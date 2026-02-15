@@ -22,6 +22,10 @@ from pickhero.ui.colors import (
     LANE_BG_EVEN,
     LANE_BG_ODD,
     LANE_LINE_COLOR,
+    LOOP_MARKER_COLOR,
+    LOOP_MARKER_DISABLED_COLOR,
+    LOOP_REGION_COLOR,
+    LOOP_REGION_DISABLED_COLOR,
     NOTE_BORDER_COLOR,
     NOTE_TEXT_COLOR,
     STRING_COLORS,
@@ -99,6 +103,11 @@ class PlayingScreen:
         self._feedback = FeedbackRenderer()
         self._audio_enabled = False
 
+        # Loop state
+        self._loop_start_ms: float | None = None
+        self._loop_end_ms: float | None = None
+        self._loop_enabled: bool = False
+
     def toggle_play(self) -> None:
         """Toggle play/pause. Restarts if past the end."""
         if self._playback_ms >= self._timeline.duration_ms and not self._playing:
@@ -159,6 +168,20 @@ class PlayingScreen:
             self._feedback.add_results(results, self._playback_ms)
             self._feedback.cleanup(self._playback_ms)
 
+        # Loop check — jump back to start marker when reaching end marker
+        if (self._loop_enabled and self._loop_end_ms is not None
+                and self._loop_start_ms is not None
+                and self._playback_ms >= self._loop_end_ms):
+            self._playback_ms = self._loop_start_ms
+            self._last_tick = time.perf_counter()
+            if self._matcher:
+                self._matcher.reset()
+            self._feedback.reset()
+            if self._audio_enabled and self._playing:
+                self._stop_audio()
+                self._start_audio()
+            return
+
         if self._playback_ms >= self._timeline.duration_ms:
             self._playback_ms = self._timeline.duration_ms
             self._playing = False
@@ -187,6 +210,12 @@ class PlayingScreen:
             self.set_tempo_factor(self._tempo_factor - 0.05)
         elif event.key == pygame.K_PAGEUP:
             self.set_tempo_factor(self._tempo_factor + 0.05)
+        elif event.key == pygame.K_i:
+            self._set_loop_start(self._playback_ms)
+        elif event.key == pygame.K_o:
+            self._set_loop_end(self._playback_ms)
+        elif event.key == pygame.K_p:
+            self._toggle_loop()
 
         return None
 
@@ -196,6 +225,7 @@ class PlayingScreen:
 
         surface.fill(BG_COLOR)
         self._draw_lanes(surface, layout)
+        self._draw_loop_region(surface, layout)
         self._draw_hit_zone(surface, layout)
         self._draw_notes(surface, layout)
         self._draw_hud(surface, layout)
@@ -322,8 +352,17 @@ class PlayingScreen:
         bpm_surf = title_font.render(bpm_text, True, HUD_ACCENT_COLOR)
         surface.blit(bpm_surf, (w // 2 - bpm_surf.get_width() // 2, 12))
 
+        # Loop status below BPM
+        loop_y = 36
+        loop_info = self._loop_hud_text()
+        if loop_info:
+            loop_color = HUD_ACCENT_COLOR if self._loop_enabled else HUD_TEXT_COLOR
+            loop_surf = hint_font.render(loop_info, True, loop_color)
+            surface.blit(loop_surf, (w // 2 - loop_surf.get_width() // 2, loop_y))
+            loop_y += 18
+
         if self._audio_enabled:
-            self._feedback.draw_streak(surface, title_font, w // 2, 36)
+            self._feedback.draw_streak(surface, title_font, w // 2, loop_y)
 
         # Top-right: time
         current = format_time(self._playback_ms)
@@ -341,9 +380,11 @@ class PlayingScreen:
         # Bottom-center: play state + controls
         state = "Playing" if self._playing else "Paused"
         audio_state = "ON" if self._audio_enabled else "off"
+        loop_state = "ON" if self._loop_enabled else "off"
         hint = (
             f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
-            f"|  HOME: restart  |  PgDn/PgUp: tempo  |  A: audio {audio_state}  |  ESC: menu"
+            f"|  HOME: restart  |  PgDn/PgUp: tempo  |  A: audio {audio_state}  "
+            f"|  I/O: loop {loop_state}  |  P: toggle  |  ESC: menu"
         )
         hint_surf = hint_font.render(hint, True, HUD_TEXT_COLOR)
         y = layout.screen_h - LANE_BOTTOM_MARGIN + 8
@@ -355,6 +396,104 @@ class PlayingScreen:
                 f"Track: {meta.track_name}", True, HUD_TEXT_COLOR
             )
             surface.blit(track_surf, (12, 38))
+
+    # -- Loop control --
+
+    def _set_loop_start(self, ms: float) -> None:
+        """Set loop start marker. Auto-swap if after end, auto-enable when both set."""
+        self._loop_start_ms = ms
+        if self._loop_end_ms is not None and self._loop_start_ms > self._loop_end_ms:
+            self._loop_start_ms, self._loop_end_ms = self._loop_end_ms, self._loop_start_ms
+        self._enforce_min_loop()
+        if self._loop_start_ms is not None and self._loop_end_ms is not None:
+            self._loop_enabled = True
+
+    def _set_loop_end(self, ms: float) -> None:
+        """Set loop end marker. Auto-swap if before start, auto-enable when both set."""
+        self._loop_end_ms = ms
+        if self._loop_start_ms is not None and self._loop_end_ms < self._loop_start_ms:
+            self._loop_start_ms, self._loop_end_ms = self._loop_end_ms, self._loop_start_ms
+        self._enforce_min_loop()
+        if self._loop_start_ms is not None and self._loop_end_ms is not None:
+            self._loop_enabled = True
+
+    def _enforce_min_loop(self) -> None:
+        """Ensure loop region is at least one beat long."""
+        if self._loop_start_ms is not None and self._loop_end_ms is not None:
+            if self._loop_end_ms - self._loop_start_ms < self._ms_per_beat:
+                self._loop_end_ms = self._loop_start_ms + self._ms_per_beat
+
+    def _toggle_loop(self) -> None:
+        """Toggle loop off (keep markers), then clear markers on second press."""
+        if self._loop_enabled:
+            self._loop_enabled = False
+        elif self._loop_start_ms is not None or self._loop_end_ms is not None:
+            self._loop_start_ms = None
+            self._loop_end_ms = None
+            self._loop_enabled = False
+        # If everything is already None/False, do nothing
+
+    def _loop_hud_text(self) -> str | None:
+        """Return loop status text for HUD, or None if no markers."""
+        if self._loop_start_ms is not None and self._loop_end_ms is not None:
+            s = format_time(self._loop_start_ms)
+            e = format_time(self._loop_end_ms)
+            if self._loop_enabled:
+                return f"LOOP {s} - {e}"
+            return f"loop {s} - {e} (off)"
+        if self._loop_start_ms is not None:
+            return f"loop start: {format_time(self._loop_start_ms)}"
+        if self._loop_end_ms is not None:
+            return f"loop end: {format_time(self._loop_end_ms)}"
+        return None
+
+    def _draw_loop_region(self, surface: pygame.Surface, layout: _Layout) -> None:
+        """Draw loop markers and shaded region between them."""
+        if self._loop_start_ms is None and self._loop_end_ms is None:
+            return
+
+        lane_top = int(LANE_TOP_MARGIN)
+        lane_bottom = int(LANE_TOP_MARGIN + 6 * layout.lane_height)
+        lane_h = lane_bottom - lane_top
+
+        marker_color = LOOP_MARKER_COLOR if self._loop_enabled else LOOP_MARKER_DISABLED_COLOR
+        region_color = LOOP_REGION_COLOR if self._loop_enabled else LOOP_REGION_DISABLED_COLOR
+
+        # Draw shaded region between both markers
+        if self._loop_start_ms is not None and self._loop_end_ms is not None:
+            x_start = int(self.note_x(self._loop_start_ms, self._playback_ms,
+                                      layout.hit_zone_x, layout.pixels_per_ms))
+            x_end = int(self.note_x(self._loop_end_ms, self._playback_ms,
+                                    layout.hit_zone_x, layout.pixels_per_ms))
+            # Clamp to screen
+            x_start = max(0, min(x_start, layout.screen_w))
+            x_end = max(0, min(x_end, layout.screen_w))
+            if x_end > x_start:
+                overlay = pygame.Surface((x_end - x_start, lane_h), pygame.SRCALPHA)
+                overlay.fill(region_color)
+                surface.blit(overlay, (x_start, lane_top))
+
+        # Draw start marker
+        if self._loop_start_ms is not None:
+            x = int(self.note_x(self._loop_start_ms, self._playback_ms,
+                                layout.hit_zone_x, layout.pixels_per_ms))
+            if 0 <= x <= layout.screen_w:
+                pygame.draw.line(surface, marker_color, (x, lane_top), (x, lane_bottom), 2)
+                # Right-pointing triangle at top
+                pygame.draw.polygon(surface, marker_color, [
+                    (x, lane_top), (x + 10, lane_top + 7), (x, lane_top + 14),
+                ])
+
+        # Draw end marker
+        if self._loop_end_ms is not None:
+            x = int(self.note_x(self._loop_end_ms, self._playback_ms,
+                                layout.hit_zone_x, layout.pixels_per_ms))
+            if 0 <= x <= layout.screen_w:
+                pygame.draw.line(surface, marker_color, (x, lane_top), (x, lane_bottom), 2)
+                # Left-pointing triangle at top
+                pygame.draw.polygon(surface, marker_color, [
+                    (x, lane_top), (x - 10, lane_top + 7), (x, lane_top + 14),
+                ])
 
     # -- Audio control --
 

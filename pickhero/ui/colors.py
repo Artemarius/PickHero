@@ -44,6 +44,12 @@ FEEDBACK_CLOSE = (255, 220, 50)    # yellow
 FEEDBACK_MISS = (255, 50, 50)      # red
 FEEDBACK_STREAK = (255, 180, 50)   # gold
 
+# Loop markers (cyan — distinct from all string colors and HUD accent)
+LOOP_MARKER_COLOR = (0, 200, 255)
+LOOP_MARKER_DISABLED_COLOR = (0, 80, 110)
+LOOP_REGION_COLOR = (0, 200, 255, 25)            # RGBA for semi-transparent overlay
+LOOP_REGION_DISABLED_COLOR = (0, 80, 110, 15)
+
 
 def dimmed(color: tuple[int, int, int], factor: float = 0.4) -> tuple[int, int, int]:
     """Darken a color by multiplying each channel by factor."""

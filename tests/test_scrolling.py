@@ -193,3 +193,104 @@ class TestTempoFactor:
         config = Config(tempo_factor=0.2)
         screen = PlayingScreen(_make_timeline(), config=config)
         assert screen._tempo_factor == 0.5
+
+
+class TestLoopState:
+    """Test section looping state management."""
+
+    def test_default_state(self):
+        screen = PlayingScreen(_make_timeline())
+        assert screen._loop_start_ms is None
+        assert screen._loop_end_ms is None
+        assert screen._loop_enabled is False
+
+    def test_setting_one_marker_does_not_enable(self):
+        screen = PlayingScreen(_make_timeline())
+        screen._set_loop_start(1000.0)
+        assert screen._loop_start_ms == 1000.0
+        assert screen._loop_end_ms is None
+        assert screen._loop_enabled is False
+
+    def test_setting_both_markers_auto_enables(self):
+        screen = PlayingScreen(_make_timeline())
+        screen._set_loop_start(1000.0)
+        screen._set_loop_end(5000.0)
+        assert screen._loop_start_ms == 1000.0
+        assert screen._loop_end_ms == 5000.0
+        assert screen._loop_enabled is True
+
+    def test_auto_swap_when_start_after_end(self):
+        screen = PlayingScreen(_make_timeline())
+        screen._set_loop_end(2000.0)
+        screen._set_loop_start(5000.0)
+        assert screen._loop_start_ms == 2000.0
+        assert screen._loop_end_ms == 5000.0
+        assert screen._loop_enabled is True
+
+    def test_auto_swap_when_end_before_start(self):
+        screen = PlayingScreen(_make_timeline())
+        screen._set_loop_start(5000.0)
+        screen._set_loop_end(2000.0)
+        assert screen._loop_start_ms == 2000.0
+        assert screen._loop_end_ms == 5000.0
+        assert screen._loop_enabled is True
+
+    def test_toggle_off_keeps_markers(self):
+        screen = PlayingScreen(_make_timeline())
+        screen._set_loop_start(1000.0)
+        screen._set_loop_end(5000.0)
+        assert screen._loop_enabled is True
+        screen._toggle_loop()
+        assert screen._loop_enabled is False
+        assert screen._loop_start_ms == 1000.0
+        assert screen._loop_end_ms == 5000.0
+
+    def test_toggle_off_again_clears_markers(self):
+        screen = PlayingScreen(_make_timeline())
+        screen._set_loop_start(1000.0)
+        screen._set_loop_end(5000.0)
+        screen._toggle_loop()   # disable
+        screen._toggle_loop()   # clear
+        assert screen._loop_start_ms is None
+        assert screen._loop_end_ms is None
+        assert screen._loop_enabled is False
+
+    def test_zero_length_guard_snaps_end(self):
+        """Loop shorter than one beat gets snapped to one beat."""
+        screen = PlayingScreen(_make_timeline(tempo=120))
+        # 120 BPM → 500ms per beat
+        screen._set_loop_start(1000.0)
+        screen._set_loop_end(1100.0)  # only 100ms apart
+        assert screen._loop_end_ms == pytest.approx(1000.0 + 500.0)
+        assert screen._loop_enabled is True
+
+    def test_zero_length_guard_on_same_position(self):
+        screen = PlayingScreen(_make_timeline(tempo=120))
+        screen._set_loop_start(3000.0)
+        screen._set_loop_end(3000.0)
+        assert screen._loop_end_ms == pytest.approx(3000.0 + 500.0)
+
+    def test_loop_hud_text_both_markers_enabled(self):
+        screen = PlayingScreen(_make_timeline())
+        screen._set_loop_start(15000.0)
+        screen._set_loop_end(32000.0)
+        text = screen._loop_hud_text()
+        assert text == "LOOP 0:15 - 0:32"
+
+    def test_loop_hud_text_both_markers_disabled(self):
+        screen = PlayingScreen(_make_timeline())
+        screen._set_loop_start(15000.0)
+        screen._set_loop_end(32000.0)
+        screen._toggle_loop()
+        text = screen._loop_hud_text()
+        assert text == "loop 0:15 - 0:32 (off)"
+
+    def test_loop_hud_text_one_marker(self):
+        screen = PlayingScreen(_make_timeline())
+        screen._set_loop_start(15000.0)
+        text = screen._loop_hud_text()
+        assert text == "loop start: 0:15"
+
+    def test_loop_hud_text_no_markers(self):
+        screen = PlayingScreen(_make_timeline())
+        assert screen._loop_hud_text() is None
