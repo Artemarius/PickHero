@@ -100,6 +100,10 @@ class PitchDetector:
             is_onset=is_onset,
         )
 
+    def set_noise_gate_db(self, db: float) -> None:
+        """Update the noise gate threshold (dB). Takes effect on next process() call."""
+        self.noise_gate_db = db
+
     def reset(self):
         """Reset detector state. Call when starting a new song/session."""
         # Re-create detectors to clear internal state

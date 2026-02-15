@@ -95,6 +95,13 @@ class AudioCapture:
             self._stream.close()
             self._stream = None
 
+    def set_noise_gate_db(self, db: float) -> None:
+        """Update the noise gate threshold on the detector.
+
+        Thread-safe: single float attribute write is atomic under the GIL.
+        """
+        self.detector.set_noise_gate_db(db)
+
     def get_notes(self) -> list[TimestampedNote]:
         """Drain all pending detected notes from the queue (non-blocking)."""
         notes = []

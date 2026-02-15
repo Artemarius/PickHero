@@ -102,6 +102,7 @@ class PlayingScreen:
         self._matcher: NoteMatcher | None = None
         self._feedback = FeedbackRenderer()
         self._audio_enabled = False
+        self._noise_gate_db: float = self._config.audio.noise_gate_db
 
         # Loop state
         self._loop_start_ms: float | None = None
@@ -147,6 +148,15 @@ class PlayingScreen:
         if self._matcher:
             self._matcher.reset()
         self._feedback.reset()
+
+    def set_noise_gate_db(self, db: float) -> None:
+        """Set noise gate threshold, clamped to [-80, -20] and rounded to int."""
+        db = max(-80, min(-20, round(db)))
+        self._noise_gate_db = db
+        self._config.audio.noise_gate_db = db
+        if self._audio_capture is not None:
+            self._audio_capture.set_noise_gate_db(db)
+        self._config.save()
 
     def update(self) -> None:
         """Advance playback clock by real elapsed time."""
@@ -216,6 +226,10 @@ class PlayingScreen:
             self._set_loop_end(self._playback_ms)
         elif event.key == pygame.K_p:
             self._toggle_loop()
+        elif event.key == pygame.K_LEFTBRACKET:
+            self.set_noise_gate_db(self._noise_gate_db - 5)
+        elif event.key == pygame.K_RIGHTBRACKET:
+            self.set_noise_gate_db(self._noise_gate_db + 5)
 
         return None
 
@@ -372,10 +386,18 @@ class PlayingScreen:
         surface.blit(time_surf, (w - time_surf.get_width() - 12, 12))
 
         # Top-right second line: accuracy stats
+        stats_bottom_y = 36
         if self._audio_enabled and self._matcher is not None:
             stats = self._matcher.get_statistics()
             if stats["total"] > 0:
                 self._feedback.draw_stats(surface, stats, hint_font, w - 12, 36)
+                stats_bottom_y = 54
+
+        # Top-right: noise gate (below stats, only when audio enabled)
+        if self._audio_enabled:
+            gate_text = f"Gate: {int(self._noise_gate_db)} dB"
+            gate_surf = hint_font.render(gate_text, True, HUD_ACCENT_COLOR)
+            surface.blit(gate_surf, (w - gate_surf.get_width() - 12, stats_bottom_y))
 
         # Bottom-center: play state + controls
         state = "Playing" if self._playing else "Paused"
@@ -383,7 +405,8 @@ class PlayingScreen:
         loop_state = "ON" if self._loop_enabled else "off"
         hint = (
             f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
-            f"|  HOME: restart  |  PgDn/PgUp: tempo  |  A: audio {audio_state}  "
+            f"|  HOME: restart  |  PgDn/PgUp: tempo  |  [/]: gate  "
+            f"|  A: audio {audio_state}  "
             f"|  I/O: loop {loop_state}  |  P: toggle  |  ESC: menu"
         )
         hint_surf = hint_font.render(hint, True, HUD_TEXT_COLOR)
