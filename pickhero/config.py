@@ -25,9 +25,19 @@ class AudioConfig:
 
 
 @dataclass
+class DisplayConfig:
+    """Display and rendering settings."""
+    width: int = 1280
+    height: int = 720
+    visible_beats: int = 4
+    hit_zone_fraction: float = 0.20
+
+
+@dataclass
 class Config:
     """Application settings."""
     audio: AudioConfig = field(default_factory=AudioConfig)
+    display: DisplayConfig = field(default_factory=DisplayConfig)
     songs_dir: str = "songs"
     timing_window_ms: float = 100.0
 
@@ -46,6 +56,11 @@ class Config:
             with open(CONFIG_FILE) as f:
                 data = json.load(f)
             audio_data = data.pop("audio", {})
-            return cls(audio=AudioConfig(**audio_data), **data)
+            display_data = data.pop("display", {})
+            return cls(
+                audio=AudioConfig(**audio_data),
+                display=DisplayConfig(**display_data),
+                **data,
+            )
         except (json.JSONDecodeError, TypeError, KeyError):
             return cls()

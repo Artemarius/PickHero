@@ -94,6 +94,7 @@ PickHero/
 │   ├── ui/
 │   │   ├── app.py           # main game loop / window
 │   │   ├── scrolling.py     # scrolling note highway renderer
+│   │   ├── colors.py        # color constants, string palette
 │   │   ├── feedback.py      # hit/miss visual effects
 │   │   └── menu.py          # song selection, settings
 │   └── config.py            # user settings, audio device config
@@ -111,7 +112,7 @@ PickHero/
 
 1. ~~**Audio Detection PoC** — `sounddevice` + `aubio` pitch detection, console output~~ **Done**
 2. ~~**Tab Parser & Timeline** — GP5 loading via `pyguitarpro`, timeline data structure~~ **Done**
-3. **Scrolling Display MVP** — PyGame window with 6 string lanes, tempo-synced scrolling
+3. ~~**Scrolling Display MVP** — PyGame window with 6 string lanes, tempo-synced scrolling~~ **Done**
 4. **Live Matching & Feedback** — pitch comparison, hit/miss visuals, accuracy scoring
 5. **Polish** — tempo control, section looping, backing tracks, song browser, `.exe` packaging
 
