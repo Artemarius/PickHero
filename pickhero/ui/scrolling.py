@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import pygame
 
+from pickhero.audio.midi_playback import BackingTrack, MidiPlayer
 from pickhero.config import Config
 from pickhero.matcher import NoteMatcher
 from pickhero.tabs.timeline import NoteEvent, Timeline
@@ -81,7 +82,8 @@ class PlayingScreen:
     """Scrolling tab display with playback clock and optional audio matching."""
 
     def __init__(self, timeline: Timeline, visible_beats: int = 4,
-                 hit_zone_fraction: float = 0.20, config: Config | None = None):
+                 hit_zone_fraction: float = 0.20, config: Config | None = None,
+                 backing_track: BackingTrack | None = None):
         self._timeline = timeline
         self._visible_beats = visible_beats
         self._hit_zone_fraction = hit_zone_fraction
@@ -109,6 +111,12 @@ class PlayingScreen:
         self._loop_end_ms: float | None = None
         self._loop_enabled: bool = False
 
+        # MIDI backing track
+        self._midi_player: MidiPlayer | None = None
+        self._backing_muted = not self._config.backing_track_enabled
+        if backing_track is not None and len(backing_track) > 0:
+            self._init_midi_player(backing_track)
+
     def toggle_play(self) -> None:
         """Toggle play/pause. Restarts if past the end."""
         if self._playback_ms >= self._timeline.duration_ms and not self._playing:
@@ -121,9 +129,13 @@ class PlayingScreen:
             self._last_tick = time.perf_counter()
             if self._audio_enabled:
                 self._start_audio()
+            if self._midi_player is not None:
+                self._midi_player.seek(self._playback_ms)
         else:
             self._last_tick = None
             self._stop_audio()
+            if self._midi_player is not None:
+                self._midi_player.pause()
 
     def seek(self, ms: float) -> None:
         """Seek to an absolute position in ms, clamped to [0, duration]."""
@@ -131,6 +143,8 @@ class PlayingScreen:
         if self._matcher:
             self._matcher.reset()
         self._feedback.reset()
+        if self._midi_player is not None:
+            self._midi_player.seek(self._playback_ms)
         # Restart audio with new offset if active
         if self._audio_enabled and self._playing:
             self._stop_audio()
@@ -178,15 +192,23 @@ class PlayingScreen:
             self._feedback.add_results(results, self._playback_ms)
             self._feedback.cleanup(self._playback_ms)
 
+        # Advance MIDI backing track
+        if self._midi_player is not None:
+            self._midi_player.update(self._playback_ms)
+
         # Loop check — jump back to start marker when reaching end marker
         if (self._loop_enabled and self._loop_end_ms is not None
                 and self._loop_start_ms is not None
                 and self._playback_ms >= self._loop_end_ms):
+            if self._midi_player is not None:
+                self._midi_player.pause()
             self._playback_ms = self._loop_start_ms
             self._last_tick = time.perf_counter()
             if self._matcher:
                 self._matcher.reset()
             self._feedback.reset()
+            if self._midi_player is not None:
+                self._midi_player.seek(self._loop_start_ms)
             if self._audio_enabled and self._playing:
                 self._stop_audio()
                 self._start_audio()
@@ -196,6 +218,8 @@ class PlayingScreen:
             self._playback_ms = self._timeline.duration_ms
             self._playing = False
             self._last_tick = None
+            if self._midi_player is not None:
+                self._midi_player.pause()
             self._stop_audio()
 
     def handle_event(self, event: pygame.event.Event) -> str | None:
@@ -226,6 +250,8 @@ class PlayingScreen:
             self._set_loop_end(self._playback_ms)
         elif event.key == pygame.K_p:
             self._toggle_loop()
+        elif event.key == pygame.K_b:
+            self._toggle_backing()
         elif event.key == pygame.K_LEFTBRACKET:
             self.set_noise_gate_db(self._noise_gate_db - 5)
         elif event.key == pygame.K_RIGHTBRACKET:
@@ -403,10 +429,14 @@ class PlayingScreen:
         state = "Playing" if self._playing else "Paused"
         audio_state = "ON" if self._audio_enabled else "off"
         loop_state = "ON" if self._loop_enabled else "off"
+        backing_state = ""
+        if self._midi_player is not None:
+            backing_state = f"|  B: backing {'off' if self._backing_muted else 'ON'}  "
         hint = (
             f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
             f"|  HOME: restart  |  PgDn/PgUp: tempo  |  [/]: gate  "
             f"|  A: audio {audio_state}  "
+            f"{backing_state}"
             f"|  I/O: loop {loop_state}  |  P: toggle  |  ESC: menu"
         )
         hint_surf = hint_font.render(hint, True, HUD_TEXT_COLOR)
@@ -555,3 +585,27 @@ class PlayingScreen:
         """Public method to stop audio (called on state transitions)."""
         self._stop_audio()
         self._audio_enabled = False
+        if self._midi_player is not None:
+            self._midi_player.close()
+            self._midi_player = None
+
+    # -- MIDI backing track --
+
+    def _init_midi_player(self, backing_track: BackingTrack) -> None:
+        """Create and open MidiPlayer. Silently continues if MIDI unavailable."""
+        try:
+            player = MidiPlayer(backing_track)
+            if player.open():
+                player.set_muted(self._backing_muted)
+                self._midi_player = player
+            else:
+                player.close()
+        except Exception as e:
+            print(f"MIDI player init failed: {e}")
+
+    def _toggle_backing(self) -> None:
+        """Toggle backing track mute on/off."""
+        if self._midi_player is None:
+            return
+        self._backing_muted = not self._backing_muted
+        self._midi_player.set_muted(self._backing_muted)

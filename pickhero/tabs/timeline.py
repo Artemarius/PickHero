@@ -47,6 +47,7 @@ class SongMetadata:
     track_name: str = ""
     tempo: int = 120
     tuning: dict[int, int] = field(default_factory=dict)
+    track_index: int = 0
 
 
 class Timeline:

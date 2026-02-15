@@ -86,6 +86,7 @@ pickhero/
 │   ├── __init__.py
 │   ├── input.py
 │   ├── detector.py
+│   ├── midi_playback.py
 │   └── note_utils.py
 ├── tabs/
 │   ├── __init__.py

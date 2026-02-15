@@ -10,6 +10,9 @@ from pathlib import Path
 
 import guitarpro
 
+from pickhero.audio.midi_playback import (
+    NOTE_ON, NOTE_OFF, PROGRAM_CHANGE, BackingTrack, MidiEvent,
+)
 from pickhero.tabs.timeline import NoteEvent, SongMetadata, Timeline
 
 # GP tick resolution: 960 ticks = 1 quarter note
@@ -160,11 +163,14 @@ def load_gp_file(path: str | Path, track_index: int | None = None) -> Timeline:
 
     # Select track
     if track_index is not None:
+        selected_index = track_index
         track = song.tracks[track_index]
     else:
+        selected_index = 0
         track = song.tracks[0]  # default fallback
-        for t in song.tracks:
+        for i, t in enumerate(song.tracks):
             if is_guitar_track(t):
+                selected_index = i
                 track = t
                 break
 
@@ -177,6 +183,85 @@ def load_gp_file(path: str | Path, track_index: int | None = None) -> Timeline:
         track_name=track.name or "",
         tempo=song.tempo,
         tuning=_extract_tuning(track),
+        track_index=selected_index,
     )
 
     return Timeline(notes, metadata)
+
+
+def extract_backing_track(
+    path: str | Path,
+    exclude_track_indices: set[int] | None = None,
+) -> BackingTrack:
+    """Extract non-guitar tracks from a GP file as MIDI events.
+
+    Args:
+        path: Path to GP3/GP4/GP5 file.
+        exclude_track_indices: Track indices to exclude. If None, auto-excludes
+                               all guitar tracks.
+
+    Returns:
+        BackingTrack with note_on, note_off, and program_change events.
+    """
+    song = guitarpro.parse(str(path))
+    tempo_map = _build_tempo_map(song)
+
+    if exclude_track_indices is None:
+        exclude_track_indices = {
+            i for i, t in enumerate(song.tracks) if is_guitar_track(t)
+        }
+
+    events: list[MidiEvent] = []
+
+    for i, track in enumerate(song.tracks):
+        if i in exclude_track_indices:
+            continue
+
+        # Determine MIDI channel: percussion on channel 9, others use GP channel
+        if track.channel.isPercussionChannel:
+            channel = 9
+        else:
+            channel = (track.channel.channel - 1) % 16  # GP is 1-indexed
+
+        # Program change at t=0 for non-percussion tracks
+        if not track.channel.isPercussionChannel:
+            events.append(MidiEvent(
+                timestamp_ms=0.0,
+                channel=channel,
+                event_type=PROGRAM_CHANGE,
+                data1=track.channel.instrument,
+                data2=0,
+            ))
+
+        # Extract note events
+        for measure in track.measures:
+            for voice in measure.voices:
+                for beat in voice.beats:
+                    timestamp_ms = tempo_map.tick_to_ms(beat.start)
+                    duration_ms = tempo_map.duration_ticks_to_ms(
+                        beat.duration.time, beat.start,
+                    )
+
+                    for note in beat.notes:
+                        if note.type.value not in (1, 3):
+                            continue
+
+                        velocity = note.velocity if note.velocity > 0 else 80
+                        midi_note = note.realValue
+
+                        events.append(MidiEvent(
+                            timestamp_ms=timestamp_ms,
+                            channel=channel,
+                            event_type=NOTE_ON,
+                            data1=midi_note,
+                            data2=velocity,
+                        ))
+                        events.append(MidiEvent(
+                            timestamp_ms=timestamp_ms + duration_ms,
+                            channel=channel,
+                            event_type=NOTE_OFF,
+                            data1=midi_note,
+                            data2=0,
+                        ))
+
+    return BackingTrack(events)

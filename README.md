@@ -54,7 +54,7 @@ PickHero reads Guitar Pro files (`.gp3`, `.gp4`, `.gp5`). You can get tabs from:
 | Onset detection | `aubio` | Detects note strikes for timing |
 | Tab parsing | `pyguitarpro` | Reads GP3/GP4/GP5 structured data |
 | UI | `pygame` | Game-loop oriented, fast rendering |
-| Audio playback | `pygame.mixer` | Backing track / metronome from MIDI |
+| Audio playback | `pygame.midi` | Real-time MIDI backing tracks via system synth |
 | Packaging | `PyInstaller` | Single .exe for Windows |
 
 ## Installation
@@ -86,6 +86,7 @@ PickHero/
 │   ├── audio/
 │   │   ├── input.py         # sounddevice audio capture
 │   │   ├── detector.py      # aubio pitch + onset detection
+│   │   ├── midi_playback.py # MIDI backing track playback
 │   │   └── note_utils.py    # frequency → note/string/fret mapping
 │   ├── tabs/
 │   │   ├── loader.py        # pyguitarpro file reader
@@ -115,7 +116,7 @@ PickHero/
 2. ~~**Tab Parser & Timeline** — GP5 loading via `pyguitarpro`, timeline data structure~~ **Done**
 3. ~~**Scrolling Display MVP** — PyGame window with 6 string lanes, tempo-synced scrolling~~ **Done**
 4. ~~**Live Matching & Feedback** — pitch comparison, hit/miss visuals, accuracy scoring~~ **Done**
-5. **Polish** — ~~tempo control~~, ~~section looping~~, ~~device selector~~, backing tracks, song browser, `.exe` packaging
+5. **Polish** — ~~tempo control~~, ~~section looping~~, ~~device selector~~, ~~backing tracks~~, song browser, `.exe` packaging
 
 ## References
 

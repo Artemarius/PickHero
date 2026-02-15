@@ -43,6 +43,7 @@ class Config:
     timing_window_ms: float = 100.0
     audio_latency_offset_ms: float = 0.0
     chord_threshold_ms: float = 50.0
+    backing_track_enabled: bool = True
 
     def save(self):
         """Save settings to JSON file."""

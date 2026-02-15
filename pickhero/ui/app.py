@@ -11,7 +11,7 @@ import pygame
 
 from pickhero.audio.input import validate_device_index
 from pickhero.config import Config
-from pickhero.tabs.loader import load_gp_file
+from pickhero.tabs.loader import extract_backing_track, load_gp_file
 from pickhero.ui.device_menu import DeviceMenuScreen
 from pickhero.ui.menu import MenuScreen
 from pickhero.ui.scrolling import PlayingScreen
@@ -120,12 +120,22 @@ class App:
             print(f"Error loading {path}: {e}")
             return
 
+        # Extract backing track (non-guitar tracks as MIDI)
+        backing_track = None
+        try:
+            backing_track = extract_backing_track(
+                path, exclude_track_indices={timeline.metadata.track_index},
+            )
+        except Exception as e:
+            print(f"Backing track extraction failed: {e}")
+
         dc = self._config.display
         self._playing_screen = PlayingScreen(
             timeline,
             visible_beats=dc.visible_beats,
             hit_zone_fraction=dc.hit_zone_fraction,
             config=self._config,
+            backing_track=backing_track,
         )
         self._state = "playing"
 
