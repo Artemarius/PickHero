@@ -81,17 +81,19 @@ class App:
                 self._handle_device_event(event)
 
     def _handle_menu_event(self, event: pygame.event.Event) -> None:
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self._running = False
-            return
-
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_d:
+        if (
+            event.type == pygame.KEYDOWN
+            and event.key == pygame.K_d
+            and not self._menu.is_searching
+        ):
             self._device_menu = DeviceMenuScreen(self._config)
             self._state = "device"
             return
 
         result = self._menu.handle_event(event)
-        if result is not None:
+        if result == "escape":
+            self._running = False
+        elif isinstance(result, Path):
             self._load_song(result)
 
     def _handle_playing_event(self, event: pygame.event.Event) -> None:
