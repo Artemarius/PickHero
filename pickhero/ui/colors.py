@@ -1,20 +1,137 @@
 """Color constants for PickHero UI.
 
-Rocksmith-style string palette. All colors are RGB tuples.
+Rocksmith-style string palette. Supports dark/light themes via Theme dataclass.
 """
 
-# Background
-BG_COLOR = (20, 20, 30)
+from dataclasses import dataclass
 
-# Lane backgrounds (alternating)
-LANE_BG_EVEN = (30, 30, 42)
-LANE_BG_ODD = (25, 25, 36)
-LANE_LINE_COLOR = (60, 60, 80)
 
-# Hit zone
-HIT_ZONE_COLOR = (255, 255, 255)
+@dataclass(frozen=True)
+class Theme:
+    """All UI colors for a theme."""
+
+    # Background
+    bg: tuple[int, int, int]
+
+    # Lane backgrounds (alternating)
+    lane_bg_even: tuple[int, int, int]
+    lane_bg_odd: tuple[int, int, int]
+    lane_line: tuple[int, int, int]
+
+    # Hit zone
+    hit_zone: tuple[int, int, int]
+
+    # Note text and border
+    note_text: tuple[int, int, int]
+    note_border: tuple[int, int, int]
+
+    # Menu
+    menu_bg: tuple[int, int, int]
+    menu_item: tuple[int, int, int]
+    menu_selected: tuple[int, int, int]
+    menu_selected_bg: tuple[int, int, int]
+    menu_check: tuple[int, int, int]
+
+    # HUD
+    hud_text: tuple[int, int, int]
+    hud_accent: tuple[int, int, int]
+
+    # Feedback
+    feedback_hit: tuple[int, int, int]
+    feedback_close: tuple[int, int, int]
+    feedback_miss: tuple[int, int, int]
+    feedback_streak: tuple[int, int, int]
+
+    # Loop markers
+    loop_marker: tuple[int, int, int]
+    loop_marker_disabled: tuple[int, int, int]
+    loop_region: tuple[int, int, int, int]          # RGBA
+    loop_region_disabled: tuple[int, int, int, int]  # RGBA
+
+
+DARK_THEME = Theme(
+    bg=(20, 20, 30),
+    lane_bg_even=(30, 30, 42),
+    lane_bg_odd=(25, 25, 36),
+    lane_line=(60, 60, 80),
+    hit_zone=(255, 255, 255),
+    note_text=(255, 255, 255),
+    note_border=(10, 10, 15),
+    menu_bg=(20, 20, 30),
+    menu_item=(180, 180, 200),
+    menu_selected=(255, 255, 255),
+    menu_selected_bg=(60, 60, 100),
+    menu_check=(50, 220, 80),
+    hud_text=(200, 200, 220),
+    hud_accent=(100, 180, 255),
+    feedback_hit=(50, 255, 50),
+    feedback_close=(255, 220, 50),
+    feedback_miss=(255, 50, 50),
+    feedback_streak=(255, 180, 50),
+    loop_marker=(0, 200, 255),
+    loop_marker_disabled=(0, 80, 110),
+    loop_region=(0, 200, 255, 25),
+    loop_region_disabled=(0, 80, 110, 15),
+)
+
+LIGHT_THEME = Theme(
+    bg=(235, 235, 240),
+    lane_bg_even=(225, 225, 232),
+    lane_bg_odd=(218, 218, 228),
+    lane_line=(180, 180, 195),
+    hit_zone=(40, 40, 50),
+    note_text=(255, 255, 255),
+    note_border=(80, 80, 100),
+    menu_bg=(235, 235, 240),
+    menu_item=(80, 80, 100),
+    menu_selected=(20, 20, 30),
+    menu_selected_bg=(180, 200, 240),
+    menu_check=(30, 160, 60),
+    hud_text=(60, 60, 80),
+    hud_accent=(30, 100, 200),
+    feedback_hit=(30, 200, 30),
+    feedback_close=(200, 170, 20),
+    feedback_miss=(220, 40, 40),
+    feedback_streak=(200, 140, 30),
+    loop_marker=(0, 150, 200),
+    loop_marker_disabled=(100, 140, 160),
+    loop_region=(0, 150, 200, 30),
+    loop_region_disabled=(100, 140, 160, 15),
+)
+
+_THEMES = {"dark": DARK_THEME, "light": LIGHT_THEME}
+_current_theme: Theme = DARK_THEME
+
+
+def set_theme(name: str) -> None:
+    """Set the active theme by name ('dark' or 'light')."""
+    global _current_theme
+    _current_theme = _THEMES.get(name, DARK_THEME)
+
+
+def get_theme() -> Theme:
+    """Return the active theme."""
+    return _current_theme
+
+
+def get_theme_name() -> str:
+    """Return the name of the active theme."""
+    if _current_theme is LIGHT_THEME:
+        return "light"
+    return "dark"
+
+
+def cycle_theme() -> str:
+    """Cycle to the next theme. Returns the new theme name."""
+    if _current_theme is DARK_THEME:
+        set_theme("light")
+        return "light"
+    set_theme("dark")
+    return "dark"
+
 
 # String colors (Rocksmith palette, keyed 1-6: 1=high E, 6=low E)
+# These don't change with theme — they're gameplay identifiers.
 STRING_COLORS: dict[int, tuple[int, int, int]] = {
     1: (200, 50, 50),    # red
     2: (220, 200, 40),   # yellow
@@ -23,33 +140,6 @@ STRING_COLORS: dict[int, tuple[int, int, int]] = {
     5: (50, 180, 70),    # green
     6: (140, 60, 200),   # purple
 }
-
-# Note text and border
-NOTE_TEXT_COLOR = (255, 255, 255)
-NOTE_BORDER_COLOR = (10, 10, 15)
-
-# Menu
-MENU_BG_COLOR = (20, 20, 30)
-MENU_ITEM_COLOR = (180, 180, 200)
-MENU_SELECTED_COLOR = (255, 255, 255)
-MENU_SELECTED_BG = (60, 60, 100)
-MENU_CHECK_COLOR = (50, 220, 80)  # green indicator for active device
-
-# HUD
-HUD_TEXT_COLOR = (200, 200, 220)
-HUD_ACCENT_COLOR = (100, 180, 255)
-
-# Feedback
-FEEDBACK_HIT = (50, 255, 50)       # bright green
-FEEDBACK_CLOSE = (255, 220, 50)    # yellow
-FEEDBACK_MISS = (255, 50, 50)      # red
-FEEDBACK_STREAK = (255, 180, 50)   # gold
-
-# Loop markers (cyan — distinct from all string colors and HUD accent)
-LOOP_MARKER_COLOR = (0, 200, 255)
-LOOP_MARKER_DISABLED_COLOR = (0, 80, 110)
-LOOP_REGION_COLOR = (0, 200, 255, 25)            # RGBA for semi-transparent overlay
-LOOP_REGION_DISABLED_COLOR = (0, 80, 110, 15)
 
 
 def dimmed(color: tuple[int, int, int], factor: float = 0.4) -> tuple[int, int, int]:

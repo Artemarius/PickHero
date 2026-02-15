@@ -19,6 +19,7 @@ env/
 
 # PyInstaller
 *.spec
+!pickhero.spec
 
 # IDE
 .vscode/

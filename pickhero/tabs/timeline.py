@@ -19,6 +19,7 @@ class NoteEvent:
     midi_note: int
     string: int  # 1-6 (1=high E)
     fret: int    # 0=open
+    measure: int = 0  # measure index (0-based)
 
     def __post_init__(self):
         if self.timestamp_ms < 0:
@@ -37,6 +38,14 @@ class NoteEvent:
         return self.timestamp_ms + self.duration_ms
 
 
+@dataclass(frozen=True)
+class MeasureInfo:
+    """Time range for a single measure/bar."""
+    index: int
+    start_ms: float
+    end_ms: float
+
+
 @dataclass
 class SongMetadata:
     """Metadata extracted from a GP file."""
@@ -53,10 +62,12 @@ class SongMetadata:
 class Timeline:
     """Sorted collection of NoteEvents with efficient range queries."""
 
-    def __init__(self, notes: list[NoteEvent], metadata: SongMetadata | None = None):
+    def __init__(self, notes: list[NoteEvent], metadata: SongMetadata | None = None,
+                 measures: list[MeasureInfo] | None = None):
         self._notes = sorted(notes, key=lambda n: (n.timestamp_ms, n.string))
         self._timestamps = [n.timestamp_ms for n in self._notes]
         self.metadata = metadata or SongMetadata()
+        self._measures = measures or []
         self._cursor = 0
 
     def __len__(self) -> int:
@@ -69,6 +80,10 @@ class Timeline:
     @property
     def notes(self) -> list[NoteEvent]:
         return list(self._notes)
+
+    @property
+    def measures(self) -> list[MeasureInfo]:
+        return list(self._measures)
 
     @property
     def duration_ms(self) -> float:

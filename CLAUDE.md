@@ -82,6 +82,8 @@ pickhero/
 ├── __main__.py          # python -m pickhero entry point
 ├── main.py
 ├── config.py
+├── matcher.py           # note matching engine (hit/close/miss)
+├── progress.py          # per-song progress tracking
 ├── audio/
 │   ├── __init__.py
 │   ├── input.py
@@ -96,9 +98,11 @@ pickhero/
 └── ui/
     ├── __init__.py
     ├── app.py
+    ├── colors.py          # Theme system (dark/light)
     ├── scrolling.py
     ├── feedback.py
-    └── menu.py
+    ├── menu.py
+    └── device_menu.py
 ```
 
 ## Testing
@@ -115,7 +119,9 @@ pip install -r requirements.txt
 python -m pickhero
 
 # Package for distribution
-pyinstaller --onefile --windowed pickhero/main.py
+pip install pyinstaller
+pyinstaller pickhero.spec --noconfirm
+# Or use build.bat on Windows
 ```
 
 ## What NOT To Do
@@ -124,4 +130,4 @@ pyinstaller --onefile --windowed pickhero/main.py
 - Don't create a web UI or Electron wrapper. This is a desktop app.
 - Don't add online features, accounts, or cloud sync. Offline-first, local files only.
 - Don't over-abstract. Simple classes, no deep inheritance hierarchies. This is a ~3K LOC app, not a framework.
-- Don't add chord detection in initial phases. Single notes first, chords as stretch goal.
+- Don't add polyphonic pitch detection. aubio YIN is monophonic. Chord scoring uses a majority-match model instead.

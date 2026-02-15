@@ -4,7 +4,7 @@ import pytest
 
 from pickhero.matcher import MatchResult, MatchType
 from pickhero.tabs.timeline import NoteEvent
-from pickhero.ui.colors import FEEDBACK_HIT, FEEDBACK_CLOSE, FEEDBACK_MISS, dimmed
+from pickhero.ui.colors import dimmed, get_theme
 from pickhero.ui.feedback import EFFECT_DURATION_MS, FeedbackRenderer
 
 
@@ -31,15 +31,17 @@ def _result(match_type: MatchType, events: list[NoteEvent],
 class TestNoteColor:
     def test_hit_color(self):
         """Active HIT effect returns green."""
+        t = get_theme()
         renderer = FeedbackRenderer()
         note = _note_event()
         renderer.add_results([_result(MatchType.HIT, [note])], playback_ms=1000.0)
 
         color = renderer.get_note_color(note, (200, 50, 50), 1100.0, is_past=True)
-        assert color == FEEDBACK_HIT
+        assert color == t.feedback_hit
 
     def test_close_color(self):
         """Active CLOSE effect returns yellow."""
+        t = get_theme()
         renderer = FeedbackRenderer()
         note = _note_event()
         renderer.add_results(
@@ -48,16 +50,17 @@ class TestNoteColor:
         )
 
         color = renderer.get_note_color(note, (200, 50, 50), 1100.0, is_past=True)
-        assert color == FEEDBACK_CLOSE
+        assert color == t.feedback_close
 
     def test_miss_color(self):
         """Active MISS effect returns red."""
+        t = get_theme()
         renderer = FeedbackRenderer()
         note = _note_event()
         renderer.add_results([_result(MatchType.MISS, [note])], playback_ms=1000.0)
 
         color = renderer.get_note_color(note, (200, 50, 50), 1100.0, is_past=True)
-        assert color == FEEDBACK_MISS
+        assert color == t.feedback_miss
 
     def test_default_color_no_effect(self):
         """No active effect -> base color or dimmed."""
@@ -75,13 +78,14 @@ class TestNoteColor:
 
     def test_effect_expiry(self):
         """Effect stops showing bright color after EFFECT_DURATION_MS."""
+        t = get_theme()
         renderer = FeedbackRenderer()
         note = _note_event()
         renderer.add_results([_result(MatchType.HIT, [note])], playback_ms=1000.0)
 
         # Within duration: bright green
         color = renderer.get_note_color(note, (200, 50, 50), 1400.0, is_past=True)
-        assert color == FEEDBACK_HIT
+        assert color == t.feedback_hit
 
         # After duration: dimmed green (not bright)
         color = renderer.get_note_color(
@@ -89,9 +93,9 @@ class TestNoteColor:
             1000.0 + EFFECT_DURATION_MS + 1,
             is_past=True,
         )
-        assert color != FEEDBACK_HIT
+        assert color != t.feedback_hit
         # Should be dimmed version of the feedback color
-        assert color == dimmed(FEEDBACK_HIT, 0.6)
+        assert color == dimmed(t.feedback_hit, 0.6)
 
 
 class TestStreak:

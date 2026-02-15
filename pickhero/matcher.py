@@ -6,8 +6,11 @@ hit/close/miss feedback. No pygame dependency — pure logic.
 
 from __future__ import annotations
 
+import math
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
 from pickhero.audio.note_utils import semitone_distance
 from pickhero.audio.input import TimestampedNote
@@ -42,11 +45,15 @@ class NoteMatcher:
         timing_window_ms: float = 100.0,
         audio_offset_ms: float = 0.0,
         chord_threshold_ms: float = 50.0,
+        note_filter: Callable[[NoteEvent], bool] | None = None,
+        chord_partial_credit: bool = True,
     ):
         self._timeline = timeline
         self._timing_window_ms = timing_window_ms
         self._audio_offset_ms = audio_offset_ms
         self._chord_threshold_ms = chord_threshold_ms
+        self.note_filter = note_filter
+        self.chord_partial_credit = chord_partial_credit
 
         # State per note event, keyed by (timestamp_ms, string)
         self._note_states: dict[tuple[float, int], MatchType] = {}
@@ -55,6 +62,11 @@ class NoteMatcher:
         self.hits = 0
         self.close = 0
         self.misses = 0
+
+        # Per-measure statistics: {measure_idx: {"hits": n, "close": n, "misses": n}}
+        self._measure_stats: dict[int, dict[str, int]] = defaultdict(
+            lambda: {"hits": 0, "close": 0, "misses": 0}
+        )
 
     @property
     def audio_offset_ms(self) -> float:
@@ -73,6 +85,12 @@ class NoteMatcher:
     def _set_state(self, event: NoteEvent, state: MatchType) -> None:
         self._note_states[self._note_key(event)] = state
 
+    def _is_filtered(self, event: NoteEvent) -> bool:
+        """Return True if this note should be excluded by the difficulty filter."""
+        if self.note_filter is None:
+            return False
+        return not self.note_filter(event)
+
     def get_note_state(self, event: NoteEvent) -> MatchType:
         """Get the current match state of a timeline note."""
         return self._get_state(event)
@@ -86,6 +104,19 @@ class NoteMatcher:
             if abs(n.timestamp_ms - event.timestamp_ms) <= self._chord_threshold_ms
         ]
 
+    def _record_match(self, event: NoteEvent, match_type: MatchType) -> None:
+        """Record a match for a note, updating stats and measure stats."""
+        self._set_state(event, match_type)
+        if match_type == MatchType.HIT:
+            self.hits += 1
+            self._measure_stats[event.measure]["hits"] += 1
+        elif match_type == MatchType.CLOSE:
+            self.close += 1
+            self._measure_stats[event.measure]["close"] += 1
+        elif match_type == MatchType.MISS:
+            self.misses += 1
+            self._measure_stats[event.measure]["misses"] += 1
+
     def _mark_missed_notes(self, playback_ms: float) -> list[MatchResult]:
         """Mark PENDING notes that have passed the timing window as MISS."""
         results = []
@@ -96,9 +127,10 @@ class NoteMatcher:
         # Check notes that should have been played by now
         candidates = self._timeline.get_notes_in_range(0, cutoff)
         for note in candidates:
+            if self._is_filtered(note):
+                continue
             if self._get_state(note) == MatchType.PENDING:
-                self._set_state(note, MatchType.MISS)
-                self.misses += 1
+                self._record_match(note, MatchType.MISS)
                 results.append(MatchResult(
                     match_type=MatchType.MISS,
                     matched_events=[note],
@@ -136,8 +168,11 @@ class NoteMatcher:
                 adjusted_ms, self._timing_window_ms
             )
 
-            # Filter to PENDING only
-            pending = [n for n in candidates if self._get_state(n) == MatchType.PENDING]
+            # Filter to PENDING and non-filtered only
+            pending = [
+                n for n in candidates
+                if self._get_state(n) == MatchType.PENDING and not self._is_filtered(n)
+            ]
             if not pending:
                 continue
 
@@ -162,27 +197,44 @@ class NoteMatcher:
                 # Too far off — ignore this detection, no penalty
                 continue
 
-            # Mark the matched note and its chord siblings
+            # Chord handling
             siblings = self._find_chord_siblings(best)
-            matched_events = []
-            for sibling in siblings:
-                if self._get_state(sibling) == MatchType.PENDING:
-                    self._set_state(sibling, match_type)
-                    matched_events.append(sibling)
-                    if match_type == MatchType.HIT:
-                        self.hits += 1
-                    else:
-                        self.close += 1
+            # Filter out excluded notes from siblings
+            siblings = [s for s in siblings if not self._is_filtered(s)]
 
-            # Ensure the best note itself is included
-            if best not in matched_events:
+            if self.chord_partial_credit and len(siblings) > 1:
+                # Partial credit mode: only mark the matched note
+                matched_events = []
                 if self._get_state(best) == MatchType.PENDING:
-                    self._set_state(best, match_type)
+                    self._record_match(best, match_type)
                     matched_events.append(best)
-                    if match_type == MatchType.HIT:
-                        self.hits += 1
-                    else:
-                        self.close += 1
+
+                # Check if majority of chord is now matched
+                total_in_chord = len(siblings)
+                needed = math.ceil(total_in_chord / 2)
+                matched_count = sum(
+                    1 for s in siblings
+                    if self._get_state(s) in (MatchType.HIT, MatchType.CLOSE)
+                )
+                if matched_count >= needed:
+                    # Auto-complete remaining pending notes
+                    for s in siblings:
+                        if self._get_state(s) == MatchType.PENDING:
+                            self._record_match(s, match_type)
+                            matched_events.append(s)
+            else:
+                # Easy mode (old behavior): mark all chord siblings
+                matched_events = []
+                for sibling in siblings:
+                    if self._get_state(sibling) == MatchType.PENDING:
+                        self._record_match(sibling, match_type)
+                        matched_events.append(sibling)
+
+                # Ensure the best note itself is included
+                if best not in matched_events:
+                    if self._get_state(best) == MatchType.PENDING:
+                        self._record_match(best, match_type)
+                        matched_events.append(best)
 
             results.append(MatchResult(
                 match_type=match_type,
@@ -204,9 +256,74 @@ class NoteMatcher:
             "accuracy_percent": accuracy,
         }
 
+    def get_weakest_sections(
+        self, threshold: float = 0.6, min_length: int = 2
+    ) -> list[tuple[int, int, float]]:
+        """Find contiguous measures below accuracy threshold.
+
+        Returns list of (start_measure, end_measure, accuracy) sorted by
+        accuracy ascending. Only returns sections of at least min_length measures.
+        """
+        if not self._measure_stats:
+            return []
+
+        max_measure = max(self._measure_stats.keys())
+        weak_runs: list[tuple[int, int, float]] = []
+        run_start = None
+        run_hits = 0
+        run_total = 0
+
+        for m in range(max_measure + 1):
+            stats = self._measure_stats.get(m)
+            if stats is None:
+                # No notes in this measure — not weak, break any run
+                if run_start is not None and (m - run_start) >= min_length:
+                    acc = run_hits / run_total if run_total > 0 else 0.0
+                    weak_runs.append((run_start, m - 1, acc * 100))
+                run_start = None
+                run_hits = 0
+                run_total = 0
+                continue
+
+            total = stats["hits"] + stats["close"] + stats["misses"]
+            if total == 0:
+                if run_start is not None and (m - run_start) >= min_length:
+                    acc = run_hits / run_total if run_total > 0 else 0.0
+                    weak_runs.append((run_start, m - 1, acc * 100))
+                run_start = None
+                run_hits = 0
+                run_total = 0
+                continue
+
+            acc = stats["hits"] / total
+            if acc < threshold:
+                if run_start is None:
+                    run_start = m
+                    run_hits = 0
+                    run_total = 0
+                run_hits += stats["hits"]
+                run_total += total
+            else:
+                if run_start is not None and (m - run_start) >= min_length:
+                    run_acc = run_hits / run_total if run_total > 0 else 0.0
+                    weak_runs.append((run_start, m - 1, run_acc * 100))
+                run_start = None
+                run_hits = 0
+                run_total = 0
+
+        # Close any open run
+        if run_start is not None and (max_measure + 1 - run_start) >= min_length:
+            acc = run_hits / run_total if run_total > 0 else 0.0
+            weak_runs.append((run_start, max_measure, acc * 100))
+
+        # Sort by accuracy ascending (weakest first)
+        weak_runs.sort(key=lambda x: x[2])
+        return weak_runs
+
     def reset(self) -> None:
         """Clear all state. Call on seek/restart."""
         self._note_states.clear()
         self.hits = 0
         self.close = 0
         self.misses = 0
+        self._measure_stats.clear()

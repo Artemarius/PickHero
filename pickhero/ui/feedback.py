@@ -11,22 +11,19 @@ import pygame
 
 from pickhero.matcher import MatchResult, MatchType
 from pickhero.tabs.timeline import NoteEvent
-from pickhero.ui.colors import (
-    FEEDBACK_HIT,
-    FEEDBACK_CLOSE,
-    FEEDBACK_MISS,
-    FEEDBACK_STREAK,
-    HUD_TEXT_COLOR,
-    dimmed,
-)
+from pickhero.ui.colors import dimmed, get_theme
 
 EFFECT_DURATION_MS = 500.0
 
-_MATCH_COLORS = {
-    MatchType.HIT: FEEDBACK_HIT,
-    MatchType.CLOSE: FEEDBACK_CLOSE,
-    MatchType.MISS: FEEDBACK_MISS,
-}
+
+def _match_color(match_type: MatchType) -> tuple[int, int, int]:
+    """Get the feedback color for a match type from the active theme."""
+    t = get_theme()
+    return {
+        MatchType.HIT: t.feedback_hit,
+        MatchType.CLOSE: t.feedback_close,
+        MatchType.MISS: t.feedback_miss,
+    }.get(match_type, t.hud_text)
 
 
 @dataclass
@@ -72,21 +69,16 @@ class FeedbackRenderer:
         playback_ms: float,
         is_past: bool,
     ) -> tuple[int, int, int]:
-        """Get the display color for a note event.
-
-        Returns feedback color if an active effect exists, otherwise
-        base_color (or dimmed if past the hit zone).
-        """
+        """Get the display color for a note event."""
         key = (event.timestamp_ms, event.string)
         effect = self._effects.get(key)
         if effect is not None:
             elapsed = playback_ms - effect.start_ms
+            color = _match_color(effect.match_type)
             if elapsed <= EFFECT_DURATION_MS:
-                return _MATCH_COLORS.get(effect.match_type, base_color)
+                return color
             # Effect expired but state is permanent — still show color (dimmed)
-            color = _MATCH_COLORS.get(effect.match_type)
-            if color is not None:
-                return dimmed(color, 0.6)
+            return dimmed(color, 0.6)
 
         return dimmed(base_color) if is_past else base_color
 
@@ -95,19 +87,21 @@ class FeedbackRenderer:
         """Draw streak counter if streak >= 3."""
         if self._streak < 3:
             return
+        t = get_theme()
         text = f"{self._streak}x streak"
-        surf = font.render(text, True, FEEDBACK_STREAK)
+        surf = font.render(text, True, t.feedback_streak)
         surface.blit(surf, (x - surf.get_width() // 2, y))
 
     def draw_stats(self, surface: pygame.Surface, stats: dict,
                    font: pygame.font.Font, x: int, y: int) -> None:
         """Draw accuracy stats (top-right area)."""
+        t = get_theme()
         acc = stats["accuracy_percent"]
         line1 = f"Accuracy: {acc:.0f}%"
         line2 = f"H:{stats['hits']} C:{stats['close']} M:{stats['misses']}"
 
-        surf1 = font.render(line1, True, FEEDBACK_HIT if acc >= 80 else HUD_TEXT_COLOR)
-        surf2 = font.render(line2, True, HUD_TEXT_COLOR)
+        surf1 = font.render(line1, True, t.feedback_hit if acc >= 80 else t.hud_text)
+        surf2 = font.render(line2, True, t.hud_text)
 
         surface.blit(surf1, (x - surf1.get_width(), y))
         surface.blit(surf2, (x - surf2.get_width(), y + surf1.get_height() + 2))

@@ -4,7 +4,6 @@ Settings stored as JSON in the user's home directory.
 """
 
 import json
-import os
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -45,12 +44,21 @@ class Config:
     chord_threshold_ms: float = 50.0
     backing_track_enabled: bool = True
     count_in_beats: int = 4
+    theme: str = "dark"
+    max_fret: int = 24
+    active_strings: list[bool] = field(default_factory=lambda: [True] * 6)
+    chord_partial_credit: bool = True
+
+    # Store default for HUD comparison (not serialized)
+    _default_chord_partial_credit: bool = field(default=True, repr=False)
 
     def save(self):
         """Save settings to JSON file."""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        data = asdict(self)
+        data.pop("_default_chord_partial_credit", None)
         with open(CONFIG_FILE, "w") as f:
-            json.dump(asdict(self), f, indent=2)
+            json.dump(data, f, indent=2)
 
     @classmethod
     def load(cls) -> "Config":
@@ -60,6 +68,7 @@ class Config:
         try:
             with open(CONFIG_FILE) as f:
                 data = json.load(f)
+            data.pop("_default_chord_partial_credit", None)
             audio_data = data.pop("audio", {})
             display_data = data.pop("display", {})
             return cls(

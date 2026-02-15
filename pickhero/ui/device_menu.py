@@ -10,16 +10,7 @@ import pygame
 
 from pickhero.audio.input import list_audio_devices
 from pickhero.config import Config
-from pickhero.ui.colors import (
-    BG_COLOR,
-    HUD_ACCENT_COLOR,
-    HUD_TEXT_COLOR,
-    MENU_BG_COLOR,
-    MENU_CHECK_COLOR,
-    MENU_ITEM_COLOR,
-    MENU_SELECTED_BG,
-    MENU_SELECTED_COLOR,
-)
+from pickhero.ui.colors import get_theme
 
 # Max items visible before scrolling
 VISIBLE_ITEMS = 14
@@ -106,7 +97,8 @@ class DeviceMenuScreen:
 
     def render(self, surface: pygame.Surface) -> None:
         """Draw the device selector screen."""
-        surface.fill(MENU_BG_COLOR)
+        t = get_theme()
+        surface.fill(t.menu_bg)
         w, h = surface.get_size()
 
         title_font = _get_font("arial", 36)
@@ -114,11 +106,11 @@ class DeviceMenuScreen:
         hint_font = _get_font("arial", 16)
 
         # Title
-        title_surf = title_font.render("Audio Device", True, HUD_ACCENT_COLOR)
+        title_surf = title_font.render("Audio Device", True, t.hud_accent)
         surface.blit(title_surf, (w // 2 - title_surf.get_width() // 2, 24))
 
         sub_surf = hint_font.render(
-            "Select an audio input device", True, HUD_TEXT_COLOR
+            "Select an audio input device", True, t.hud_text
         )
         surface.blit(sub_surf, (w // 2 - sub_surf.get_width() // 2, 68))
 
@@ -146,17 +138,17 @@ class DeviceMenuScreen:
             if i == self._selected:
                 pygame.draw.rect(
                     surface,
-                    MENU_SELECTED_BG,
+                    t.menu_selected_bg,
                     (list_left - 8, y, list_width, item_h),
                     border_radius=4,
                 )
-                color = MENU_SELECTED_COLOR
+                color = t.menu_selected
             else:
-                color = MENU_ITEM_COLOR
+                color = t.menu_item
 
             # Active device indicator
             if is_active:
-                check = item_font.render("●", True, MENU_CHECK_COLOR)
+                check = item_font.render("●", True, t.menu_check)
                 surface.blit(check, (list_left - 4, y + 4))
 
             text_surf = item_font.render(label, True, color)
@@ -164,16 +156,16 @@ class DeviceMenuScreen:
 
         # Scroll indicators
         if self._scroll_offset > 0:
-            arrow = hint_font.render("▲ more", True, HUD_TEXT_COLOR)
+            arrow = hint_font.render("▲ more", True, t.hud_text)
             surface.blit(arrow, (w // 2 - arrow.get_width() // 2, list_top - 20))
         if visible_end < len(items):
-            arrow = hint_font.render("▼ more", True, HUD_TEXT_COLOR)
+            arrow = hint_font.render("▼ more", True, t.hud_text)
             y_bottom = list_top + VISIBLE_ITEMS * item_h + 4
             surface.blit(arrow, (w // 2 - arrow.get_width() // 2, y_bottom))
 
         # Hints
         hint = "UP/DOWN: navigate  |  ENTER: select  |  R: refresh  |  ESC: back"
-        hint_surf = hint_font.render(hint, True, HUD_TEXT_COLOR)
+        hint_surf = hint_font.render(hint, True, t.hud_text)
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, h - 36))
 
     def _ensure_visible(self) -> None:

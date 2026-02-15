@@ -12,14 +12,7 @@ import pygame
 from pickhero.audio.input import list_audio_devices
 from pickhero.config import Config
 from pickhero.progress import ProgressTracker
-from pickhero.ui.colors import (
-    HUD_ACCENT_COLOR,
-    HUD_TEXT_COLOR,
-    MENU_BG_COLOR,
-    MENU_ITEM_COLOR,
-    MENU_SELECTED_BG,
-    MENU_SELECTED_COLOR,
-)
+from pickhero.ui.colors import cycle_theme, get_theme
 
 GP_EXTENSIONS = {".gp3", ".gp4", ".gp5"}
 
@@ -161,6 +154,14 @@ class MenuScreen:
                     self._ensure_visible()
                 return None
 
+            # T key: toggle theme (only when not searching to avoid conflict)
+            if event.key == pygame.K_t and not self._search_text:
+                name = cycle_theme()
+                if self._config:
+                    self._config.theme = name
+                    self._config.save()
+                return None
+
             # Printable character → append to search
             ch = event.unicode
             if ch and ch.isprintable() and ch not in ("\r", "\n", "\t"):
@@ -181,7 +182,8 @@ class MenuScreen:
 
     def render(self, surface: pygame.Surface) -> None:
         """Draw the menu screen."""
-        surface.fill(MENU_BG_COLOR)
+        t = get_theme()
+        surface.fill(t.menu_bg)
         w, h = surface.get_size()
         files = self._display_files
 
@@ -190,12 +192,12 @@ class MenuScreen:
         hint_font = _get_font("arial", 16)
 
         # Title
-        title_surf = title_font.render("PickHero", True, HUD_ACCENT_COLOR)
+        title_surf = title_font.render("PickHero", True, t.hud_accent)
         surface.blit(title_surf, (w // 2 - title_surf.get_width() // 2, 24))
 
         # Subtitle
         sub_surf = hint_font.render(
-            "Select a song to play", True, HUD_TEXT_COLOR
+            "Select a song to play", True, t.hud_text
         )
         surface.blit(sub_surf, (w // 2 - sub_surf.get_width() // 2, 68))
 
@@ -207,10 +209,10 @@ class MenuScreen:
         # Search bar
         if self._search_text:
             search_label = f"Search: {self._search_text}_"
-            search_surf = item_font.render(search_label, True, HUD_ACCENT_COLOR)
+            search_surf = item_font.render(search_label, True, t.hud_accent)
             surface.blit(search_surf, (list_left, 90))
             count_label = f"({len(files)} of {len(self._files)} songs)"
-            count_surf = hint_font.render(count_label, True, HUD_TEXT_COLOR)
+            count_surf = hint_font.render(count_label, True, t.hud_text)
             surface.blit(count_surf, (list_left + search_surf.get_width() + 12, 95))
             list_top = 120
 
@@ -222,7 +224,7 @@ class MenuScreen:
                 )
             else:
                 empty_msg = f'No songs match "{self._search_text}"'
-            msg_surf = item_font.render(empty_msg, True, MENU_ITEM_COLOR)
+            msg_surf = item_font.render(empty_msg, True, t.menu_item)
             surface.blit(msg_surf, (w // 2 - msg_surf.get_width() // 2, h // 2))
         else:
             # File list
@@ -232,13 +234,13 @@ class MenuScreen:
                 if i == self._selected:
                     pygame.draw.rect(
                         surface,
-                        MENU_SELECTED_BG,
+                        t.menu_selected_bg,
                         (list_left - 8, y, list_width, item_h),
                         border_radius=4,
                     )
-                    color = MENU_SELECTED_COLOR
+                    color = t.menu_selected
                 else:
-                    color = MENU_ITEM_COLOR
+                    color = t.menu_item
 
                 label = files[i].name
                 text_surf = item_font.render(label, True, color)
@@ -249,30 +251,35 @@ class MenuScreen:
                     record = self._progress.get_best(files[i].stem)
                     if record is not None and record.attempts > 0:
                         pct = f"{record.best_accuracy:.0f}%"
-                        pct_surf = item_font.render(pct, True, HUD_ACCENT_COLOR)
+                        pct_surf = item_font.render(pct, True, t.hud_accent)
                         pct_x = list_left + list_width - pct_surf.get_width() - 8
                         surface.blit(pct_surf, (pct_x, y + 4))
 
             # Scroll indicators
             if self._scroll_offset > 0:
-                arrow = hint_font.render("▲ more", True, HUD_TEXT_COLOR)
+                arrow = hint_font.render("▲ more", True, t.hud_text)
                 surface.blit(arrow, (w // 2 - arrow.get_width() // 2, list_top - 20))
             if visible_end < len(files):
-                arrow = hint_font.render("▼ more", True, HUD_TEXT_COLOR)
+                arrow = hint_font.render("▼ more", True, t.hud_text)
                 y_bottom = list_top + VISIBLE_ITEMS * item_h + 4
                 surface.blit(arrow, (w // 2 - arrow.get_width() // 2, y_bottom))
 
         # Current audio device
         dev_text = f"Audio: {self._device_name}"
-        dev_surf = hint_font.render(dev_text, True, HUD_TEXT_COLOR)
-        surface.blit(dev_surf, (w // 2 - dev_surf.get_width() // 2, h - 56))
+        dev_surf = hint_font.render(dev_text, True, t.hud_text)
+        surface.blit(dev_surf, (w // 2 - dev_surf.get_width() // 2, h - 72))
+
+        # Scoring hint
+        score_hint = "Press A during playback to enable scoring"
+        score_surf = hint_font.render(score_hint, True, t.hud_text)
+        surface.blit(score_surf, (w // 2 - score_surf.get_width() // 2, h - 56))
 
         # Controls hint
         if self._search_text:
             hint = "BACKSPACE: edit  |  ESC: clear search  |  ENTER: select  |  UP/DOWN: navigate"
         else:
-            hint = "Type to search  |  UP/DOWN: navigate  |  ENTER: select  |  D: audio device  |  ESC: quit"
-        hint_surf = hint_font.render(hint, True, HUD_TEXT_COLOR)
+            hint = "Type to search  |  UP/DOWN: navigate  |  ENTER: select  |  D: audio device  |  T: theme  |  ESC: quit"
+        hint_surf = hint_font.render(hint, True, t.hud_text)
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, h - 36))
 
         # Store layout for hit testing

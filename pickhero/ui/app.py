@@ -13,6 +13,7 @@ from pickhero.audio.input import validate_device_index
 from pickhero.config import Config
 from pickhero.progress import ProgressTracker
 from pickhero.tabs.loader import extract_backing_track, load_gp_file
+from pickhero.ui.colors import set_theme
 from pickhero.ui.device_menu import DeviceMenuScreen
 from pickhero.ui.menu import MenuScreen
 from pickhero.ui.scrolling import PlayingScreen
@@ -32,6 +33,9 @@ class App:
 
     def run(self) -> None:
         """Initialize PyGame, run main loop, clean up."""
+        # Apply saved theme
+        set_theme(self._config.theme)
+
         # Validate saved audio device — fall back to default if unavailable
         if not validate_device_index(self._config.audio.device_index):
             print(

@@ -1,6 +1,21 @@
 """PickHero application entry point."""
 
 import sys
+from pathlib import Path
+
+from pickhero.config import Config
+
+
+def _resolve_songs_dir(config: Config) -> None:
+    """Fix songs_dir for frozen exe: look next to the executable."""
+    if getattr(sys, "frozen", False):
+        base_dir = Path(sys.executable).parent
+    else:
+        base_dir = Path.cwd()
+
+    songs_path = Path(config.songs_dir)
+    if not songs_path.is_absolute():
+        config.songs_dir = str(base_dir / songs_path)
 
 
 def main():
@@ -13,5 +28,7 @@ def main():
             print("\nStopped.")
             sys.exit(0)
     else:
+        config = Config.load()
+        _resolve_songs_dir(config)
         from pickhero.ui.app import App
-        App().run()
+        App(config=config).run()

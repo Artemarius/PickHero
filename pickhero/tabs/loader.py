@@ -13,7 +13,7 @@ import guitarpro
 from pickhero.audio.midi_playback import (
     NOTE_ON, NOTE_OFF, PROGRAM_CHANGE, BackingTrack, MidiEvent,
 )
-from pickhero.tabs.timeline import NoteEvent, SongMetadata, Timeline
+from pickhero.tabs.timeline import MeasureInfo, NoteEvent, SongMetadata, Timeline
 
 # GP tick resolution: 960 ticks = 1 quarter note
 TICKS_PER_QUARTER = 960
@@ -105,7 +105,7 @@ def _extract_tuning(track: guitarpro.Track) -> dict[int, int]:
 def _extract_notes(track: guitarpro.Track, tempo_map: TempoMap) -> list[NoteEvent]:
     """Extract all playable notes from a track."""
     notes = []
-    for measure in track.measures:
+    for measure_idx, measure in enumerate(track.measures):
         for voice in measure.voices:
             for beat in voice.beats:
                 timestamp_ms = tempo_map.tick_to_ms(beat.start)
@@ -123,9 +123,38 @@ def _extract_notes(track: guitarpro.Track, tempo_map: TempoMap) -> list[NoteEven
                             midi_note=note.realValue,
                             string=note.string,
                             fret=note.value,
+                            measure=measure_idx,
                         )
                     )
     return notes
+
+
+def _extract_measures(track: guitarpro.Track, tempo_map: TempoMap) -> list[MeasureInfo]:
+    """Extract measure time ranges from a track."""
+    measures = []
+    for idx, measure in enumerate(track.measures):
+        # Each measure has a header with start tick. We compute start/end from beats.
+        beats_in_measure = []
+        for voice in measure.voices:
+            for beat in voice.beats:
+                beats_in_measure.append(beat.start)
+                beats_in_measure.append(beat.start + beat.duration.time)
+
+        if beats_in_measure:
+            start_tick = min(beats_in_measure)
+            end_tick = max(beats_in_measure)
+            start_ms = tempo_map.tick_to_ms(start_tick)
+            end_ms = tempo_map.tick_to_ms(end_tick)
+        else:
+            # Empty measure — use previous end or 0
+            if measures:
+                start_ms = measures[-1].end_ms
+            else:
+                start_ms = 0.0
+            end_ms = start_ms
+
+        measures.append(MeasureInfo(index=idx, start_ms=start_ms, end_ms=end_ms))
+    return measures
 
 
 def list_tracks(path: str | Path) -> list[dict]:
@@ -175,6 +204,7 @@ def load_gp_file(path: str | Path, track_index: int | None = None) -> Timeline:
                 break
 
     notes = _extract_notes(track, tempo_map)
+    measures = _extract_measures(track, tempo_map)
 
     metadata = SongMetadata(
         title=song.title or "",
@@ -186,7 +216,7 @@ def load_gp_file(path: str | Path, track_index: int | None = None) -> Timeline:
         track_index=selected_index,
     )
 
-    return Timeline(notes, metadata)
+    return Timeline(notes, metadata, measures=measures)
 
 
 def extract_backing_track(

@@ -17,21 +17,10 @@ from pickhero.matcher import NoteMatcher
 from pickhero.progress import ProgressTracker
 from pickhero.tabs.timeline import NoteEvent, Timeline
 from pickhero.ui.colors import (
-    BG_COLOR,
-    HIT_ZONE_COLOR,
-    HUD_ACCENT_COLOR,
-    HUD_TEXT_COLOR,
-    LANE_BG_EVEN,
-    LANE_BG_ODD,
-    LANE_LINE_COLOR,
-    LOOP_MARKER_COLOR,
-    LOOP_MARKER_DISABLED_COLOR,
-    LOOP_REGION_COLOR,
-    LOOP_REGION_DISABLED_COLOR,
-    NOTE_BORDER_COLOR,
-    NOTE_TEXT_COLOR,
     STRING_COLORS,
+    cycle_theme,
     dimmed,
+    get_theme,
 )
 from pickhero.ui.feedback import FeedbackRenderer
 
@@ -46,6 +35,9 @@ NOTE_CORNER_RADIUS = 4
 LEFT_MARGIN_MS = 2000
 # Right margin for notes not yet visible (ms)
 RIGHT_MARGIN_MS = 500
+
+# Difficulty filter: fret limit cycle values
+FRET_LIMITS = [24, 12, 7, 5, 3]
 
 
 def _get_font(name: str, size: int) -> pygame.font.Font:
@@ -131,6 +123,25 @@ class PlayingScreen:
         if backing_track is not None and len(backing_track) > 0:
             self._init_midi_player(backing_track)
 
+        # Difficulty filter
+        self._max_fret: int = self._config.max_fret
+        self._active_strings: list[bool] = list(self._config.active_strings)
+
+        # Chord partial credit mode
+        self._chord_partial_credit: bool = self._config.chord_partial_credit
+
+    def _note_passes_filter(self, note: NoteEvent) -> bool:
+        """Check if a note passes the difficulty filter."""
+        if note.fret > self._max_fret:
+            return False
+        if not self._active_strings[note.string - 1]:
+            return False
+        return True
+
+    def _is_filter_active(self) -> bool:
+        """Check if any difficulty filter is active."""
+        return self._max_fret < 24 or not all(self._active_strings)
+
     def toggle_play(self) -> None:
         """Toggle play/pause. Restarts with count-in if at beginning or past end."""
         if self._playback_ms >= self._timeline.duration_ms and not self._playing:
@@ -139,6 +150,7 @@ class PlayingScreen:
             self._last_count_in_beat = -1
             self._song_completed = False
             self._is_new_best = False
+            self._weakest_sections = []
             if self._matcher:
                 self._matcher.reset()
             self._feedback.reset()
@@ -148,6 +160,7 @@ class PlayingScreen:
             self._last_count_in_beat = -1
             self._song_completed = False
             self._is_new_best = False
+            self._weakest_sections = []
         self._playing = not self._playing
         if self._playing:
             self._last_tick = time.perf_counter()
@@ -269,17 +282,22 @@ class PlayingScreen:
                 self._midi_player.pause()
             self._stop_audio()
 
-            # Record progress on song completion
-            if (not self._song_completed
-                    and self._audio_enabled
-                    and self._matcher is not None
-                    and self._progress_tracker is not None
-                    and self._song_key):
-                stats = self._matcher.get_statistics()
-                if stats["total"] > 0:
-                    self._is_new_best = self._progress_tracker.record_result(
-                        self._song_key, stats
-                    )
+            if not self._song_completed:
+                if (self._audio_enabled
+                        and self._matcher is not None
+                        and self._progress_tracker is not None
+                        and self._song_key):
+                    # Audio-scored completion
+                    stats = self._matcher.get_statistics()
+                    if stats["total"] > 0:
+                        self._is_new_best = self._progress_tracker.record_result(
+                            self._song_key, stats
+                        )
+                        self._weakest_sections = self._matcher.get_weakest_sections()
+                        self._song_completed = True
+                elif not self._audio_enabled:
+                    # Auto-scroll (passive) completion
+                    self._weakest_sections = []
                     self._song_completed = True
 
     def handle_event(self, event: pygame.event.Event) -> str | None:
@@ -316,14 +334,35 @@ class PlayingScreen:
             self.set_noise_gate_db(self._noise_gate_db - 5)
         elif event.key == pygame.K_RIGHTBRACKET:
             self.set_noise_gate_db(self._noise_gate_db + 5)
+        elif event.key == pygame.K_t:
+            self._cycle_theme()
+        elif event.key == pygame.K_f:
+            self._cycle_fret_limit()
+        elif event.key == pygame.K_F1:
+            self._toggle_string(1)
+        elif event.key == pygame.K_F2:
+            self._toggle_string(2)
+        elif event.key == pygame.K_F3:
+            self._toggle_string(3)
+        elif event.key == pygame.K_F4:
+            self._toggle_string(4)
+        elif event.key == pygame.K_F5:
+            self._toggle_string(5)
+        elif event.key == pygame.K_F6:
+            self._toggle_string(6)
+        elif event.key == pygame.K_c:
+            self._toggle_chord_mode()
+        elif event.key == pygame.K_l:
+            self._loop_weakest_section()
 
         return None
 
     def render(self, surface: pygame.Surface) -> None:
         """Draw the full playing screen."""
+        t = get_theme()
         layout = self._layout(surface)
 
-        surface.fill(BG_COLOR)
+        surface.fill(t.bg)
         self._draw_lanes(surface, layout)
         self._draw_loop_region(surface, layout)
         self._draw_hit_zone(surface, layout)
@@ -366,9 +405,10 @@ class PlayingScreen:
     # -- Drawing --
 
     def _draw_lanes(self, surface: pygame.Surface, layout: _Layout) -> None:
+        t = get_theme()
         for i in range(6):
             y = LANE_TOP_MARGIN + i * layout.lane_height
-            bg = LANE_BG_EVEN if i % 2 == 0 else LANE_BG_ODD
+            bg = t.lane_bg_even if i % 2 == 0 else t.lane_bg_odd
             pygame.draw.rect(
                 surface, bg,
                 (0, y, layout.screen_w, layout.lane_height),
@@ -376,17 +416,19 @@ class PlayingScreen:
             # Divider line at bottom of lane
             line_y = int(y + layout.lane_height)
             pygame.draw.line(
-                surface, LANE_LINE_COLOR,
+                surface, t.lane_line,
                 (0, line_y), (layout.screen_w, line_y),
             )
 
     def _draw_hit_zone(self, surface: pygame.Surface, layout: _Layout) -> None:
+        t = get_theme()
         x = int(layout.hit_zone_x)
         top = int(LANE_TOP_MARGIN)
         bottom = int(LANE_TOP_MARGIN + 6 * layout.lane_height)
-        pygame.draw.line(surface, HIT_ZONE_COLOR, (x, top), (x, bottom), 2)
+        pygame.draw.line(surface, t.hit_zone, (x, top), (x, bottom), 2)
 
     def _draw_notes(self, surface: pygame.Surface, layout: _Layout) -> None:
+        t = get_theme()
         # Visible time range with margins for long notes
         view_start = self._playback_ms - LEFT_MARGIN_MS
         view_end = self._playback_ms + self._visible_window_ms + RIGHT_MARGIN_MS
@@ -396,6 +438,10 @@ class PlayingScreen:
         fret_font = _get_font("consolas", 14)
 
         for note in notes:
+            # Difficulty filter: skip notes that fail
+            if not self._note_passes_filter(note):
+                continue
+
             x = self.note_x(
                 note.timestamp_ms, self._playback_ms,
                 layout.hit_zone_x, layout.pixels_per_ms,
@@ -422,16 +468,17 @@ class PlayingScreen:
 
             rect = pygame.Rect(int(x), int(y), int(w), int(layout.note_h))
             pygame.draw.rect(surface, color, rect, border_radius=NOTE_CORNER_RADIUS)
-            pygame.draw.rect(surface, NOTE_BORDER_COLOR, rect, width=2, border_radius=NOTE_CORNER_RADIUS)
+            pygame.draw.rect(surface, t.note_border, rect, width=2, border_radius=NOTE_CORNER_RADIUS)
 
             # Fret number — only draw if note is wide enough to fit it
-            fret_text = fret_font.render(str(note.fret), True, NOTE_TEXT_COLOR)
+            fret_text = fret_font.render(str(note.fret), True, t.note_text)
             if fret_text.get_width() + 4 <= rect.width:
                 tx = rect.x + rect.width // 2 - fret_text.get_width() // 2
                 ty = rect.y + rect.height // 2 - fret_text.get_height() // 2
                 surface.blit(fret_text, (tx, ty))
 
     def _draw_hud(self, surface: pygame.Surface, layout: _Layout) -> None:
+        t = get_theme()
         title_font = _get_font("arial", 20)
         time_font = _get_font("consolas", 20)
         hint_font = _get_font("arial", 14)
@@ -446,7 +493,7 @@ class PlayingScreen:
             remaining_beats = min(remaining_beats, self._config.count_in_beats)
             countdown_font = _get_font("arial", 120)
             countdown_surf = countdown_font.render(
-                str(remaining_beats), True, HUD_ACCENT_COLOR
+                str(remaining_beats), True, t.hud_accent
             )
             surface.blit(
                 countdown_surf,
@@ -462,20 +509,20 @@ class PlayingScreen:
         title = meta.title or "Untitled"
         if meta.artist:
             title = f"{meta.artist} — {title}"
-        title_surf = title_font.render(title, True, HUD_TEXT_COLOR)
+        title_surf = title_font.render(title, True, t.hud_text)
         surface.blit(title_surf, (12, 12))
 
         # Top-center: BPM with tempo percentage (and streak below it)
         pct = int(self._tempo_factor * 100)
         bpm_text = f"{meta.tempo} BPM ({pct}%)"
-        bpm_surf = title_font.render(bpm_text, True, HUD_ACCENT_COLOR)
+        bpm_surf = title_font.render(bpm_text, True, t.hud_accent)
         surface.blit(bpm_surf, (w // 2 - bpm_surf.get_width() // 2, 12))
 
         # Loop status below BPM
         loop_y = 36
         loop_info = self._loop_hud_text()
         if loop_info:
-            loop_color = HUD_ACCENT_COLOR if self._loop_enabled else HUD_TEXT_COLOR
+            loop_color = t.hud_accent if self._loop_enabled else t.hud_text
             loop_surf = hint_font.render(loop_info, True, loop_color)
             surface.blit(loop_surf, (w // 2 - loop_surf.get_width() // 2, loop_y))
             loop_y += 18
@@ -487,7 +534,7 @@ class PlayingScreen:
         current = format_time(self._playback_ms)
         total = format_time(self._timeline.duration_ms)
         time_text = f"{current} / {total}"
-        time_surf = time_font.render(time_text, True, HUD_TEXT_COLOR)
+        time_surf = time_font.render(time_text, True, t.hud_text)
         surface.blit(time_surf, (w - time_surf.get_width() - 12, 12))
 
         # Top-right second line: accuracy stats
@@ -501,14 +548,17 @@ class PlayingScreen:
         # Top-right: noise gate (below stats, only when audio enabled)
         if self._audio_enabled:
             gate_text = f"Gate: {int(self._noise_gate_db)} dB"
-            gate_surf = hint_font.render(gate_text, True, HUD_ACCENT_COLOR)
+            gate_surf = hint_font.render(gate_text, True, t.hud_accent)
             surface.blit(gate_surf, (w - gate_surf.get_width() - 12, stats_bottom_y))
 
         # Bottom-center: play state + controls
         if self._playback_ms < 0:
             state = "Count-in"
         elif self._playing:
-            state = "Playing"
+            if self._audio_enabled:
+                state = "Playing"
+            else:
+                state = "Auto-scroll"
         else:
             state = "Paused"
         audio_state = "ON" if self._audio_enabled else "off"
@@ -523,19 +573,35 @@ class PlayingScreen:
             f"{backing_state}"
             f"|  I/O: loop {loop_state}  |  P: toggle  |  ESC: menu"
         )
-        hint_surf = hint_font.render(hint, True, HUD_TEXT_COLOR)
+        hint_surf = hint_font.render(hint, True, t.hud_text)
         y = layout.screen_h - LANE_BOTTOM_MARGIN + 8
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, y))
 
-        # Top-left second line: track name
+        # Top-left second line: track name + filter info
+        info_y = 38
         if meta.track_name:
             track_surf = hint_font.render(
-                f"Track: {meta.track_name}", True, HUD_TEXT_COLOR
+                f"Track: {meta.track_name}", True, t.hud_text
             )
-            surface.blit(track_surf, (12, 38))
+            surface.blit(track_surf, (12, info_y))
+            info_y += 16
+
+        # Difficulty filter HUD
+        filter_text = self._filter_hud_text()
+        if filter_text:
+            filter_surf = hint_font.render(filter_text, True, t.hud_accent)
+            surface.blit(filter_surf, (12, info_y))
+            info_y += 16
+
+        # Chord mode HUD
+        if self._chord_partial_credit != self._config._default_chord_partial_credit:
+            chord_text = "Chords: strict" if self._chord_partial_credit else "Chords: easy"
+            chord_surf = hint_font.render(chord_text, True, t.hud_accent)
+            surface.blit(chord_surf, (12, info_y))
 
     def _draw_completion_overlay(self, surface: pygame.Surface, layout: _Layout) -> None:
         """Draw the song completion results overlay."""
+        t = get_theme()
         w, h = layout.screen_w, layout.screen_h
 
         # Semi-transparent dark overlay
@@ -547,20 +613,20 @@ class PlayingScreen:
         stat_font = _get_font("consolas", 28)
         hint_font = _get_font("arial", 18)
 
-        center_y = h // 2 - 60
+        center_y = h // 2 - 80
 
         # "Song Complete!" header
-        header_surf = header_font.render("Song Complete!", True, HUD_ACCENT_COLOR)
+        header_surf = header_font.render("Song Complete!", True, t.hud_accent)
         surface.blit(header_surf, (w // 2 - header_surf.get_width() // 2, center_y))
 
-        # Accuracy stats
-        if self._matcher is not None:
+        if self._audio_enabled and self._matcher is not None:
+            # Accuracy stats
             stats = self._matcher.get_statistics()
             accuracy_text = (
                 f"Accuracy: {stats['accuracy_percent']:.1f}%  "
                 f"({stats['hits']}/{stats['total']})"
             )
-            acc_surf = stat_font.render(accuracy_text, True, HUD_TEXT_COLOR)
+            acc_surf = stat_font.render(accuracy_text, True, t.hud_text)
             surface.blit(acc_surf, (w // 2 - acc_surf.get_width() // 2, center_y + 60))
 
             # "New Best!" indicator
@@ -568,10 +634,113 @@ class PlayingScreen:
                 best_surf = stat_font.render("New Best!", True, (255, 220, 50))
                 surface.blit(best_surf, (w // 2 - best_surf.get_width() // 2, center_y + 100))
 
-        # Controls hint
-        hint_text = "SPACE to replay  |  ESC to menu"
-        hint_surf = hint_font.render(hint_text, True, HUD_TEXT_COLOR)
-        surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, center_y + 150))
+            # Weakest sections
+            weak = getattr(self, "_weakest_sections", [])
+            if weak:
+                section = weak[0]
+                weak_text = (
+                    f"Weakest: bars {section[0]+1}-{section[1]+1} "
+                    f"({section[2]:.0f}%) -- press L to loop"
+                )
+                weak_surf = hint_font.render(weak_text, True, t.feedback_close)
+                surface.blit(weak_surf, (w // 2 - weak_surf.get_width() // 2, center_y + 140))
+
+            # Controls hint
+            hint_text = "SPACE to replay  |  L to loop weak section  |  ESC to menu"
+            hint_surf = hint_font.render(hint_text, True, t.hud_text)
+            surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, center_y + 180))
+        else:
+            # Auto-scroll completion — no stats
+            hint_text = "SPACE to replay  |  ESC to menu"
+            hint_surf = hint_font.render(hint_text, True, t.hud_text)
+            surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, center_y + 70))
+
+    # -- Difficulty filter --
+
+    def _cycle_fret_limit(self) -> None:
+        """Cycle through fret limit options."""
+        try:
+            idx = FRET_LIMITS.index(self._max_fret)
+            self._max_fret = FRET_LIMITS[(idx + 1) % len(FRET_LIMITS)]
+        except ValueError:
+            self._max_fret = FRET_LIMITS[0]
+        self._config.max_fret = self._max_fret
+        self._config.save()
+        self._reset_matcher_for_filter()
+
+    def _toggle_string(self, string: int) -> None:
+        """Toggle a string on/off in the difficulty filter."""
+        idx = string - 1
+        self._active_strings[idx] = not self._active_strings[idx]
+        # Don't allow all strings to be off
+        if not any(self._active_strings):
+            self._active_strings[idx] = True
+            return
+        self._config.active_strings = list(self._active_strings)
+        self._config.save()
+        self._reset_matcher_for_filter()
+
+    def _reset_matcher_for_filter(self) -> None:
+        """Reset matcher when filter changes mid-song."""
+        if self._matcher:
+            self._matcher.reset()
+            self._matcher.note_filter = self._note_passes_filter
+        self._feedback.reset()
+
+    def _filter_hud_text(self) -> str | None:
+        """Return difficulty filter text for HUD, or None if default."""
+        parts = []
+        if self._max_fret < 24:
+            parts.append(f"Fret: 0-{self._max_fret}")
+        if not all(self._active_strings):
+            strs = " ".join(
+                str(i + 1) if on else "_"
+                for i, on in enumerate(self._active_strings)
+            )
+            parts.append(f"Strings: {strs}")
+        return "  |  ".join(parts) if parts else None
+
+    # -- Theme --
+
+    def _cycle_theme(self) -> None:
+        """Toggle between dark and light theme."""
+        name = cycle_theme()
+        self._config.theme = name
+        self._config.save()
+
+    # -- Chord mode --
+
+    def _toggle_chord_mode(self) -> None:
+        """Toggle chord partial credit on/off."""
+        self._chord_partial_credit = not self._chord_partial_credit
+        self._config.chord_partial_credit = self._chord_partial_credit
+        self._config.save()
+        if self._matcher:
+            self._matcher.chord_partial_credit = self._chord_partial_credit
+
+    # -- Loop weakest section --
+
+    def _loop_weakest_section(self) -> None:
+        """Set loop to weakest section from completion screen."""
+        weak = getattr(self, "_weakest_sections", [])
+        if not weak or not self._song_completed:
+            return
+        section = weak[0]
+        start_measure, end_measure = section[0], section[1]
+        # Get measure time ranges from timeline
+        measures = self._timeline.measures
+        if not measures or start_measure >= len(measures):
+            return
+        start_ms = measures[start_measure].start_ms
+        end_idx = min(end_measure + 1, len(measures) - 1)
+        end_ms = measures[end_idx].end_ms if end_idx < len(measures) else self._timeline.duration_ms
+        self._loop_start_ms = start_ms
+        self._loop_end_ms = end_ms
+        self._loop_enabled = True
+        self._song_completed = False
+        self._is_new_best = False
+        self._weakest_sections = []
+        self.seek(start_ms)
 
     # -- Loop control --
 
@@ -628,12 +797,13 @@ class PlayingScreen:
         if self._loop_start_ms is None and self._loop_end_ms is None:
             return
 
+        t = get_theme()
         lane_top = int(LANE_TOP_MARGIN)
         lane_bottom = int(LANE_TOP_MARGIN + 6 * layout.lane_height)
         lane_h = lane_bottom - lane_top
 
-        marker_color = LOOP_MARKER_COLOR if self._loop_enabled else LOOP_MARKER_DISABLED_COLOR
-        region_color = LOOP_REGION_COLOR if self._loop_enabled else LOOP_REGION_DISABLED_COLOR
+        marker_color = t.loop_marker if self._loop_enabled else t.loop_marker_disabled
+        region_color = t.loop_region if self._loop_enabled else t.loop_region_disabled
 
         # Draw shaded region between both markers
         if self._loop_start_ms is not None and self._loop_end_ms is not None:
@@ -693,6 +863,8 @@ class PlayingScreen:
                 timing_window_ms=self._config.timing_window_ms,
                 audio_offset_ms=self._playback_ms + self._config.audio_latency_offset_ms,
                 chord_threshold_ms=self._config.chord_threshold_ms,
+                note_filter=self._note_passes_filter if self._is_filter_active() else None,
+                chord_partial_credit=self._chord_partial_credit,
             )
             self._feedback.reset()
         except Exception as e:
