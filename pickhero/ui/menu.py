@@ -11,6 +11,7 @@ import pygame
 
 from pickhero.audio.input import list_audio_devices
 from pickhero.config import Config
+from pickhero.progress import ProgressTracker
 from pickhero.ui.colors import (
     HUD_ACCENT_COLOR,
     HUD_TEXT_COLOR,
@@ -38,9 +39,11 @@ def _get_font(name: str, size: int) -> pygame.font.Font:
 class MenuScreen:
     """File browser for selecting GP tab files."""
 
-    def __init__(self, songs_dir: Path, config: Config | None = None):
+    def __init__(self, songs_dir: Path, config: Config | None = None,
+                 progress: ProgressTracker | None = None):
         self._songs_dir = Path(songs_dir)
         self._config = config
+        self._progress = progress
         self._files: list[Path] = []
         self._search_text: str = ""
         self._filtered_files: list[Path] = []
@@ -240,6 +243,15 @@ class MenuScreen:
                 label = files[i].name
                 text_surf = item_font.render(label, True, color)
                 surface.blit(text_surf, (list_left, y + 4))
+
+                # Show best accuracy if available
+                if self._progress is not None:
+                    record = self._progress.get_best(files[i].stem)
+                    if record is not None and record.attempts > 0:
+                        pct = f"{record.best_accuracy:.0f}%"
+                        pct_surf = item_font.render(pct, True, HUD_ACCENT_COLOR)
+                        pct_x = list_left + list_width - pct_surf.get_width() - 8
+                        surface.blit(pct_surf, (pct_x, y + 4))
 
             # Scroll indicators
             if self._scroll_offset > 0:

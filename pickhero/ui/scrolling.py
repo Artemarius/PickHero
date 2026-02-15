@@ -14,6 +14,7 @@ import pygame
 from pickhero.audio.midi_playback import BackingTrack, MidiPlayer
 from pickhero.config import Config
 from pickhero.matcher import NoteMatcher
+from pickhero.progress import ProgressTracker
 from pickhero.tabs.timeline import NoteEvent, Timeline
 from pickhero.ui.colors import (
     BG_COLOR,
@@ -83,7 +84,9 @@ class PlayingScreen:
 
     def __init__(self, timeline: Timeline, visible_beats: int = 4,
                  hit_zone_fraction: float = 0.20, config: Config | None = None,
-                 backing_track: BackingTrack | None = None):
+                 backing_track: BackingTrack | None = None,
+                 progress_tracker: ProgressTracker | None = None,
+                 song_key: str = ""):
         self._timeline = timeline
         self._visible_beats = visible_beats
         self._hit_zone_fraction = hit_zone_fraction
@@ -99,6 +102,11 @@ class PlayingScreen:
         self._ms_per_beat = 60_000 / tempo
         self._visible_window_ms = self._visible_beats * self._ms_per_beat
 
+        # Count-in state
+        count_in_beats = max(0, self._config.count_in_beats)
+        self._count_in_ms = count_in_beats * self._ms_per_beat
+        self._last_count_in_beat: int = -1
+
         # Audio matching
         self._audio_capture = None  # AudioCapture, created on demand
         self._matcher: NoteMatcher | None = None
@@ -111,6 +119,12 @@ class PlayingScreen:
         self._loop_end_ms: float | None = None
         self._loop_enabled: bool = False
 
+        # Progress tracking
+        self._progress_tracker = progress_tracker
+        self._song_key = song_key
+        self._song_completed = False
+        self._is_new_best = False
+
         # MIDI backing track
         self._midi_player: MidiPlayer | None = None
         self._backing_muted = not self._config.backing_track_enabled
@@ -118,19 +132,31 @@ class PlayingScreen:
             self._init_midi_player(backing_track)
 
     def toggle_play(self) -> None:
-        """Toggle play/pause. Restarts if past the end."""
+        """Toggle play/pause. Restarts with count-in if at beginning or past end."""
         if self._playback_ms >= self._timeline.duration_ms and not self._playing:
-            self._playback_ms = 0.0
+            # Restart from beginning with count-in
+            self._playback_ms = -self._count_in_ms if self._count_in_ms > 0 else 0.0
+            self._last_count_in_beat = -1
+            self._song_completed = False
+            self._is_new_best = False
             if self._matcher:
                 self._matcher.reset()
             self._feedback.reset()
+        elif self._playback_ms == 0.0 and not self._playing and self._count_in_ms > 0:
+            # Starting from the very beginning — add count-in
+            self._playback_ms = -self._count_in_ms
+            self._last_count_in_beat = -1
+            self._song_completed = False
+            self._is_new_best = False
         self._playing = not self._playing
         if self._playing:
             self._last_tick = time.perf_counter()
-            if self._audio_enabled:
+            # Only start audio capture when past count-in
+            if self._audio_enabled and self._playback_ms >= 0:
                 self._start_audio()
             if self._midi_player is not None:
-                self._midi_player.seek(self._playback_ms)
+                if self._playback_ms >= 0:
+                    self._midi_player.seek(self._playback_ms)
         else:
             self._last_tick = None
             self._stop_audio()
@@ -178,13 +204,33 @@ class PlayingScreen:
             return
 
         now = time.perf_counter()
+        prev_ms = self._playback_ms
         if self._last_tick is not None:
             elapsed_ms = (now - self._last_tick) * 1000.0 * self._tempo_factor
             self._playback_ms += elapsed_ms
         self._last_tick = now
 
-        # Process audio matching
-        if self._audio_enabled and self._audio_capture is not None and self._matcher is not None:
+        # Count-in: play metronome clicks and start audio/midi when crossing 0
+        if prev_ms < 0:
+            # Play count-in clicks at beat boundaries
+            if self._count_in_ms > 0 and self._midi_player is not None:
+                beat_index = int((self._count_in_ms + self._playback_ms) / self._ms_per_beat)
+                if beat_index > self._last_count_in_beat:
+                    self._midi_player.play_click(100)
+                    self._last_count_in_beat = beat_index
+
+            # Crossed from negative to non-negative — song starts
+            if self._playback_ms >= 0:
+                if self._audio_enabled:
+                    self._start_audio()
+                if self._midi_player is not None:
+                    self._midi_player.seek(0)
+
+        # Process audio matching (only during actual song, not count-in)
+        if (self._playback_ms >= 0
+                and self._audio_enabled
+                and self._audio_capture is not None
+                and self._matcher is not None):
             detected = self._audio_capture.get_notes()
             for d in detected:
                 d.timestamp_ms *= self._tempo_factor
@@ -192,11 +238,12 @@ class PlayingScreen:
             self._feedback.add_results(results, self._playback_ms)
             self._feedback.cleanup(self._playback_ms)
 
-        # Advance MIDI backing track
-        if self._midi_player is not None:
+        # Advance MIDI backing track (only during actual song)
+        if self._playback_ms >= 0 and self._midi_player is not None:
             self._midi_player.update(self._playback_ms)
 
         # Loop check — jump back to start marker when reaching end marker
+        # (no count-in on loop)
         if (self._loop_enabled and self._loop_end_ms is not None
                 and self._loop_start_ms is not None
                 and self._playback_ms >= self._loop_end_ms):
@@ -221,6 +268,19 @@ class PlayingScreen:
             if self._midi_player is not None:
                 self._midi_player.pause()
             self._stop_audio()
+
+            # Record progress on song completion
+            if (not self._song_completed
+                    and self._audio_enabled
+                    and self._matcher is not None
+                    and self._progress_tracker is not None
+                    and self._song_key):
+                stats = self._matcher.get_statistics()
+                if stats["total"] > 0:
+                    self._is_new_best = self._progress_tracker.record_result(
+                        self._song_key, stats
+                    )
+                    self._song_completed = True
 
     def handle_event(self, event: pygame.event.Event) -> str | None:
         """Handle input. Returns 'menu' to go back, else None."""
@@ -378,6 +438,25 @@ class PlayingScreen:
 
         meta = self._timeline.metadata
         w = layout.screen_w
+        h = layout.screen_h
+
+        # Count-in overlay — large centered beat countdown
+        if self._playback_ms < 0 and self._count_in_ms > 0:
+            remaining_beats = int(-self._playback_ms / self._ms_per_beat) + 1
+            remaining_beats = min(remaining_beats, self._config.count_in_beats)
+            countdown_font = _get_font("arial", 120)
+            countdown_surf = countdown_font.render(
+                str(remaining_beats), True, HUD_ACCENT_COLOR
+            )
+            surface.blit(
+                countdown_surf,
+                (w // 2 - countdown_surf.get_width() // 2,
+                 h // 2 - countdown_surf.get_height() // 2),
+            )
+
+        # Song completion overlay
+        if self._song_completed:
+            self._draw_completion_overlay(surface, layout)
 
         # Top-left: title + artist
         title = meta.title or "Untitled"
@@ -426,7 +505,12 @@ class PlayingScreen:
             surface.blit(gate_surf, (w - gate_surf.get_width() - 12, stats_bottom_y))
 
         # Bottom-center: play state + controls
-        state = "Playing" if self._playing else "Paused"
+        if self._playback_ms < 0:
+            state = "Count-in"
+        elif self._playing:
+            state = "Playing"
+        else:
+            state = "Paused"
         audio_state = "ON" if self._audio_enabled else "off"
         loop_state = "ON" if self._loop_enabled else "off"
         backing_state = ""
@@ -449,6 +533,45 @@ class PlayingScreen:
                 f"Track: {meta.track_name}", True, HUD_TEXT_COLOR
             )
             surface.blit(track_surf, (12, 38))
+
+    def _draw_completion_overlay(self, surface: pygame.Surface, layout: _Layout) -> None:
+        """Draw the song completion results overlay."""
+        w, h = layout.screen_w, layout.screen_h
+
+        # Semi-transparent dark overlay
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 160))
+        surface.blit(overlay, (0, 0))
+
+        header_font = _get_font("arial", 48)
+        stat_font = _get_font("consolas", 28)
+        hint_font = _get_font("arial", 18)
+
+        center_y = h // 2 - 60
+
+        # "Song Complete!" header
+        header_surf = header_font.render("Song Complete!", True, HUD_ACCENT_COLOR)
+        surface.blit(header_surf, (w // 2 - header_surf.get_width() // 2, center_y))
+
+        # Accuracy stats
+        if self._matcher is not None:
+            stats = self._matcher.get_statistics()
+            accuracy_text = (
+                f"Accuracy: {stats['accuracy_percent']:.1f}%  "
+                f"({stats['hits']}/{stats['total']})"
+            )
+            acc_surf = stat_font.render(accuracy_text, True, HUD_TEXT_COLOR)
+            surface.blit(acc_surf, (w // 2 - acc_surf.get_width() // 2, center_y + 60))
+
+            # "New Best!" indicator
+            if self._is_new_best:
+                best_surf = stat_font.render("New Best!", True, (255, 220, 50))
+                surface.blit(best_surf, (w // 2 - best_surf.get_width() // 2, center_y + 100))
+
+        # Controls hint
+        hint_text = "SPACE to replay  |  ESC to menu"
+        hint_surf = hint_font.render(hint_text, True, HUD_TEXT_COLOR)
+        surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, center_y + 150))
 
     # -- Loop control --
 

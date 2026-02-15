@@ -100,6 +100,18 @@ class MidiPlayer:
             print(f"MIDI init failed: {e}")
             return False
 
+    def play_click(self, velocity: int = 100) -> None:
+        """Play a single metronome click on the MIDI percussion channel.
+
+        Uses channel 9 (percussion), note 76 (hi wood block).
+        """
+        if self._output is None or self._muted:
+            return
+        try:
+            self._output.write_short(NOTE_ON | 9, 76, velocity)
+        except Exception:
+            pass
+
     def update(self, playback_ms: float) -> None:
         """Fire all events up to playback_ms. Called each frame."""
         events = self._track.get_events_until(playback_ms)

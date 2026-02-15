@@ -11,6 +11,7 @@ import pygame
 
 from pickhero.audio.input import validate_device_index
 from pickhero.config import Config
+from pickhero.progress import ProgressTracker
 from pickhero.tabs.loader import extract_backing_track, load_gp_file
 from pickhero.ui.device_menu import DeviceMenuScreen
 from pickhero.ui.menu import MenuScreen
@@ -22,6 +23,7 @@ class App:
 
     def __init__(self, config: Config | None = None):
         self._config = config or Config.load()
+        self._progress = ProgressTracker()
         self._running = False
         self._state = "menu"
         self._menu: MenuScreen | None = None
@@ -49,7 +51,7 @@ class App:
         clock = pygame.time.Clock()
 
         songs_dir = Path(self._config.songs_dir)
-        self._menu = MenuScreen(songs_dir, config=self._config)
+        self._menu = MenuScreen(songs_dir, config=self._config, progress=self._progress)
         self._state = "menu"
         self._running = True
 
@@ -136,6 +138,8 @@ class App:
             hit_zone_fraction=dc.hit_zone_fraction,
             config=self._config,
             backing_track=backing_track,
+            progress_tracker=self._progress,
+            song_key=path.stem,
         )
         self._state = "playing"
 

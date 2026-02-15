@@ -44,6 +44,7 @@ class Config:
     audio_latency_offset_ms: float = 0.0
     chord_threshold_ms: float = 50.0
     backing_track_enabled: bool = True
+    count_in_beats: int = 4
 
     def save(self):
         """Save settings to JSON file."""
