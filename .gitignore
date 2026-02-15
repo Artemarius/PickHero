@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# PyInstaller
+*.spec
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Private planning docs
+PROJECT.md
+
+# AI/development config
+.claude/
+.mcp/
+
+# Songs directory content (GP files are large, user-specific)
+songs/*.gp3
+songs/*.gp4
+songs/*.gp5
+songs/*.gpx
+songs/*.gp
+!songs/.gitkeep
+
+# User config
+pickhero_config.json
