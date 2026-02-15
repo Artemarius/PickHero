@@ -9,6 +9,9 @@ build/
 *.egg
 .eggs/
 
+# Testing
+.pytest_cache/
+
 # Virtual environments
 venv/
 .venv/

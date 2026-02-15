@@ -105,11 +105,11 @@ PickHero/
 
 ## Status
 
-🚧 **Under active development** — see [Development Phases](#development-phases) below.
+**Under active development** — see [Development Phases](#development-phases) below.
 
 ### Development Phases
 
-1. **Audio Detection PoC** — `sounddevice` + `aubio` pitch detection, console output
+1. ~~**Audio Detection PoC** — `sounddevice` + `aubio` pitch detection, console output~~ **Done**
 2. **Tab Parser & Timeline** — GP5 loading via `pyguitarpro`, timeline data structure
 3. **Scrolling Display MVP** — PyGame window with 6 string lanes, tempo-synced scrolling
 4. **Live Matching & Feedback** — pitch comparison, hit/miss visuals, accuracy scoring
