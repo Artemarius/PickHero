@@ -39,6 +39,7 @@ class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
     songs_dir: str = "songs"
+    tempo_factor: float = 1.0
     timing_window_ms: float = 100.0
     audio_latency_offset_ms: float = 0.0
     chord_threshold_ms: float = 50.0

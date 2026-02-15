@@ -82,6 +82,8 @@ class PlayingScreen:
         self._hit_zone_fraction = hit_zone_fraction
         self._config = config or Config()
 
+        self._tempo_factor = max(0.5, min(1.0, self._config.tempo_factor))
+
         self._playback_ms: float = 0.0
         self._playing = False
         self._last_tick: float | None = None
@@ -126,6 +128,16 @@ class PlayingScreen:
     def is_playing(self) -> bool:
         return self._playing
 
+    def set_tempo_factor(self, factor: float) -> None:
+        """Set tempo scaling factor, clamped to [0.5, 1.0] and rounded to nearest 0.05."""
+        factor = max(0.5, min(1.0, factor))
+        factor = round(factor * 20) / 20  # round to nearest 0.05
+        self._tempo_factor = factor
+        self._config.tempo_factor = factor
+        if self._matcher:
+            self._matcher.reset()
+        self._feedback.reset()
+
     def update(self) -> None:
         """Advance playback clock by real elapsed time."""
         if not self._playing:
@@ -133,13 +145,15 @@ class PlayingScreen:
 
         now = time.perf_counter()
         if self._last_tick is not None:
-            elapsed_ms = (now - self._last_tick) * 1000.0
+            elapsed_ms = (now - self._last_tick) * 1000.0 * self._tempo_factor
             self._playback_ms += elapsed_ms
         self._last_tick = now
 
         # Process audio matching
         if self._audio_enabled and self._audio_capture is not None and self._matcher is not None:
             detected = self._audio_capture.get_notes()
+            for d in detected:
+                d.timestamp_ms *= self._tempo_factor
             results = self._matcher.process_detected_notes(detected, self._playback_ms)
             self._feedback.add_results(results, self._playback_ms)
             self._feedback.cleanup(self._playback_ms)
@@ -168,6 +182,10 @@ class PlayingScreen:
             self.seek(0)
         elif event.key == pygame.K_a:
             self._toggle_audio()
+        elif event.key == pygame.K_MINUS:
+            self.set_tempo_factor(self._tempo_factor - 0.05)
+        elif event.key == pygame.K_EQUALS:
+            self.set_tempo_factor(self._tempo_factor + 0.05)
 
         return None
 
@@ -296,7 +314,11 @@ class PlayingScreen:
         surface.blit(title_surf, (12, 12))
 
         # Top-center: BPM (and streak below it)
-        bpm_text = f"{meta.tempo} BPM"
+        if self._tempo_factor < 1.0:
+            pct = int(self._tempo_factor * 100)
+            bpm_text = f"{meta.tempo} BPM ({pct}%)"
+        else:
+            bpm_text = f"{meta.tempo} BPM"
         bpm_surf = title_font.render(bpm_text, True, HUD_ACCENT_COLOR)
         surface.blit(bpm_surf, (w // 2 - bpm_surf.get_width() // 2, 12))
 
@@ -321,7 +343,7 @@ class PlayingScreen:
         audio_state = "ON" if self._audio_enabled else "off"
         hint = (
             f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
-            f"|  HOME: restart  |  A: audio {audio_state}  |  ESC: menu"
+            f"|  HOME: restart  |  -/=: tempo  |  A: audio {audio_state}  |  ESC: menu"
         )
         hint_surf = hint_font.render(hint, True, HUD_TEXT_COLOR)
         y = layout.screen_h - LANE_BOTTOM_MARGIN + 8

@@ -154,3 +154,42 @@ class TestPlaybackClock:
         screen = PlayingScreen(timeline)
         screen.seek(999999)
         assert screen._playback_ms == timeline.duration_ms
+
+
+class TestTempoFactor:
+    """Test tempo factor (speed adjustment) logic."""
+
+    def test_tempo_factor_default(self):
+        screen = PlayingScreen(_make_timeline())
+        assert screen._tempo_factor == 1.0
+
+    def test_tempo_factor_clamps_low(self):
+        screen = PlayingScreen(_make_timeline())
+        screen.set_tempo_factor(0.3)
+        assert screen._tempo_factor == 0.5
+
+    def test_tempo_factor_clamps_high(self):
+        screen = PlayingScreen(_make_timeline())
+        screen.set_tempo_factor(1.5)
+        assert screen._tempo_factor == 1.0
+
+    def test_tempo_factor_rounds_to_nearest_005(self):
+        screen = PlayingScreen(_make_timeline())
+        screen.set_tempo_factor(0.73)
+        assert screen._tempo_factor == pytest.approx(0.75)
+        screen.set_tempo_factor(0.82)
+        assert screen._tempo_factor == pytest.approx(0.80)
+        screen.set_tempo_factor(0.68)
+        assert screen._tempo_factor == pytest.approx(0.70)
+
+    def test_tempo_factor_from_config(self):
+        from pickhero.config import Config
+        config = Config(tempo_factor=0.75)
+        screen = PlayingScreen(_make_timeline(), config=config)
+        assert screen._tempo_factor == pytest.approx(0.75)
+
+    def test_tempo_factor_config_clamped_on_init(self):
+        from pickhero.config import Config
+        config = Config(tempo_factor=0.2)
+        screen = PlayingScreen(_make_timeline(), config=config)
+        assert screen._tempo_factor == 0.5
