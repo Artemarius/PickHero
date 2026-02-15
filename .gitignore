@@ -47,5 +47,8 @@ songs/*.gpx
 songs/*.gp
 !songs/.gitkeep
 
+# Temp files
+tmp/
+
 # User config
 pickhero_config.json
