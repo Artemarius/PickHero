@@ -78,6 +78,7 @@ class App:
     def _handle_playing_event(self, event: pygame.event.Event) -> None:
         result = self._playing_screen.handle_event(event)
         if result == "menu":
+            self._playing_screen.stop_audio()
             self._playing_screen = None
             self._state = "menu"
             self._menu.scan_files()
@@ -95,6 +96,7 @@ class App:
             timeline,
             visible_beats=dc.visible_beats,
             hit_zone_fraction=dc.hit_zone_fraction,
+            config=self._config,
         )
         self._state = "playing"
 

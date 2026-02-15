@@ -113,7 +113,7 @@ PickHero/
 1. ~~**Audio Detection PoC** — `sounddevice` + `aubio` pitch detection, console output~~ **Done**
 2. ~~**Tab Parser & Timeline** — GP5 loading via `pyguitarpro`, timeline data structure~~ **Done**
 3. ~~**Scrolling Display MVP** — PyGame window with 6 string lanes, tempo-synced scrolling~~ **Done**
-4. **Live Matching & Feedback** — pitch comparison, hit/miss visuals, accuracy scoring
+4. ~~**Live Matching & Feedback** — pitch comparison, hit/miss visuals, accuracy scoring~~ **Done**
 5. **Polish** — tempo control, section looping, backing tracks, song browser, `.exe` packaging
 
 ## References

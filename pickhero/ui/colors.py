@@ -37,6 +37,12 @@ MENU_SELECTED_BG = (60, 60, 100)
 HUD_TEXT_COLOR = (200, 200, 220)
 HUD_ACCENT_COLOR = (100, 180, 255)
 
+# Feedback
+FEEDBACK_HIT = (50, 255, 50)       # bright green
+FEEDBACK_CLOSE = (255, 220, 50)    # yellow
+FEEDBACK_MISS = (255, 50, 50)      # red
+FEEDBACK_STREAK = (255, 180, 50)   # gold
+
 
 def dimmed(color: tuple[int, int, int], factor: float = 0.4) -> tuple[int, int, int]:
     """Darken a color by multiplying each channel by factor."""

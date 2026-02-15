@@ -1,7 +1,7 @@
 """Scrolling note display for the playing screen.
 
 Renders 6 string lanes with notes scrolling right-to-left, synchronized
-to a playback clock. No audio matching — visual display only.
+to a playback clock. Optionally captures audio and shows hit/miss feedback.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import pygame
 
+from pickhero.config import Config
+from pickhero.matcher import NoteMatcher
 from pickhero.tabs.timeline import NoteEvent, Timeline
 from pickhero.ui.colors import (
     BG_COLOR,
@@ -24,6 +26,7 @@ from pickhero.ui.colors import (
     STRING_COLORS,
     dimmed,
 )
+from pickhero.ui.feedback import FeedbackRenderer
 
 # Layout constants
 LANE_TOP_MARGIN = 80
@@ -70,13 +73,14 @@ class _Layout:
 
 
 class PlayingScreen:
-    """Scrolling tab display with playback clock."""
+    """Scrolling tab display with playback clock and optional audio matching."""
 
     def __init__(self, timeline: Timeline, visible_beats: int = 4,
-                 hit_zone_fraction: float = 0.20):
+                 hit_zone_fraction: float = 0.20, config: Config | None = None):
         self._timeline = timeline
         self._visible_beats = visible_beats
         self._hit_zone_fraction = hit_zone_fraction
+        self._config = config or Config()
 
         self._playback_ms: float = 0.0
         self._playing = False
@@ -86,19 +90,38 @@ class PlayingScreen:
         self._ms_per_beat = 60_000 / tempo
         self._visible_window_ms = self._visible_beats * self._ms_per_beat
 
+        # Audio matching
+        self._audio_capture = None  # AudioCapture, created on demand
+        self._matcher: NoteMatcher | None = None
+        self._feedback = FeedbackRenderer()
+        self._audio_enabled = False
+
     def toggle_play(self) -> None:
         """Toggle play/pause. Restarts if past the end."""
         if self._playback_ms >= self._timeline.duration_ms and not self._playing:
             self._playback_ms = 0.0
+            if self._matcher:
+                self._matcher.reset()
+            self._feedback.reset()
         self._playing = not self._playing
         if self._playing:
             self._last_tick = time.perf_counter()
+            if self._audio_enabled:
+                self._start_audio()
         else:
             self._last_tick = None
+            self._stop_audio()
 
     def seek(self, ms: float) -> None:
         """Seek to an absolute position in ms, clamped to [0, duration]."""
         self._playback_ms = max(0.0, min(ms, self._timeline.duration_ms))
+        if self._matcher:
+            self._matcher.reset()
+        self._feedback.reset()
+        # Restart audio with new offset if active
+        if self._audio_enabled and self._playing:
+            self._stop_audio()
+            self._start_audio()
 
     def is_playing(self) -> bool:
         return self._playing
@@ -114,10 +137,18 @@ class PlayingScreen:
             self._playback_ms += elapsed_ms
         self._last_tick = now
 
+        # Process audio matching
+        if self._audio_enabled and self._audio_capture is not None and self._matcher is not None:
+            detected = self._audio_capture.get_notes()
+            results = self._matcher.process_detected_notes(detected, self._playback_ms)
+            self._feedback.add_results(results, self._playback_ms)
+            self._feedback.cleanup(self._playback_ms)
+
         if self._playback_ms >= self._timeline.duration_ms:
             self._playback_ms = self._timeline.duration_ms
             self._playing = False
             self._last_tick = None
+            self._stop_audio()
 
     def handle_event(self, event: pygame.event.Event) -> str | None:
         """Handle input. Returns 'menu' to go back, else None."""
@@ -127,6 +158,7 @@ class PlayingScreen:
         if event.key == pygame.K_SPACE:
             self.toggle_play()
         elif event.key == pygame.K_ESCAPE:
+            self.stop_audio()
             return "menu"
         elif event.key == pygame.K_LEFT:
             self.seek(self._playback_ms - self._ms_per_beat)
@@ -134,6 +166,8 @@ class PlayingScreen:
             self.seek(self._playback_ms + self._ms_per_beat)
         elif event.key == pygame.K_HOME:
             self.seek(0)
+        elif event.key == pygame.K_a:
+            self._toggle_audio()
 
         return None
 
@@ -227,10 +261,15 @@ class PlayingScreen:
             lane_y = LANE_TOP_MARGIN + (note.string - 1) * layout.lane_height
             y = lane_y + layout.lane_height / 2 - layout.note_h / 2
 
-            # Color: dimmed if past the hit zone
+            # Color: feedback color if matched, dimmed if past the hit zone
             base_color = STRING_COLORS.get(note.string, (180, 180, 180))
             past_hit_zone = note.timestamp_ms < self._playback_ms
-            color = dimmed(base_color) if past_hit_zone else base_color
+            if self._audio_enabled:
+                color = self._feedback.get_note_color(
+                    note, base_color, self._playback_ms, past_hit_zone,
+                )
+            else:
+                color = dimmed(base_color) if past_hit_zone else base_color
 
             rect = pygame.Rect(int(x), int(y), int(w), int(layout.note_h))
             pygame.draw.rect(surface, color, rect, border_radius=NOTE_CORNER_RADIUS)
@@ -256,10 +295,13 @@ class PlayingScreen:
         title_surf = title_font.render(title, True, HUD_TEXT_COLOR)
         surface.blit(title_surf, (12, 12))
 
-        # Top-center: BPM
+        # Top-center: BPM (and streak below it)
         bpm_text = f"{meta.tempo} BPM"
         bpm_surf = title_font.render(bpm_text, True, HUD_ACCENT_COLOR)
         surface.blit(bpm_surf, (w // 2 - bpm_surf.get_width() // 2, 12))
+
+        if self._audio_enabled:
+            self._feedback.draw_streak(surface, title_font, w // 2, 36)
 
         # Top-right: time
         current = format_time(self._playback_ms)
@@ -268,9 +310,19 @@ class PlayingScreen:
         time_surf = time_font.render(time_text, True, HUD_TEXT_COLOR)
         surface.blit(time_surf, (w - time_surf.get_width() - 12, 12))
 
+        # Top-right second line: accuracy stats
+        if self._audio_enabled and self._matcher is not None:
+            stats = self._matcher.get_statistics()
+            if stats["total"] > 0:
+                self._feedback.draw_stats(surface, stats, hint_font, w - 12, 36)
+
         # Bottom-center: play state + controls
         state = "Playing" if self._playing else "Paused"
-        hint = f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  |  HOME: restart  |  ESC: menu"
+        audio_state = "ON" if self._audio_enabled else "off"
+        hint = (
+            f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
+            f"|  HOME: restart  |  A: audio {audio_state}  |  ESC: menu"
+        )
         hint_surf = hint_font.render(hint, True, HUD_TEXT_COLOR)
         y = layout.screen_h - LANE_BOTTOM_MARGIN + 8
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, y))
@@ -281,3 +333,41 @@ class PlayingScreen:
                 f"Track: {meta.track_name}", True, HUD_TEXT_COLOR
             )
             surface.blit(track_surf, (12, 38))
+
+    # -- Audio control --
+
+    def _toggle_audio(self) -> None:
+        """Toggle audio capture on/off."""
+        self._audio_enabled = not self._audio_enabled
+        if self._audio_enabled and self._playing:
+            self._start_audio()
+        else:
+            self._stop_audio()
+
+    def _start_audio(self) -> None:
+        """Start audio capture and create matcher."""
+        try:
+            from pickhero.audio.input import AudioCapture
+            if self._audio_capture is None:
+                self._audio_capture = AudioCapture(self._config)
+            self._audio_capture.start()
+            self._matcher = NoteMatcher(
+                self._timeline,
+                timing_window_ms=self._config.timing_window_ms,
+                audio_offset_ms=self._playback_ms + self._config.audio_latency_offset_ms,
+                chord_threshold_ms=self._config.chord_threshold_ms,
+            )
+            self._feedback.reset()
+        except Exception as e:
+            print(f"Audio start failed: {e}")
+            self._audio_enabled = False
+
+    def _stop_audio(self) -> None:
+        """Stop audio capture."""
+        if self._audio_capture is not None:
+            self._audio_capture.stop()
+
+    def stop_audio(self) -> None:
+        """Public method to stop audio (called on state transitions)."""
+        self._stop_audio()
+        self._audio_enabled = False
