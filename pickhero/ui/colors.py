@@ -24,8 +24,9 @@ STRING_COLORS: dict[int, tuple[int, int, int]] = {
     6: (140, 60, 200),   # purple
 }
 
-# Note text
+# Note text and border
 NOTE_TEXT_COLOR = (255, 255, 255)
+NOTE_BORDER_COLOR = (10, 10, 15)
 
 # Menu
 MENU_BG_COLOR = (20, 20, 30)

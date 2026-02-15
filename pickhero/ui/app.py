@@ -100,6 +100,13 @@ class App:
         )
         self._state = "playing"
 
+        # Skip ahead so the first note is just entering the visible window
+        if timeline.notes:
+            first_note_ms = timeline.notes[0].timestamp_ms
+            seek_to = max(0.0, first_note_ms - self._playing_screen._visible_window_ms)
+            if seek_to > 0:
+                self._playing_screen.seek(seek_to)
+
     def _update(self) -> None:
         if self._state == "playing" and self._playing_screen is not None:
             self._playing_screen.update()

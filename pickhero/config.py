@@ -29,7 +29,7 @@ class DisplayConfig:
     """Display and rendering settings."""
     width: int = 1280
     height: int = 720
-    visible_beats: int = 4
+    visible_beats: int = 16
     hit_zone_fraction: float = 0.20
 
 

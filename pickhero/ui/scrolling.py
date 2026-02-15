@@ -22,6 +22,7 @@ from pickhero.ui.colors import (
     LANE_BG_EVEN,
     LANE_BG_ODD,
     LANE_LINE_COLOR,
+    NOTE_BORDER_COLOR,
     NOTE_TEXT_COLOR,
     STRING_COLORS,
     dimmed,
@@ -182,9 +183,9 @@ class PlayingScreen:
             self.seek(0)
         elif event.key == pygame.K_a:
             self._toggle_audio()
-        elif event.key == pygame.K_MINUS:
+        elif event.key == pygame.K_PAGEDOWN:
             self.set_tempo_factor(self._tempo_factor - 0.05)
-        elif event.key == pygame.K_EQUALS:
+        elif event.key == pygame.K_PAGEUP:
             self.set_tempo_factor(self._tempo_factor + 0.05)
 
         return None
@@ -262,7 +263,7 @@ class PlayingScreen:
 
         notes = self._timeline.get_notes_in_range(view_start, view_end)
 
-        fret_font = _get_font("consolas", max(12, int(layout.note_h * 0.6)))
+        fret_font = _get_font("consolas", 14)
 
         for note in notes:
             x = self.note_x(
@@ -291,12 +292,14 @@ class PlayingScreen:
 
             rect = pygame.Rect(int(x), int(y), int(w), int(layout.note_h))
             pygame.draw.rect(surface, color, rect, border_radius=NOTE_CORNER_RADIUS)
+            pygame.draw.rect(surface, NOTE_BORDER_COLOR, rect, width=2, border_radius=NOTE_CORNER_RADIUS)
 
-            # Fret number
+            # Fret number — only draw if note is wide enough to fit it
             fret_text = fret_font.render(str(note.fret), True, NOTE_TEXT_COLOR)
-            tx = rect.x + rect.width // 2 - fret_text.get_width() // 2
-            ty = rect.y + rect.height // 2 - fret_text.get_height() // 2
-            surface.blit(fret_text, (tx, ty))
+            if fret_text.get_width() + 4 <= rect.width:
+                tx = rect.x + rect.width // 2 - fret_text.get_width() // 2
+                ty = rect.y + rect.height // 2 - fret_text.get_height() // 2
+                surface.blit(fret_text, (tx, ty))
 
     def _draw_hud(self, surface: pygame.Surface, layout: _Layout) -> None:
         title_font = _get_font("arial", 20)
@@ -313,12 +316,9 @@ class PlayingScreen:
         title_surf = title_font.render(title, True, HUD_TEXT_COLOR)
         surface.blit(title_surf, (12, 12))
 
-        # Top-center: BPM (and streak below it)
-        if self._tempo_factor < 1.0:
-            pct = int(self._tempo_factor * 100)
-            bpm_text = f"{meta.tempo} BPM ({pct}%)"
-        else:
-            bpm_text = f"{meta.tempo} BPM"
+        # Top-center: BPM with tempo percentage (and streak below it)
+        pct = int(self._tempo_factor * 100)
+        bpm_text = f"{meta.tempo} BPM ({pct}%)"
         bpm_surf = title_font.render(bpm_text, True, HUD_ACCENT_COLOR)
         surface.blit(bpm_surf, (w // 2 - bpm_surf.get_width() // 2, 12))
 
@@ -343,7 +343,7 @@ class PlayingScreen:
         audio_state = "ON" if self._audio_enabled else "off"
         hint = (
             f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
-            f"|  HOME: restart  |  -/=: tempo  |  A: audio {audio_state}  |  ESC: menu"
+            f"|  HOME: restart  |  PgDn/PgUp: tempo  |  A: audio {audio_state}  |  ESC: menu"
         )
         hint_surf = hint_font.render(hint, True, HUD_TEXT_COLOR)
         y = layout.screen_h - LANE_BOTTOM_MARGIN + 8
