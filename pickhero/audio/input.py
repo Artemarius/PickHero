@@ -121,6 +121,20 @@ def list_audio_devices() -> list[dict]:
     return inputs
 
 
+def validate_device_index(index: int | None) -> bool:
+    """Check if a device index exists and has input channels.
+
+    Returns True for None (system default) or a valid input device index.
+    """
+    if index is None:
+        return True
+    try:
+        info = sd.query_devices(index)
+        return info["max_input_channels"] > 0
+    except (sd.PortAudioError, IndexError, ValueError):
+        return False
+
+
 def run_console_demo():
     """Interactive console demo for testing pitch detection.
 

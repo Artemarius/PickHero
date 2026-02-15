@@ -9,8 +9,10 @@ from pathlib import Path
 
 import pygame
 
+from pickhero.audio.input import validate_device_index
 from pickhero.config import Config
 from pickhero.tabs.loader import load_gp_file
+from pickhero.ui.device_menu import DeviceMenuScreen
 from pickhero.ui.menu import MenuScreen
 from pickhero.ui.scrolling import PlayingScreen
 
@@ -24,9 +26,19 @@ class App:
         self._state = "menu"
         self._menu: MenuScreen | None = None
         self._playing_screen: PlayingScreen | None = None
+        self._device_menu: DeviceMenuScreen | None = None
 
     def run(self) -> None:
         """Initialize PyGame, run main loop, clean up."""
+        # Validate saved audio device — fall back to default if unavailable
+        if not validate_device_index(self._config.audio.device_index):
+            print(
+                f"Saved audio device #{self._config.audio.device_index} not available, "
+                "falling back to system default."
+            )
+            self._config.audio.device_index = None
+            self._config.save()
+
         pygame.init()
         pygame.display.set_caption("PickHero")
 
@@ -37,7 +49,7 @@ class App:
         clock = pygame.time.Clock()
 
         songs_dir = Path(self._config.songs_dir)
-        self._menu = MenuScreen(songs_dir)
+        self._menu = MenuScreen(songs_dir, config=self._config)
         self._state = "menu"
         self._running = True
 
@@ -65,10 +77,17 @@ class App:
                 self._handle_menu_event(event)
             elif self._state == "playing":
                 self._handle_playing_event(event)
+            elif self._state == "device":
+                self._handle_device_event(event)
 
     def _handle_menu_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self._running = False
+            return
+
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_d:
+            self._device_menu = DeviceMenuScreen(self._config)
+            self._state = "device"
             return
 
         result = self._menu.handle_event(event)
@@ -82,6 +101,14 @@ class App:
             self._playing_screen = None
             self._state = "menu"
             self._menu.scan_files()
+
+    def _handle_device_event(self, event: pygame.event.Event) -> None:
+        result = self._device_menu.handle_event(event)
+        if result in ("back", "selected"):
+            if result == "selected":
+                self._menu.refresh_device_name()
+            self._device_menu = None
+            self._state = "menu"
 
     def _load_song(self, path: Path) -> None:
         """Load a GP file and switch to playing state."""
@@ -116,3 +143,5 @@ class App:
             self._menu.render(surface)
         elif self._state == "playing" and self._playing_screen is not None:
             self._playing_screen.render(surface)
+        elif self._state == "device" and self._device_menu is not None:
+            self._device_menu.render(surface)

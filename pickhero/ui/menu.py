@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pygame
 
+from pickhero.audio.input import list_audio_devices
+from pickhero.config import Config
 from pickhero.ui.colors import (
     BG_COLOR,
     HUD_ACCENT_COLOR,
@@ -37,13 +39,34 @@ def _get_font(name: str, size: int) -> pygame.font.Font:
 class MenuScreen:
     """File browser for selecting GP tab files."""
 
-    def __init__(self, songs_dir: Path):
+    def __init__(self, songs_dir: Path, config: Config | None = None):
         self._songs_dir = Path(songs_dir)
+        self._config = config
         self._files: list[Path] = []
         self._selected = 0
         self._scroll_offset = 0
         self._last_click_time = 0
+        self._device_name = self._resolve_device_name()
         self.scan_files()
+
+    def refresh_device_name(self) -> None:
+        """Re-resolve the current device name (call after device selection)."""
+        self._device_name = self._resolve_device_name()
+
+    def _resolve_device_name(self) -> str:
+        """Return a display name for the current audio device."""
+        if self._config is None:
+            return "Default"
+        idx = self._config.audio.device_index
+        if idx is None:
+            return "System Default"
+        try:
+            for dev in list_audio_devices():
+                if dev["index"] == idx:
+                    return dev["name"]
+        except Exception:
+            pass
+        return f"Device #{idx}"
 
     def scan_files(self) -> None:
         """Scan songs directory for GP files."""
@@ -156,8 +179,13 @@ class MenuScreen:
             y_bottom = list_top + VISIBLE_ITEMS * item_h + 4
             surface.blit(arrow, (w // 2 - arrow.get_width() // 2, y_bottom))
 
+        # Current audio device
+        dev_text = f"Audio: {self._device_name}"
+        dev_surf = hint_font.render(dev_text, True, HUD_TEXT_COLOR)
+        surface.blit(dev_surf, (w // 2 - dev_surf.get_width() // 2, h - 56))
+
         # Controls hint
-        hint = "UP/DOWN: navigate  |  ENTER: select  |  ESC: quit"
+        hint = "UP/DOWN: navigate  |  ENTER: select  |  D: audio device  |  ESC: quit"
         hint_surf = hint_font.render(hint, True, HUD_TEXT_COLOR)
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, h - 36))
 
