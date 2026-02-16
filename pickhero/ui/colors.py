@@ -48,6 +48,16 @@ class Theme:
     loop_region: tuple[int, int, int, int]          # RGBA
     loop_region_disabled: tuple[int, int, int, int]  # RGBA
 
+    # Signal meter
+    signal_hot: tuple[int, int, int]
+    signal_warm: tuple[int, int, int]
+    signal_cold: tuple[int, int, int]
+
+    # Tuner
+    tuner_in_tune: tuple[int, int, int]
+    tuner_close: tuple[int, int, int]
+    tuner_off: tuple[int, int, int]
+
 
 DARK_THEME = Theme(
     bg=(20, 20, 30),
@@ -72,6 +82,12 @@ DARK_THEME = Theme(
     loop_marker_disabled=(0, 80, 110),
     loop_region=(0, 200, 255, 25),
     loop_region_disabled=(0, 80, 110, 15),
+    signal_hot=(50, 220, 80),
+    signal_warm=(220, 200, 40),
+    signal_cold=(70, 70, 90),
+    tuner_in_tune=(50, 220, 80),
+    tuner_close=(220, 200, 40),
+    tuner_off=(220, 100, 40),
 )
 
 LIGHT_THEME = Theme(
@@ -97,6 +113,12 @@ LIGHT_THEME = Theme(
     loop_marker_disabled=(100, 140, 160),
     loop_region=(0, 150, 200, 30),
     loop_region_disabled=(100, 140, 160, 15),
+    signal_hot=(30, 180, 60),
+    signal_warm=(200, 170, 20),
+    signal_cold=(160, 160, 175),
+    tuner_in_tune=(30, 180, 60),
+    tuner_close=(200, 170, 20),
+    tuner_off=(200, 80, 30),
 )
 
 _THEMES = {"dark": DARK_THEME, "light": LIGHT_THEME}

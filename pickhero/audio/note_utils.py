@@ -125,6 +125,20 @@ def midi_to_fret_options(midi_note: int, tuning: dict[int, int] | None = None) -
     return sorted(options, key=lambda x: x[0])
 
 
+def freq_to_cents_deviation(freq: float) -> tuple[int, float]:
+    """Return (nearest_midi_note, cents_off) for a frequency.
+
+    cents_off is in range [-50, +50]. Negative = flat, positive = sharp.
+    Returns (-1, 0.0) for invalid frequencies.
+    """
+    if freq <= 0:
+        return (-1, 0.0)
+    midi_exact = 12 * math.log2(freq / A4_FREQ) + A4_MIDI
+    midi_note = round(midi_exact)
+    cents = (midi_exact - midi_note) * 100.0
+    return (midi_note, cents)
+
+
 def semitone_distance(midi_a: int, midi_b: int) -> int:
     """Absolute semitone distance between two MIDI notes."""
     return abs(midi_a - midi_b)

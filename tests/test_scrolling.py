@@ -110,8 +110,8 @@ class TestPlayingScreenLayout:
         assert layout.screen_h == 720
         assert layout.hit_zone_x == pytest.approx(1280 * 0.20)
 
-        # 120 BPM → 500ms per beat → 2000ms visible window
-        expected_window = 4 * (60_000 / 120)
+        # Fixed 8-second visible window
+        expected_window = 8000.0
         assert screen._visible_window_ms == pytest.approx(expected_window)
 
         usable = 1280 - layout.hit_zone_x
