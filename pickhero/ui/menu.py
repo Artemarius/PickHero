@@ -14,7 +14,7 @@ from pickhero.config import Config
 from pickhero.progress import ProgressTracker
 from pickhero.ui.colors import cycle_theme, get_theme
 
-GP_EXTENSIONS = {".gp3", ".gp4", ".gp5"}
+GP_EXTENSIONS = {".gp3", ".gp4", ".gp5", ".gp"}
 
 # How many items visible at once before scrolling
 VISIBLE_ITEMS = 18

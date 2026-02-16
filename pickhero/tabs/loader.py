@@ -1,11 +1,14 @@
 """Guitar Pro file loader.
 
-Parses GP3/GP4/GP5 files via pyguitarpro, builds a TempoMap for tick-to-ms
-conversion, extracts note events, and produces a Timeline.
+Parses GP3/GP4/GP5 files via pyguitarpro, and GP7/GP8 files (ZIP+XML) via
+stdlib xml.etree. Builds note timelines for both formats.
 """
 
 from __future__ import annotations
 
+import json
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 import guitarpro
@@ -179,14 +182,497 @@ def list_tracks(path: str | Path) -> list[dict]:
     return tracks
 
 
+def _is_gp7_file(path: str | Path) -> bool:
+    """Check if a file is GP7/GP8 format (ZIP with Content/score.gpif)."""
+    try:
+        return zipfile.is_zipfile(str(path))
+    except OSError:
+        return False
+
+
+# ── GP7/GP8 loader ──────────────────────────────────────────────────────────
+
+# Rhythm note value → duration in quarter notes
+_GP7_NOTE_VALUES = {
+    "Whole": 4.0, "Half": 2.0, "Quarter": 1.0, "Eighth": 0.5,
+    "16th": 0.25, "32nd": 0.125, "64th": 0.0625,
+}
+
+
+def _load_gp7_file(path: str | Path, track_index: int | None = None) -> Timeline:
+    """Load a GP7/GP8 file (ZIP containing Content/score.gpif XML)."""
+    with zipfile.ZipFile(str(path)) as zf:
+        gpif = zf.read("Content/score.gpif").decode("utf-8")
+
+    root = ET.fromstring(gpif)
+
+    # ── Parse lookup tables ──────────────────────────────────────────────
+
+    # Rhythms: id → duration in quarter notes
+    rhythms: dict[str, float] = {}
+    rhythms_el = root.find("Rhythms")
+    if rhythms_el is not None:
+        for r in rhythms_el.findall("Rhythm"):
+            rid = r.get("id", "")
+            nv = r.findtext("NoteValue", "Quarter")
+            base = _GP7_NOTE_VALUES.get(nv, 1.0)
+            dot = r.find("AugmentationDot")
+            if dot is not None:
+                dot_count = int(dot.get("count", "1"))
+                if dot_count == 1:
+                    base *= 1.5
+                elif dot_count >= 2:
+                    base *= 1.75
+            tuplet = r.find("PrimaryTuplet")
+            if tuplet is not None:
+                num = int(tuplet.get("num", "1"))
+                den = int(tuplet.get("den", "1"))
+                if num > 0:
+                    base = base * den / num
+            rhythms[rid] = base
+
+    # Notes: id → (fret, gp7_string)  (gp7_string is 0-indexed, 0=low E)
+    notes_map: dict[str, tuple[int, int]] = {}
+    notes_el = root.find("Notes")
+    if notes_el is not None:
+        for n in notes_el.findall("Note"):
+            nid = n.get("id", "")
+            fret = None
+            string_val = None
+            for prop in n.findall(".//Property"):
+                pname = prop.get("name", "")
+                if pname == "Fret":
+                    try:
+                        fret = int(prop.findtext("Fret", "0"))
+                    except ValueError:
+                        pass
+                elif pname == "String":
+                    try:
+                        raw = prop.findtext("String", "0")
+                        f = float(raw)
+                        if f != int(f):
+                            continue  # fractional = drum/percussion, skip
+                        string_val = int(f)
+                    except ValueError:
+                        pass
+            if fret is not None and string_val is not None:
+                notes_map[nid] = (fret, string_val)
+
+    # Beats: id → (rhythm_ref, [note_ids])
+    beats_map: dict[str, tuple[str, list[str]]] = {}
+    beats_el = root.find("Beats")
+    if beats_el is not None:
+        for b in beats_el.findall("Beat"):
+            bid = b.get("id", "")
+            rhythm_ref_el = b.find("Rhythm")
+            rhythm_ref = rhythm_ref_el.get("ref", "") if rhythm_ref_el is not None else ""
+            notes_text = b.findtext("Notes", "").strip()
+            note_ids = notes_text.split() if notes_text else []
+            beats_map[bid] = (rhythm_ref, note_ids)
+
+    # Voices: id → [beat_ids]
+    voices_map: dict[str, list[str]] = {}
+    voices_el = root.find("Voices")
+    if voices_el is not None:
+        for v in voices_el.findall("Voice"):
+            vid = v.get("id", "")
+            beats_text = v.findtext("Beats", "").strip()
+            voices_map[vid] = beats_text.split() if beats_text else []
+
+    # Bars: id → [voice_ids]
+    bars_map: dict[str, list[str]] = {}
+    bars_el = root.find("Bars")
+    if bars_el is not None:
+        for bar in bars_el.findall("Bar"):
+            bid = bar.get("id", "")
+            voices_text = bar.findtext("Voices", "").strip()
+            bars_map[bid] = voices_text.split() if voices_text else []
+
+    # ── Parse tracks ─────────────────────────────────────────────────────
+
+    track_list: list[dict] = []
+    tracks_el = root.find("Tracks")
+    if tracks_el is not None:
+        for t in tracks_el.findall("Track"):
+            tuning_pitches: list[int] = []
+            for prop in t.findall(".//Property"):
+                if prop.get("name") == "Tuning":
+                    raw = prop.findtext("Pitches", "")
+                    tuning_pitches = [int(x) for x in raw.split() if x]
+            midi_prog = -1
+            try:
+                midi_prog = int(t.findtext(".//MIDI/Program", "-1"))
+            except ValueError:
+                pass
+            is_drum = (midi_prog == 1024 or
+                       t.findtext(".//InstrumentSet", "") == "drums")
+            # Heuristic: drums have instrumentId=1024 in the search API;
+            # in GPIF the program is the GM number. Drum kits use channel 10.
+            track_list.append({
+                "id": t.get("id", ""),
+                "name": t.findtext("Name", "").strip(),
+                "tuning": tuning_pitches,
+                "midi_program": midi_prog,
+                "num_strings": len(tuning_pitches),
+                "is_guitar": (
+                    len(tuning_pitches) == 6
+                    and GUITAR_INSTRUMENT_MIN <= midi_prog <= GUITAR_INSTRUMENT_MAX
+                ),
+                "is_percussion": is_drum,
+            })
+
+    # ── Select track ─────────────────────────────────────────────────────
+
+    if track_index is not None:
+        selected_index = track_index
+    else:
+        selected_index = 0
+        for i, ti in enumerate(track_list):
+            if ti["is_guitar"]:
+                selected_index = i
+                break
+
+    sel = track_list[selected_index]
+    tuning = sel["tuning"]  # [low_E, A, D, G, B, high_E] (0-indexed)
+    num_strings = sel["num_strings"] or 6
+
+    # Build our tuning dict: {1: high_E_midi, ..., 6: low_E_midi}
+    tuning_dict: dict[int, int] = {}
+    for gp7_idx, midi_val in enumerate(tuning):
+        our_string = num_strings - gp7_idx  # 0→6, 1→5, ..., 5→1
+        tuning_dict[our_string] = midi_val
+
+    # ── Parse tempos ─────────────────────────────────────────────────────
+
+    tempos: dict[int, float] = {}  # master_bar_index → BPM
+    for auto in root.findall(".//MasterTrack/Automations/Automation"):
+        if auto.findtext("Type") == "Tempo":
+            bar_idx = int(auto.findtext("Bar", "0"))
+            val = auto.findtext("Value", "120 2")
+            bpm = float(val.split()[0])
+            tempos[bar_idx] = bpm
+
+    initial_bpm = tempos.get(0, 120.0)
+
+    # ── Walk MasterBars → extract notes and measures ─────────────────────
+
+    master_bars = root.findall(".//MasterBar")
+    current_bpm = initial_bpm
+    current_ms = 0.0
+    note_events: list[NoteEvent] = []
+    measure_infos: list[MeasureInfo] = []
+
+    for mb_idx, mb in enumerate(master_bars):
+        if mb_idx in tempos:
+            current_bpm = tempos[mb_idx]
+
+        time_sig = mb.findtext("Time", "4/4")
+        parts = time_sig.split("/")
+        ts_num = int(parts[0]) if len(parts) == 2 else 4
+        ts_den = int(parts[1]) if len(parts) == 2 else 4
+
+        measure_start_ms = current_ms
+        measure_duration_ms = ts_num * (4.0 / ts_den) * (60_000.0 / current_bpm)
+
+        # Get bar IDs for this master bar (one per track)
+        bar_ids_text = mb.findtext("Bars", "").strip()
+        bar_ids = bar_ids_text.split()
+
+        if selected_index < len(bar_ids):
+            bar_id = bar_ids[selected_index]
+            voice_ids = bars_map.get(bar_id, [])
+
+            # Walk voices → beats → notes
+            for vid in voice_ids:
+                if vid == "-1":
+                    continue
+                beat_ids = voices_map.get(vid, [])
+                beat_pos_ms = current_ms
+
+                for bid in beat_ids:
+                    rhythm_ref, note_ids = beats_map.get(bid, ("", []))
+                    dur_quarters = rhythms.get(rhythm_ref, 1.0)
+                    dur_ms = dur_quarters * (60_000.0 / current_bpm)
+
+                    for nid in note_ids:
+                        if nid not in notes_map:
+                            continue
+                        fret, gp7_string = notes_map[nid]
+                        our_string = num_strings - gp7_string
+                        if not 1 <= our_string <= 6:
+                            continue
+                        if gp7_string < len(tuning):
+                            midi_note = tuning[gp7_string] + fret
+                        else:
+                            midi_note = fret  # fallback
+
+                        if not 0 <= midi_note <= 127:
+                            continue
+
+                        note_events.append(NoteEvent(
+                            timestamp_ms=beat_pos_ms,
+                            duration_ms=dur_ms,
+                            midi_note=midi_note,
+                            string=our_string,
+                            fret=fret,
+                            measure=mb_idx,
+                        ))
+
+                    beat_pos_ms += dur_ms
+
+        measure_infos.append(MeasureInfo(
+            index=mb_idx,
+            start_ms=measure_start_ms,
+            end_ms=measure_start_ms + measure_duration_ms,
+        ))
+        current_ms += measure_duration_ms
+
+    # ── Build metadata and timeline ──────────────────────────────────────
+
+    title = root.findtext(".//Score/Title", "").strip()
+    artist = root.findtext(".//Score/Artist", "").strip()
+    album = root.findtext(".//Score/Album", "").strip()
+
+    metadata = SongMetadata(
+        title=title,
+        artist=artist,
+        album=album,
+        track_name=sel["name"],
+        tempo=int(initial_bpm),
+        tuning=tuning_dict,
+        track_index=selected_index,
+    )
+
+    return Timeline(note_events, metadata, measures=measure_infos)
+
+
+def _extract_gp7_backing_track(
+    path: str | Path,
+    exclude_track_indices: set[int] | None = None,
+) -> BackingTrack:
+    """Extract non-guitar tracks from a GP7/GP8 file as MIDI events."""
+    with zipfile.ZipFile(str(path)) as zf:
+        gpif = zf.read("Content/score.gpif").decode("utf-8")
+
+    root = ET.fromstring(gpif)
+
+    # Reuse the same lookup tables as _load_gp7_file
+    # Rhythms
+    rhythms: dict[str, float] = {}
+    rhythms_el = root.find("Rhythms")
+    if rhythms_el is not None:
+        for r in rhythms_el.findall("Rhythm"):
+            rid = r.get("id", "")
+            nv = r.findtext("NoteValue", "Quarter")
+            base = _GP7_NOTE_VALUES.get(nv, 1.0)
+            dot = r.find("AugmentationDot")
+            if dot is not None:
+                dot_count = int(dot.get("count", "1"))
+                if dot_count == 1:
+                    base *= 1.5
+                elif dot_count >= 2:
+                    base *= 1.75
+            tuplet = r.find("PrimaryTuplet")
+            if tuplet is not None:
+                num = int(tuplet.get("num", "1"))
+                den = int(tuplet.get("den", "1"))
+                if num > 0:
+                    base = base * den / num
+            rhythms[rid] = base
+
+    # Notes: id → (fret, gp7_string)
+    notes_map: dict[str, tuple[int, int]] = {}
+    notes_el = root.find("Notes")
+    if notes_el is not None:
+        for n in notes_el.findall("Note"):
+            nid = n.get("id", "")
+            fret = None
+            string_val = None
+            for prop in n.findall(".//Property"):
+                pname = prop.get("name", "")
+                if pname == "Fret":
+                    try:
+                        fret = int(prop.findtext("Fret", "0"))
+                    except ValueError:
+                        pass
+                elif pname == "String":
+                    try:
+                        raw = prop.findtext("String", "0")
+                        f = float(raw)
+                        string_val = int(round(f))
+                    except ValueError:
+                        pass
+            if fret is not None and string_val is not None:
+                notes_map[nid] = (fret, string_val)
+
+    # Beats
+    beats_map: dict[str, tuple[str, list[str]]] = {}
+    beats_el = root.find("Beats")
+    if beats_el is not None:
+        for b in beats_el.findall("Beat"):
+            bid = b.get("id", "")
+            rhythm_ref_el = b.find("Rhythm")
+            rhythm_ref = rhythm_ref_el.get("ref", "") if rhythm_ref_el is not None else ""
+            notes_text = b.findtext("Notes", "").strip()
+            beats_map[bid] = (rhythm_ref, notes_text.split() if notes_text else [])
+
+    # Voices
+    voices_map: dict[str, list[str]] = {}
+    voices_el = root.find("Voices")
+    if voices_el is not None:
+        for v in voices_el.findall("Voice"):
+            vid = v.get("id", "")
+            beats_text = v.findtext("Beats", "").strip()
+            voices_map[vid] = beats_text.split() if beats_text else []
+
+    # Bars
+    bars_map: dict[str, list[str]] = {}
+    bars_el = root.find("Bars")
+    if bars_el is not None:
+        for bar in bars_el.findall("Bar"):
+            bid = bar.get("id", "")
+            voices_text = bar.findtext("Voices", "").strip()
+            bars_map[bid] = voices_text.split() if voices_text else []
+
+    # Tracks
+    track_list: list[dict] = []
+    tracks_el = root.find("Tracks")
+    if tracks_el is not None:
+        for t in tracks_el.findall("Track"):
+            tuning_pitches: list[int] = []
+            for prop in t.findall(".//Property"):
+                if prop.get("name") == "Tuning":
+                    raw = prop.findtext("Pitches", "")
+                    tuning_pitches = [int(x) for x in raw.split() if x]
+            midi_prog = -1
+            try:
+                midi_prog = int(t.findtext(".//MIDI/Program", "-1"))
+            except ValueError:
+                pass
+            track_list.append({
+                "tuning": tuning_pitches,
+                "midi_program": midi_prog,
+                "num_strings": len(tuning_pitches),
+                "is_guitar": (
+                    len(tuning_pitches) == 6
+                    and GUITAR_INSTRUMENT_MIN <= midi_prog <= GUITAR_INSTRUMENT_MAX
+                ),
+            })
+
+    if exclude_track_indices is None:
+        exclude_track_indices = {
+            i for i, ti in enumerate(track_list) if ti["is_guitar"]
+        }
+
+    # Tempos
+    tempos: dict[int, float] = {}
+    for auto in root.findall(".//MasterTrack/Automations/Automation"):
+        if auto.findtext("Type") == "Tempo":
+            bar_idx = int(auto.findtext("Bar", "0"))
+            val = auto.findtext("Value", "120 2")
+            tempos[bar_idx] = float(val.split()[0])
+
+    initial_bpm = tempos.get(0, 120.0)
+
+    # Walk master bars and extract MIDI events for non-excluded tracks
+    master_bars = root.findall(".//MasterBar")
+    events: list[MidiEvent] = []
+
+    # Program changes at t=0
+    for i, ti in enumerate(track_list):
+        if i in exclude_track_indices:
+            continue
+        if ti["midi_program"] >= 0:
+            channel = i % 16
+            events.append(MidiEvent(
+                timestamp_ms=0.0,
+                channel=channel,
+                event_type=PROGRAM_CHANGE,
+                data1=ti["midi_program"],
+                data2=0,
+            ))
+
+    current_bpm = initial_bpm
+    current_ms = 0.0
+
+    for mb_idx, mb in enumerate(master_bars):
+        if mb_idx in tempos:
+            current_bpm = tempos[mb_idx]
+
+        time_sig = mb.findtext("Time", "4/4")
+        parts = time_sig.split("/")
+        ts_num = int(parts[0]) if len(parts) == 2 else 4
+        ts_den = int(parts[1]) if len(parts) == 2 else 4
+
+        bar_ids_text = mb.findtext("Bars", "").strip()
+        bar_ids = bar_ids_text.split()
+
+        for track_idx, bar_id in enumerate(bar_ids):
+            if track_idx in exclude_track_indices:
+                continue
+            if track_idx >= len(track_list):
+                continue
+
+            ti = track_list[track_idx]
+            tuning = ti["tuning"]
+            channel = track_idx % 16
+
+            voice_ids = bars_map.get(bar_id, [])
+            for vid in voice_ids:
+                if vid == "-1":
+                    continue
+                beat_ids = voices_map.get(vid, [])
+                beat_pos_ms = current_ms
+
+                for bid in beat_ids:
+                    rhythm_ref, note_ids = beats_map.get(bid, ("", []))
+                    dur_quarters = rhythms.get(rhythm_ref, 1.0)
+                    dur_ms = dur_quarters * (60_000.0 / current_bpm)
+
+                    for nid in note_ids:
+                        if nid not in notes_map:
+                            continue
+                        fret, gp7_string = notes_map[nid]
+                        if gp7_string < len(tuning):
+                            midi_note = tuning[gp7_string] + fret
+                        else:
+                            midi_note = fret
+                        midi_note = max(0, min(127, midi_note))
+
+                        events.append(MidiEvent(
+                            timestamp_ms=beat_pos_ms,
+                            channel=channel,
+                            event_type=NOTE_ON,
+                            data1=midi_note,
+                            data2=80,
+                        ))
+                        events.append(MidiEvent(
+                            timestamp_ms=beat_pos_ms + dur_ms,
+                            channel=channel,
+                            event_type=NOTE_OFF,
+                            data1=midi_note,
+                            data2=0,
+                        ))
+
+                    beat_pos_ms += dur_ms
+
+        measure_dur = ts_num * (4.0 / ts_den) * (60_000.0 / current_bpm)
+        current_ms += measure_dur
+
+    return BackingTrack(events)
+
+
 def load_gp_file(path: str | Path, track_index: int | None = None) -> Timeline:
     """Load a GP file and return a Timeline.
 
     Args:
-        path: Path to GP3/GP4/GP5 file.
+        path: Path to GP3/GP4/GP5/GP7/GP8 file.
         track_index: Explicit track index to load. If None, auto-selects
                      the first guitar track (or track 0 as fallback).
     """
+    if _is_gp7_file(path):
+        return _load_gp7_file(path, track_index)
+
     song = guitarpro.parse(str(path))
     tempo_map = _build_tempo_map(song)
 
@@ -226,13 +712,16 @@ def extract_backing_track(
     """Extract non-guitar tracks from a GP file as MIDI events.
 
     Args:
-        path: Path to GP3/GP4/GP5 file.
+        path: Path to GP3/GP4/GP5/GP7/GP8 file.
         exclude_track_indices: Track indices to exclude. If None, auto-excludes
                                all guitar tracks.
 
     Returns:
         BackingTrack with note_on, note_off, and program_change events.
     """
+    if _is_gp7_file(path):
+        return _extract_gp7_backing_track(path, exclude_track_indices)
+
     song = guitarpro.parse(str(path))
     tempo_map = _build_tempo_map(song)
 

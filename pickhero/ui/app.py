@@ -137,7 +137,10 @@ class App:
         try:
             timeline = load_gp_file(path)
         except Exception as e:
-            print(f"Error loading {path}: {e}")
+            try:
+                print(f"Error loading {path}: {e}")
+            except UnicodeEncodeError:
+                print(f"Error loading {path}: {type(e).__name__}")
             return
 
         # Extract backing track (non-guitar tracks as MIDI)
