@@ -92,7 +92,7 @@ class PlayingScreen:
 
         tempo = max(1, self._timeline.metadata.tempo)
         self._ms_per_beat = 60_000 / tempo
-        self._visible_window_ms = self._visible_beats * self._ms_per_beat
+        self._visible_window_ms = 8000.0  # Fixed 8-second window
 
         # Count-in state
         count_in_beats = max(0, self._config.count_in_beats)
@@ -435,7 +435,8 @@ class PlayingScreen:
 
         notes = self._timeline.get_notes_in_range(view_start, view_end)
 
-        fret_font = _get_font("consolas", 14)
+        fret_font_size = max(12, int(layout.note_h * 0.55))
+        fret_font = _get_font("consolas", fret_font_size)
 
         for note in notes:
             # Difficulty filter: skip notes that fail
@@ -470,11 +471,16 @@ class PlayingScreen:
             pygame.draw.rect(surface, color, rect, border_radius=NOTE_CORNER_RADIUS)
             pygame.draw.rect(surface, t.note_border, rect, width=2, border_radius=NOTE_CORNER_RADIUS)
 
-            # Fret number — only draw if note is wide enough to fit it
-            fret_text = fret_font.render(str(note.fret), True, t.note_text)
+            # Fret number with outline, left-aligned inside note
+            fret_label = str(note.fret)
+            fret_text = fret_font.render(fret_label, True, t.note_text)
             if fret_text.get_width() + 4 <= rect.width:
-                tx = rect.x + rect.width // 2 - fret_text.get_width() // 2
+                tx = rect.x + 4
                 ty = rect.y + rect.height // 2 - fret_text.get_height() // 2
+                # Black outline (render at offsets)
+                outline = fret_font.render(fret_label, True, (0, 0, 0))
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    surface.blit(outline, (tx + dx, ty + dy))
                 surface.blit(fret_text, (tx, ty))
 
     def _draw_hud(self, surface: pygame.Surface, layout: _Layout) -> None:

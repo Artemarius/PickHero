@@ -39,6 +39,7 @@ class MenuScreen:
         self._progress = progress
         self._files: list[Path] = []
         self._search_text: str = ""
+        self._search_active: bool = False
         self._filtered_files: list[Path] = []
         self._selected = 0
         self._scroll_offset = 0
@@ -72,8 +73,8 @@ class MenuScreen:
 
     @property
     def is_searching(self) -> bool:
-        """True when the user has typed search text."""
-        return bool(self._search_text)
+        """True when search mode is active."""
+        return self._search_active
 
     def _apply_filter(self) -> None:
         """Filter _files by search text and reset selection."""
@@ -96,6 +97,7 @@ class MenuScreen:
             if p.is_file() and p.suffix.lower() in GP_EXTENSIONS
         )
         self._search_text = ""
+        self._search_active = False
         self._apply_filter()
 
     def handle_event(self, event: pygame.event.Event) -> Path | str | None:
@@ -104,16 +106,28 @@ class MenuScreen:
 
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
-                if self._search_text:
+                if self._search_active:
                     self._search_text = ""
+                    self._search_active = False
                     self._apply_filter()
                     return None
                 return "escape"
 
+            # F activates filter mode
+            if event.key == pygame.K_f and not self._search_active:
+                self._search_active = True
+                self._search_text = ""
+                self._apply_filter()
+                return None
+
             if event.key == pygame.K_BACKSPACE:
-                if self._search_text:
-                    self._search_text = self._search_text[:-1]
-                    self._apply_filter()
+                if self._search_active:
+                    if self._search_text:
+                        self._search_text = self._search_text[:-1]
+                        self._apply_filter()
+                    else:
+                        self._search_active = False
+                        self._apply_filter()
                 return None
 
             # Navigation keys
@@ -154,20 +168,21 @@ class MenuScreen:
                     self._ensure_visible()
                 return None
 
-            # T key: toggle theme (only when not searching to avoid conflict)
-            if event.key == pygame.K_t and not self._search_text:
+            # T key: toggle theme (only when not searching)
+            if event.key == pygame.K_t and not self._search_active:
                 name = cycle_theme()
                 if self._config:
                     self._config.theme = name
                     self._config.save()
                 return None
 
-            # Printable character → append to search
-            ch = event.unicode
-            if ch and ch.isprintable() and ch not in ("\r", "\n", "\t"):
-                self._search_text += ch
-                self._apply_filter()
-                return None
+            # Printable character → append to search (only when search is active)
+            if self._search_active:
+                ch = event.unicode
+                if ch and ch.isprintable() and ch not in ("\r", "\n", "\t"):
+                    self._search_text += ch
+                    self._apply_filter()
+                    return None
 
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             idx = self._hit_test(event.pos)
@@ -207,8 +222,8 @@ class MenuScreen:
         list_width = w - 120
 
         # Search bar
-        if self._search_text:
-            search_label = f"Search: {self._search_text}_"
+        if self._search_active:
+            search_label = f"Filter: {self._search_text}_"
             search_surf = item_font.render(search_label, True, t.hud_accent)
             surface.blit(search_surf, (list_left, 90))
             count_label = f"({len(files)} of {len(self._files)} songs)"
@@ -275,10 +290,10 @@ class MenuScreen:
         surface.blit(score_surf, (w // 2 - score_surf.get_width() // 2, h - 56))
 
         # Controls hint
-        if self._search_text:
-            hint = "BACKSPACE: edit  |  ESC: clear search  |  ENTER: select  |  UP/DOWN: navigate"
+        if self._search_active:
+            hint = "Type to filter  |  BACKSPACE: edit  |  ESC: exit filter  |  ENTER: select  |  UP/DOWN: navigate"
         else:
-            hint = "Type to search  |  UP/DOWN: navigate  |  ENTER: select  |  S: search online  |  D: audio device  |  T: theme  |  ESC: quit"
+            hint = "F: filter  |  UP/DOWN: navigate  |  ENTER: select  |  S: search online  |  D: audio device  |  T: theme  |  ESC: quit"
         hint_surf = hint_font.render(hint, True, t.hud_text)
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, h - 36))
 
