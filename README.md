@@ -121,6 +121,27 @@ PickHero/
 4. ~~**Live Matching & Feedback** — pitch comparison, hit/miss visuals, accuracy scoring~~ **Done**
 5. ~~**Polish** — tempo control, section looping, device selector, backing tracks, count-in, progress tracking, song browser, difficulty filter, themes, practice recommendations, `.exe` packaging~~ **Done**
 
+## Troubleshooting
+
+**No notes detected / no signal:**
+- Turn up the volume knob on your guitar (most common gotcha!)
+- Check the pickup selector is in a live position (bridge or neck, not between clicks)
+- Unplug and re-plug the USB cable at both ends
+- Use a rear motherboard USB port, not a front panel or hub
+- In Windows: `Settings > System > Sound > Input` — select "USB Audio" and check the volume slider isn't at zero. You should see the input meter move when you strum.
+
+**Testing your setup:**
+Run `python -m pickhero --console` to see detected notes printed live in the terminal. This helps isolate whether the issue is hardware (no signal) or software (signal present but not matching).
+
+**Audio detection not working in-game:**
+- Press **A** during playback to enable audio detection (it's off by default). The bottom status bar should show `A: audio ON`.
+- Press **D** on the menu screen to select the correct audio input device.
+
+**High latency or missed notes:**
+- Lower the noise gate with **Z** during playback (default is -60 dB)
+- Cheap USB cables can add 10-20ms of latency — this is usually fine but noticeable on fast passages
+- Slow the song down with **PgDn** while practicing
+
 ## References
 
 - [aubio](https://github.com/aubio/aubio) — pitch/onset detection
