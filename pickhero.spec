@@ -5,6 +5,10 @@ Build with:  pyinstaller pickhero.spec --noconfirm
 Output:      dist/PickHero.exe  (single-file, windowed)
 """
 
+import glob
+import os
+import sys
+
 from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_dynamic_libs,
@@ -28,6 +32,14 @@ binaries = []
 binaries += collect_dynamic_libs("aubio")
 binaries += collect_dynamic_libs("pygame")
 binaries += collect_dynamic_libs("numpy")
+
+# ── VC++ Runtime ────────────────────────────────────────────────────────────
+# Bundle the Visual C++ runtime so the exe works on machines without it.
+# Python ships these DLLs in its install directory.
+_python_dir = os.path.dirname(sys.executable)
+for _pattern in ("vcruntime*.dll", "msvcp*.dll"):
+    for _dll in glob.glob(os.path.join(_python_dir, _pattern)):
+        binaries.append((_dll, "."))
 
 # ── Analysis ────────────────────────────────────────────────────────────────
 a = Analysis(
