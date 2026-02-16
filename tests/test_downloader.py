@@ -1,11 +1,12 @@
 """Tests for pickhero.tabs.downloader module."""
 
 import json
+import urllib.error
 from unittest.mock import patch
 
 from pickhero.tabs.downloader import (
     SongsterrResult,
-    _extract_source_from_state_script,
+    _get_source_url,
     download_gp5,
     get_songsterr_url,
     sanitize_filename,
@@ -37,7 +38,6 @@ class TestSearch:
         assert len(results) == 5
 
     def test_network_error_returns_empty(self):
-        import urllib.error
         with patch(
             "pickhero.tabs.downloader._urlopen",
             side_effect=urllib.error.URLError("fail"),
@@ -61,66 +61,85 @@ class TestSearch:
         assert results[0].artist == ""
 
 
-class TestExtractSourceFromStateScript:
-    def test_extracts_url(self):
-        source_url = "https://d12345.cloudfront.net/tabs/song.gp5"
-        state = {"meta": {"current": {"source": source_url}}}
-        html = f'<script id="state" type="application/json">{json.dumps(state)}</script>'
+class TestGetSourceUrl:
+    def _make_responses(self, meta_body, revision_body=None):
+        """Helper: return a fake _urlopen that returns meta then revision JSON."""
+        responses = iter(
+            [json.dumps(b).encode() for b in [meta_body] + ([revision_body] if revision_body else [])]
+        )
+        def fake_urlopen(url, timeout=15):
+            try:
+                return next(responses)
+            except StopIteration:
+                raise urllib.error.URLError("unexpected call")
+        return fake_urlopen
 
-        result = _extract_source_from_state_script(html)
-        assert result == source_url
+    def test_success(self):
+        meta = {"revisionId": 999}
+        revision = {"source": "https://gp.songsterr.com/export.abc.gp"}
+        with patch("pickhero.tabs.downloader._urlopen",
+                   side_effect=self._make_responses(meta, revision)):
+            result = _get_source_url(42)
+        assert result == "https://gp.songsterr.com/export.abc.gp"
 
-    def test_double_quotes_around_id(self):
-        state = {"meta": {"current": {"source": "https://cdn.example.com/tab.gp5"}}}
-        html = f'<script id="state">{json.dumps(state)}</script>'
-        assert _extract_source_from_state_script(html) == "https://cdn.example.com/tab.gp5"
+    def test_meta_network_error(self):
+        with patch("pickhero.tabs.downloader._urlopen",
+                   side_effect=urllib.error.URLError("fail")):
+            assert _get_source_url(42) is None
 
-    def test_single_quotes_around_id(self):
-        state = {"meta": {"current": {"source": "https://cdn.example.com/tab.gp5"}}}
-        html = f"<script id='state'>{json.dumps(state)}</script>"
-        assert _extract_source_from_state_script(html) == "https://cdn.example.com/tab.gp5"
+    def test_meta_not_dict(self):
+        with patch("pickhero.tabs.downloader._urlopen",
+                   return_value=json.dumps([1, 2]).encode()):
+            assert _get_source_url(42) is None
 
-    def test_no_script_tag(self):
-        assert _extract_source_from_state_script("<html><body>hi</body></html>") is None
+    def test_meta_missing_revision_id(self):
+        with patch("pickhero.tabs.downloader._urlopen",
+                   return_value=json.dumps({"other": "data"}).encode()):
+            assert _get_source_url(42) is None
 
-    def test_invalid_json(self):
-        html = '<script id="state">not valid json</script>'
-        assert _extract_source_from_state_script(html) is None
+    def test_revision_network_error(self):
+        meta = {"revisionId": 999}
+        calls = [0]
+        def fake(url, timeout=15):
+            calls[0] += 1
+            if calls[0] == 1:
+                return json.dumps(meta).encode()
+            raise urllib.error.URLError("fail")
+        with patch("pickhero.tabs.downloader._urlopen", side_effect=fake):
+            assert _get_source_url(42) is None
 
-    def test_missing_meta_key(self):
-        html = f'<script id="state">{json.dumps({"other": "data"})}</script>'
-        assert _extract_source_from_state_script(html) is None
-
-    def test_missing_current_key(self):
-        html = f'<script id="state">{json.dumps({"meta": {"other": 1}})}</script>'
-        assert _extract_source_from_state_script(html) is None
-
-    def test_missing_source_key(self):
-        state = {"meta": {"current": {"revision": 1}}}
-        html = f'<script id="state">{json.dumps(state)}</script>'
-        assert _extract_source_from_state_script(html) is None
+    def test_revision_missing_source(self):
+        meta = {"revisionId": 999}
+        revision = {"other": "data"}
+        with patch("pickhero.tabs.downloader._urlopen",
+                   side_effect=self._make_responses(meta, revision)):
+            assert _get_source_url(42) is None
 
     def test_non_http_source_rejected(self):
-        state = {"meta": {"current": {"source": "ftp://example.com/tab.gp5"}}}
-        html = f'<script id="state">{json.dumps(state)}</script>'
-        assert _extract_source_from_state_script(html) is None
+        meta = {"revisionId": 999}
+        revision = {"source": "ftp://example.com/tab.gp5"}
+        with patch("pickhero.tabs.downloader._urlopen",
+                   side_effect=self._make_responses(meta, revision)):
+            assert _get_source_url(42) is None
 
     def test_non_string_source_rejected(self):
-        state = {"meta": {"current": {"source": 12345}}}
-        html = f'<script id="state">{json.dumps(state)}</script>'
-        assert _extract_source_from_state_script(html) is None
+        meta = {"revisionId": 999}
+        revision = {"source": 12345}
+        with patch("pickhero.tabs.downloader._urlopen",
+                   side_effect=self._make_responses(meta, revision)):
+            assert _get_source_url(42) is None
 
 
 class TestDownloadGp5:
     def test_success(self, tmp_path):
-        source_url = "https://cdn.example.com/tab.gp5"
-        state = {"meta": {"current": {"source": source_url}}}
-        page_html = f'<script id="state">{json.dumps(state)}</script>'
+        source_url = "https://gp.songsterr.com/export.abc.gp"
         file_bytes = b"\x00GP5_FAKE_DATA"
 
         def fake_urlopen(url, timeout=15):
-            if "wsa" in url:
-                return page_html.encode()
+            if "meta" in url:
+                return json.dumps({"revisionId": 999}).encode()
+            if "revision" in url:
+                return json.dumps({"source": source_url}).encode()
             return file_bytes
 
         output = tmp_path / "test.gp5"
@@ -130,34 +149,22 @@ class TestDownloadGp5:
         assert result is True
         assert output.read_bytes() == file_bytes
 
-    def test_page_fetch_fails(self, tmp_path):
-        import urllib.error
-        with patch(
-            "pickhero.tabs.downloader._urlopen",
-            side_effect=urllib.error.URLError("fail"),
-        ):
-            result = download_gp5(42, tmp_path / "test.gp5")
-        assert result is False
-
-    def test_no_source_url_in_page(self, tmp_path):
-        page_html = b"<html><body>no state script</body></html>"
-        with patch("pickhero.tabs.downloader._urlopen", return_value=page_html):
+    def test_source_url_not_found(self, tmp_path):
+        with patch("pickhero.tabs.downloader._urlopen",
+                   side_effect=urllib.error.URLError("fail")):
             result = download_gp5(42, tmp_path / "test.gp5")
         assert result is False
 
     def test_file_download_fails(self, tmp_path):
-        import urllib.error
-        source_url = "https://cdn.example.com/tab.gp5"
-        state = {"meta": {"current": {"source": source_url}}}
-        page_html = f'<script id="state">{json.dumps(state)}</script>'
-
-        call_count = 0
+        source_url = "https://gp.songsterr.com/export.abc.gp"
+        calls = [0]
 
         def fake_urlopen(url, timeout=15):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return page_html.encode()
+            calls[0] += 1
+            if calls[0] == 1:
+                return json.dumps({"revisionId": 999}).encode()
+            if calls[0] == 2:
+                return json.dumps({"source": source_url}).encode()
             raise urllib.error.URLError("download fail")
 
         output = tmp_path / "test.gp5"
@@ -168,13 +175,13 @@ class TestDownloadGp5:
         assert not output.exists()
 
     def test_creates_parent_dirs(self, tmp_path):
-        source_url = "https://cdn.example.com/tab.gp5"
-        state = {"meta": {"current": {"source": source_url}}}
-        page_html = f'<script id="state">{json.dumps(state)}</script>'
+        source_url = "https://gp.songsterr.com/export.abc.gp"
 
         def fake_urlopen(url, timeout=15):
-            if "wsa" in url:
-                return page_html.encode()
+            if "meta" in url:
+                return json.dumps({"revisionId": 999}).encode()
+            if "revision" in url:
+                return json.dumps({"source": source_url}).encode()
             return b"data"
 
         output = tmp_path / "sub" / "dir" / "test.gp5"

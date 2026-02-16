@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SONGSTERR_API_URL = "https://www.songsterr.com/api/songs"
+SONGSTERR_META_URL = "https://www.songsterr.com/api/meta"
+SONGSTERR_REVISION_URL = "https://www.songsterr.com/api/revision"
 SONGSTERR_TAB_URL = "https://www.songsterr.com/a/wsa"
 
 REQUEST_TIMEOUT = 15
@@ -42,6 +44,18 @@ def _urlopen(url: str, timeout: int = REQUEST_TIMEOUT) -> bytes:
         return resp.read()
 
 
+def _fetch_json(url: str) -> dict | list | None:
+    """Fetch a URL and parse as JSON. Returns None on any error."""
+    try:
+        data = _urlopen(url)
+    except (urllib.error.URLError, OSError):
+        return None
+    try:
+        return json.loads(data)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 def search(query: str, max_results: int = 10) -> list[SongsterrResult]:
     """Search Songsterr for tabs matching a query.
 
@@ -54,14 +68,8 @@ def search(query: str, max_results: int = 10) -> list[SongsterrResult]:
     """
     params = urllib.parse.urlencode({"pattern": query})
     url = f"{SONGSTERR_API_URL}?{params}"
-    try:
-        data = _urlopen(url)
-    except (urllib.error.URLError, OSError):
-        return []
-
-    try:
-        items = json.loads(data)
-    except (json.JSONDecodeError, ValueError):
+    items = _fetch_json(url)
+    if not isinstance(items, list):
         return []
 
     results = []
@@ -76,34 +84,28 @@ def search(query: str, max_results: int = 10) -> list[SongsterrResult]:
     return results
 
 
-def _extract_source_from_state_script(page_html: str) -> str | None:
-    """Extract the GP file CloudFront URL from the <script id="state"> JSON blob.
+def _get_source_url(song_id: int) -> str | None:
+    """Get the GP file download URL via Songsterr's API.
 
-    Songsterr embeds tab metadata in a script tag like:
-        <script id="state" type="application/json">{"meta": ...}</script>
+    Two API calls:
+        1. /api/meta/{songId} → revisionId
+        2. /api/revision/{revisionId} → source URL
 
-    The source URL lives at state["meta"]["current"]["source"].
-
-    Returns None if the URL can't be found.
+    Returns None if the source URL can't be resolved.
     """
-    match = re.search(
-        r'<script\s+id=["\']state["\'][^>]*>(.*?)</script>',
-        page_html,
-        re.DOTALL,
-    )
-    if not match:
+    meta = _fetch_json(f"{SONGSTERR_META_URL}/{song_id}")
+    if not isinstance(meta, dict):
         return None
 
-    try:
-        state = json.loads(match.group(1))
-    except (json.JSONDecodeError, ValueError):
+    revision_id = meta.get("revisionId")
+    if not revision_id:
         return None
 
-    try:
-        source = state["meta"]["current"]["source"]
-    except (KeyError, TypeError):
+    revision = _fetch_json(f"{SONGSTERR_REVISION_URL}/{revision_id}")
+    if not isinstance(revision, dict):
         return None
 
+    source = revision.get("source")
     if isinstance(source, str) and source.startswith("http"):
         return source
     return None
@@ -115,7 +117,7 @@ def get_songsterr_url(song_id: int) -> str:
 
 
 def download_gp5(song_id: int, output_path: str | Path) -> bool:
-    """Download a GP5 tab file from Songsterr.
+    """Download a GP tab file from Songsterr.
 
     Args:
         song_id: Songsterr song ID.
@@ -124,14 +126,7 @@ def download_gp5(song_id: int, output_path: str | Path) -> bool:
     Returns:
         True if download succeeded, False otherwise.
     """
-    tab_url = get_songsterr_url(song_id)
-    try:
-        page_data = _urlopen(tab_url)
-        page_html = page_data.decode("utf-8", errors="replace")
-    except (urllib.error.URLError, OSError):
-        return False
-
-    source_url = _extract_source_from_state_script(page_html)
+    source_url = _get_source_url(song_id)
     if not source_url:
         return False
 
