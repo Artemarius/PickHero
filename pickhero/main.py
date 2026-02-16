@@ -32,3 +32,7 @@ def main():
         _resolve_songs_dir(config)
         from pickhero.ui.app import App
         App(config=config).run()
+
+
+if __name__ == "__main__":
+    main()
