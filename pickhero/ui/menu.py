@@ -14,10 +14,18 @@ from pickhero.config import Config
 from pickhero.progress import ProgressTracker
 from pickhero.ui.colors import cycle_theme, get_theme
 
-GP_EXTENSIONS = {".gp3", ".gp4", ".gp5", ".gp"}
+GP_EXTENSIONS = {".gp3", ".gp4", ".gp5", ".gp", ".gp7", ".gp8"}
 
 # How many items visible at once before scrolling
 VISIBLE_ITEMS = 18
+
+SORT_MODES = ["name_asc", "name_za", "accuracy", "last_played"]
+SORT_LABELS = {
+    "name_asc": "Name A-Z",
+    "name_za": "Name Z-A",
+    "accuracy": "Best %",
+    "last_played": "Recent",
+}
 
 
 def _get_font(name: str, size: int) -> pygame.font.Font:
@@ -37,6 +45,7 @@ class MenuScreen:
         self._songs_dir = Path(songs_dir)
         self._config = config
         self._progress = progress
+        self._sort_mode: str = config.sort_mode if config else "name_asc"
         self._files: list[Path] = []
         self._search_text: str = ""
         self._search_active: bool = False
@@ -77,7 +86,7 @@ class MenuScreen:
         return self._search_active
 
     def _apply_filter(self) -> None:
-        """Filter _files by search text and reset selection."""
+        """Filter _files by search text, apply sort, and reset selection."""
         if self._search_text:
             query = self._search_text.lower()
             self._filtered_files = [
@@ -85,15 +94,50 @@ class MenuScreen:
             ]
         else:
             self._filtered_files = list(self._files)
+        self._sort_files()
         self._selected = 0
         self._scroll_offset = 0
 
+    def _sort_files(self) -> None:
+        """Sort _filtered_files by current sort mode."""
+        mode = self._sort_mode
+        if mode == "name_asc":
+            self._filtered_files.sort(key=lambda p: p.name.lower())
+        elif mode == "name_za":
+            self._filtered_files.sort(key=lambda p: p.name.lower(), reverse=True)
+        elif mode == "accuracy":
+            def acc_key(p: Path) -> tuple[int, float]:
+                rec = self._progress.get_best(p.stem) if self._progress else None
+                if rec and rec.attempts > 0:
+                    return (0, -rec.best_accuracy)  # played: sort by accuracy desc
+                return (1, 0.0)  # unplayed at bottom
+            self._filtered_files.sort(key=acc_key)
+        elif mode == "last_played":
+            def played_key(p: Path) -> tuple[int, str]:
+                rec = self._progress.get_best(p.stem) if self._progress else None
+                if rec and rec.last_played:
+                    return (0, rec.last_played)
+                return (1, "")
+            # Most recent first: reverse so latest ISO date comes first
+            self._filtered_files.sort(key=played_key, reverse=True)
+
+    def _cycle_sort(self) -> None:
+        """Advance to the next sort mode."""
+        idx = SORT_MODES.index(self._sort_mode) if self._sort_mode in SORT_MODES else 0
+        self._sort_mode = SORT_MODES[(idx + 1) % len(SORT_MODES)]
+        self._sort_files()
+        self._selected = 0
+        self._scroll_offset = 0
+        if self._config:
+            self._config.sort_mode = self._sort_mode
+            self._config.save()
+
     def scan_files(self) -> None:
-        """Scan songs directory for GP files."""
+        """Scan songs directory (recursively) for GP files."""
         self._songs_dir.mkdir(parents=True, exist_ok=True)
         self._files = sorted(
             p
-            for p in self._songs_dir.iterdir()
+            for p in self._songs_dir.rglob("*")
             if p.is_file() and p.suffix.lower() in GP_EXTENSIONS
         )
         self._search_text = ""
@@ -166,6 +210,11 @@ class MenuScreen:
                 if files:
                     self._selected = len(files) - 1
                     self._ensure_visible()
+                return None
+
+            # N key: cycle sort mode (only when not searching)
+            if event.key == pygame.K_n and not self._search_active:
+                self._cycle_sort()
                 return None
 
             # T key: toggle theme (only when not searching)
@@ -257,11 +306,13 @@ class MenuScreen:
                 else:
                     color = t.menu_item
 
-                label = files[i].name
+                # Show relative path for subfolder files, just name for root
+                rel = files[i].relative_to(self._songs_dir)
+                label = str(rel) if len(rel.parts) > 1 else files[i].name
                 text_surf = item_font.render(label, True, color)
                 surface.blit(text_surf, (list_left, y + 4))
 
-                # Show best accuracy if available
+                # Show attempts + best accuracy if available
                 if self._progress is not None:
                     record = self._progress.get_best(files[i].stem)
                     if record is not None and record.attempts > 0:
@@ -269,6 +320,11 @@ class MenuScreen:
                         pct_surf = item_font.render(pct, True, t.hud_accent)
                         pct_x = list_left + list_width - pct_surf.get_width() - 8
                         surface.blit(pct_surf, (pct_x, y + 4))
+
+                        att = f"{record.attempts}x"
+                        att_surf = item_font.render(att, True, t.hud_text)
+                        att_x = pct_x - att_surf.get_width() - 12
+                        surface.blit(att_surf, (att_x, y + 4))
 
             # Scroll indicators
             if self._scroll_offset > 0:
@@ -293,7 +349,8 @@ class MenuScreen:
         if self._search_active:
             hint = "Type to filter  |  BACKSPACE: edit  |  ESC: exit filter  |  ENTER: select  |  UP/DOWN: navigate"
         else:
-            hint = "F: filter  |  UP/DOWN: navigate  |  ENTER: select  |  S: search online  |  D: audio device  |  T: theme  |  ESC: quit"
+            sort_label = SORT_LABELS.get(self._sort_mode, "Name A-Z")
+            hint = f"F: filter  |  N: sort ({sort_label})  |  UP/DOWN: navigate  |  ENTER: select  |  S: search online  |  D: audio device  |  T: theme  |  ESC: quit"
         hint_surf = hint_font.render(hint, True, t.hud_text)
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, h - 36))
 

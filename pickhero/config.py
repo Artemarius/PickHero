@@ -48,6 +48,7 @@ class Config:
     max_fret: int = 24
     active_strings: list[bool] = field(default_factory=lambda: [True] * 6)
     chord_partial_credit: bool = True
+    sort_mode: str = "name_asc"
 
     # Store default for HUD comparison (not serialized)
     _default_chord_partial_credit: bool = field(default=True, repr=False)
