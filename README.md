@@ -59,6 +59,12 @@ PickHero reads Guitar Pro files (`.gp3`, `.gp4`, `.gp5`, `.gp7`, `.gp8`). You ca
 
 ## Installation
 
+### Option 1: Download (recommended)
+
+Grab `PickHero.exe` from the [latest release](https://github.com/Artemarius/PickHero/releases/latest). No Python install needed — just run it.
+
+### Option 2: From source
+
 ```bash
 # Clone
 git clone https://github.com/Artemarius/PickHero.git
@@ -73,9 +79,9 @@ python -m pickhero
 
 ### Requirements
 
-- Python 3.10+
 - Windows 10/11 (primary target; Linux/macOS may work but untested)
 - A USB audio input device (guitar cable or microphone)
+- Python 3.10+ (only if running from source)
 
 ## Project Structure
 
