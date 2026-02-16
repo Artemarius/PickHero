@@ -48,6 +48,7 @@ class App:
             self._config.save()
 
         pygame.init()
+        pygame.key.set_repeat(300, 40)  # 300ms delay, then repeat every 40ms
         pygame.display.set_caption("PickHero")
 
         dc = self._config.display
