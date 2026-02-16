@@ -1,5 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec file for PickHero."""
+"""PyInstaller spec file for PickHero.
+
+Build with:  pyinstaller pickhero.spec --noconfirm
+Output:      dist/PickHero.exe  (single-file, windowed)
+"""
 
 from PyInstaller.utils.hooks import (
     collect_data_files,
@@ -8,27 +12,40 @@ from PyInstaller.utils.hooks import (
 
 block_cipher = None
 
-# Collect runtime data/libraries that PyInstaller misses
+# ── Data files ──────────────────────────────────────────────────────────────
+# sounddevice bundles the PortAudio shared library as package data.
+# certifi provides the CA certificate bundle needed for HTTPS downloads
+# (Songsterr search/download via urllib).
 datas = []
-datas += collect_data_files("sounddevice")  # includes PortAudio DLL
-datas += collect_data_files("certifi")       # SSL certs for Songsterr downloads
+datas += collect_data_files("sounddevice")
+datas += collect_data_files("certifi")
 
+# ── Native binaries / C extensions ──────────────────────────────────────────
+# aubio  — C pitch/onset detection library
+# pygame — SDL2 + mixer + image + font shared libraries
+# numpy  — C core (multiarray, umath, etc.) — sometimes missed by analysis
 binaries = []
 binaries += collect_dynamic_libs("aubio")
 binaries += collect_dynamic_libs("pygame")
+binaries += collect_dynamic_libs("numpy")
 
+# ── Analysis ────────────────────────────────────────────────────────────────
 a = Analysis(
     ["pickhero/main.py"],
     pathex=[],
     binaries=binaries,
     datas=datas,
     hiddenimports=[
+        # Audio capture & detection
         "aubio",
         "numpy",
         "sounddevice",
+        # UI
         "pygame",
         "pygame.midi",
-        "pyguitarpro",
+        # Tab loading — the pip package is "pyguitarpro", but the import is "guitarpro"
+        "guitarpro",
+        # SSL certs for urllib HTTPS requests (Songsterr downloader)
         "certifi",
     ],
     hookspath=[],

@@ -1,11 +1,14 @@
 """Per-song progress tracking.
 
-Stores best accuracy, attempt count, and last played date per song.
-JSON file in the user's home directory alongside settings.
+Stores best accuracy, attempt count, last played date, and detailed
+section/tempo history per song. JSON file in the user's home directory
+alongside settings.
 """
 
+from __future__ import annotations
+
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 
 from pickhero.config import CONFIG_DIR
@@ -21,11 +24,19 @@ class SongRecord:
     attempts: int = 0
     last_played: str = ""
 
+    # Per-section accuracy history across attempts.
+    # Each entry: {"attempt": N, "sections": [{"measures": [start, end], "accuracy": float}, ...]}
+    section_history: list[dict] = field(default_factory=list)
+
+    # Per-attempt tempo/accuracy tracking.
+    # Each entry: {"attempt": N, "tempo_factor": float, "accuracy": float}
+    tempo_history: list[dict] = field(default_factory=list)
+
 
 class ProgressTracker:
     """Loads and saves per-song progress data."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._data: dict[str, SongRecord] = {}
         self._load()
 
@@ -46,6 +57,67 @@ class ProgressTracker:
         self._save()
         return is_new_best
 
+    def record_detailed_result(
+        self,
+        song_key: str,
+        stats: dict,
+        weakest_sections: list[tuple[int, int, float]],
+        tempo_factor: float,
+    ) -> tuple[bool, list[str]]:
+        """Record a completed attempt with section-level detail.
+
+        Calls record_result internally for backward compatibility, then
+        stores section and tempo history and generates recommendations.
+
+        Args:
+            song_key: Unique identifier for the song/track.
+            stats: Dict from matcher.get_statistics().
+            weakest_sections: List of (start_measure, end_measure, accuracy_pct).
+            tempo_factor: Tempo scaling factor used for this attempt (0.5-1.0).
+
+        Returns:
+            Tuple of (is_new_best, recommendations) where recommendations
+            is a list of short practice suggestion strings.
+        """
+        is_new_best = self.record_result(song_key, stats)
+        record = self._data[song_key]
+        accuracy = stats.get("accuracy_percent", 0.0)
+
+        # Store section history for this attempt
+        section_entry = {
+            "attempt": record.attempts,
+            "sections": [
+                {"measures": [s, e], "accuracy": acc}
+                for s, e, acc in weakest_sections
+            ],
+        }
+        record.section_history.append(section_entry)
+
+        # Store tempo history for this attempt
+        tempo_entry = {
+            "attempt": record.attempts,
+            "tempo_factor": tempo_factor,
+            "accuracy": accuracy,
+        }
+        record.tempo_history.append(tempo_entry)
+
+        # Cap history length to prevent unbounded growth (keep last 50)
+        if len(record.section_history) > 50:
+            record.section_history = record.section_history[-50:]
+        if len(record.tempo_history) > 50:
+            record.tempo_history = record.tempo_history[-50:]
+
+        self._save()
+
+        # Generate recommendations
+        from pickhero.recommendations import generate_recommendations
+
+        recommendations = generate_recommendations(
+            record, stats, weakest_sections, tempo_factor,
+        )
+
+        return is_new_best, recommendations
+
     def get_best(self, song_key: str) -> SongRecord | None:
         """Get best record for a song, or None if never played."""
         return self._data.get(song_key)
@@ -57,7 +129,11 @@ class ProgressTracker:
             with open(PROGRESS_FILE) as f:
                 raw = json.load(f)
             for key, val in raw.items():
-                self._data[key] = SongRecord(**val)
+                # Backward compat: ignore unknown fields, supply defaults
+                # for new fields that may be missing from old data.
+                known_fields = {f.name for f in SongRecord.__dataclass_fields__.values()}
+                filtered = {k: v for k, v in val.items() if k in known_fields}
+                self._data[key] = SongRecord(**filtered)
         except (json.JSONDecodeError, TypeError, KeyError):
             pass
 
