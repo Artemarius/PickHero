@@ -102,7 +102,8 @@ pickhero/
     ├── scrolling.py
     ├── feedback.py
     ├── menu.py
-    └── device_menu.py
+    ├── device_menu.py
+    └── download_menu.py
 ```
 
 ## Testing
@@ -110,6 +111,7 @@ pickhero/
 - `tests/test_detector.py` — feed known sine waves to aubio, verify correct note detection
 - `tests/test_loader.py` — load a reference GP5 file, verify extracted notes match expected
 - `tests/test_timeline.py` — verify timeline tick advancement, note activation windows
+- `tests/test_downloader.py` — Songsterr search/download with mocked urllib responses
 - Use `pytest`. Keep tests independent of audio hardware (mock sounddevice).
 
 ## Build & Run

@@ -278,7 +278,7 @@ class MenuScreen:
         if self._search_text:
             hint = "BACKSPACE: edit  |  ESC: clear search  |  ENTER: select  |  UP/DOWN: navigate"
         else:
-            hint = "Type to search  |  UP/DOWN: navigate  |  ENTER: select  |  D: audio device  |  T: theme  |  ESC: quit"
+            hint = "Type to search  |  UP/DOWN: navigate  |  ENTER: select  |  S: search online  |  D: audio device  |  T: theme  |  ESC: quit"
         hint_surf = hint_font.render(hint, True, t.hud_text)
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, h - 36))
 

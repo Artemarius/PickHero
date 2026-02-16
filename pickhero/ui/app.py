@@ -15,6 +15,7 @@ from pickhero.progress import ProgressTracker
 from pickhero.tabs.loader import extract_backing_track, load_gp_file
 from pickhero.ui.colors import set_theme
 from pickhero.ui.device_menu import DeviceMenuScreen
+from pickhero.ui.download_menu import DownloadMenuScreen
 from pickhero.ui.menu import MenuScreen
 from pickhero.ui.scrolling import PlayingScreen
 
@@ -30,6 +31,7 @@ class App:
         self._menu: MenuScreen | None = None
         self._playing_screen: PlayingScreen | None = None
         self._device_menu: DeviceMenuScreen | None = None
+        self._download_menu: DownloadMenuScreen | None = None
 
     def run(self) -> None:
         """Initialize PyGame, run main loop, clean up."""
@@ -85,16 +87,20 @@ class App:
                 self._handle_playing_event(event)
             elif self._state == "device":
                 self._handle_device_event(event)
+            elif self._state == "download":
+                self._handle_download_event(event)
 
     def _handle_menu_event(self, event: pygame.event.Event) -> None:
-        if (
-            event.type == pygame.KEYDOWN
-            and event.key == pygame.K_d
-            and not self._menu.is_searching
-        ):
-            self._device_menu = DeviceMenuScreen(self._config)
-            self._state = "device"
-            return
+        if event.type == pygame.KEYDOWN and not self._menu.is_searching:
+            if event.key == pygame.K_d:
+                self._device_menu = DeviceMenuScreen(self._config)
+                self._state = "device"
+                return
+            if event.key == pygame.K_s:
+                songs_dir = Path(self._config.songs_dir)
+                self._download_menu = DownloadMenuScreen(songs_dir)
+                self._state = "download"
+                return
 
         result = self._menu.handle_event(event)
         if result == "escape":
@@ -116,6 +122,14 @@ class App:
             if result == "selected":
                 self._menu.refresh_device_name()
             self._device_menu = None
+            self._state = "menu"
+
+    def _handle_download_event(self, event: pygame.event.Event) -> None:
+        result = self._download_menu.handle_event(event)
+        if result in ("back", "downloaded"):
+            if result == "downloaded":
+                self._menu.scan_files()
+            self._download_menu = None
             self._state = "menu"
 
     def _load_song(self, path: Path) -> None:
@@ -165,3 +179,5 @@ class App:
             self._playing_screen.render(surface)
         elif self._state == "device" and self._device_menu is not None:
             self._device_menu.render(surface)
+        elif self._state == "download" and self._download_menu is not None:
+            self._download_menu.render(surface)

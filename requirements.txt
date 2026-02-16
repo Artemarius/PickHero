@@ -3,4 +3,3 @@ aubio>=0.4.9
 numpy>=1.24.0
 pyguitarpro>=0.9
 pygame>=2.5.0
-requests>=2.31.0
