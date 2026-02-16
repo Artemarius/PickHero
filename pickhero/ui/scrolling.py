@@ -116,6 +116,7 @@ class PlayingScreen:
         self._song_key = song_key
         self._song_completed = False
         self._is_new_best = False
+        self._recommendations: list[str] = []
 
         # MIDI backing track
         self._midi_player: MidiPlayer | None = None
@@ -151,6 +152,7 @@ class PlayingScreen:
             self._song_completed = False
             self._is_new_best = False
             self._weakest_sections = []
+            self._recommendations = []
             if self._matcher:
                 self._matcher.reset()
             self._feedback.reset()
@@ -161,6 +163,7 @@ class PlayingScreen:
             self._song_completed = False
             self._is_new_best = False
             self._weakest_sections = []
+            self._recommendations = []
         self._playing = not self._playing
         if self._playing:
             self._last_tick = time.perf_counter()
@@ -290,10 +293,14 @@ class PlayingScreen:
                     # Audio-scored completion
                     stats = self._matcher.get_statistics()
                     if stats["total"] > 0:
-                        self._is_new_best = self._progress_tracker.record_result(
-                            self._song_key, stats
+                        weakest = self._matcher.get_weakest_sections()
+                        self._is_new_best, self._recommendations = (
+                            self._progress_tracker.record_detailed_result(
+                                self._song_key, stats,
+                                weakest, self._tempo_factor,
+                            )
                         )
-                        self._weakest_sections = self._matcher.get_weakest_sections()
+                        self._weakest_sections = weakest
                         self._song_completed = True
                 elif not self._audio_enabled:
                     # Auto-scroll (passive) completion
@@ -651,10 +658,18 @@ class PlayingScreen:
                 weak_surf = hint_font.render(weak_text, True, t.feedback_close)
                 surface.blit(weak_surf, (w // 2 - weak_surf.get_width() // 2, center_y + 140))
 
+            # Practice recommendations
+            rec_y = center_y + 170
+            for rec in self._recommendations:
+                rec_surf = hint_font.render(rec, True, t.hud_accent)
+                surface.blit(rec_surf, (w // 2 - rec_surf.get_width() // 2, rec_y))
+                rec_y += 24
+
             # Controls hint
+            hint_y = max(center_y + 180, rec_y + 10)
             hint_text = "SPACE to replay  |  L to loop weak section  |  ESC to menu"
             hint_surf = hint_font.render(hint_text, True, t.hud_text)
-            surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, center_y + 180))
+            surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, hint_y))
         else:
             # Auto-scroll completion — no stats
             hint_text = "SPACE to replay  |  ESC to menu"

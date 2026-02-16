@@ -100,7 +100,9 @@ PickHero/
 │   │   ├── feedback.py      # hit/miss visual effects
 │   │   └── menu.py          # song selection, settings
 │   ├── config.py            # user settings, audio device config
-│   └── progress.py          # per-song best score tracking
+│   ├── matcher.py           # note matching engine (hit/close/miss)
+│   ├── progress.py          # per-song score tracking + section history
+│   └── recommendations.py   # practice suggestion engine
 ├── assets/
 │   └── fonts/
 ├── songs/                   # local GP5 tab storage
@@ -117,7 +119,7 @@ PickHero/
 2. ~~**Tab Parser & Timeline** — GP5 loading via `pyguitarpro`, timeline data structure~~ **Done**
 3. ~~**Scrolling Display MVP** — PyGame window with 6 string lanes, tempo-synced scrolling~~ **Done**
 4. ~~**Live Matching & Feedback** — pitch comparison, hit/miss visuals, accuracy scoring~~ **Done**
-5. **Polish** — ~~tempo control~~, ~~section looping~~, ~~device selector~~, ~~backing tracks~~, ~~count-in~~, ~~progress tracking~~, ~~song browser~~, `.exe` packaging
+5. ~~**Polish** — tempo control, section looping, device selector, backing tracks, count-in, progress tracking, song browser, difficulty filter, themes, practice recommendations, `.exe` packaging~~ **Done**
 
 ## References
 
