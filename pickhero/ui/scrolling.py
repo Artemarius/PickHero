@@ -330,9 +330,9 @@ class PlayingScreen:
             self._toggle_loop()
         elif event.key == pygame.K_b:
             self._toggle_backing()
-        elif event.key == pygame.K_LEFTBRACKET:
+        elif event.key == pygame.K_z:
             self.set_noise_gate_db(self._noise_gate_db - 5)
-        elif event.key == pygame.K_RIGHTBRACKET:
+        elif event.key == pygame.K_x:
             self.set_noise_gate_db(self._noise_gate_db + 5)
         elif event.key == pygame.K_t:
             self._cycle_theme()
@@ -568,7 +568,7 @@ class PlayingScreen:
             backing_state = f"|  B: backing {'off' if self._backing_muted else 'ON'}  "
         hint = (
             f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
-            f"|  HOME: restart  |  PgDn/PgUp: tempo  |  [/]: gate  "
+            f"|  HOME: restart  |  PgDn/PgUp: tempo  |  Z/X: gate"
             f"|  A: audio {audio_state}  "
             f"{backing_state}"
             f"|  I/O: loop {loop_state}  |  P: toggle  |  ESC: menu"
