@@ -35,6 +35,7 @@ class AudioCapture:
         self.config = config
         ac = config.audio
 
+        calibration = getattr(config, 'calibration', None) or None
         self.detector = PitchDetector(
             buf_size=ac.buf_size,
             hop_size=ac.hop_size,
@@ -42,10 +43,14 @@ class AudioCapture:
             confidence_threshold=ac.confidence_threshold,
             onset_threshold=ac.onset_threshold,
             noise_gate_db=ac.noise_gate_db,
+            calibration=calibration if calibration else None,
         )
         self.note_queue: queue.Queue[TimestampedNote] = queue.Queue()
         self._stream: sd.InputStream | None = None
         self._start_time: float = 0.0
+        self._signal_db: float = -120.0
+        self._tuner_freq: float = 0.0
+        self._tuner_confidence: float = 0.0
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
         """Sounddevice callback — runs in audio thread."""
@@ -61,6 +66,9 @@ class AudioCapture:
         for i in range(0, len(mono) - hop + 1, hop):
             chunk = mono[i:i + hop]
             result = self.detector.process(chunk)
+            self._signal_db = self.detector.last_signal_db
+            self._tuner_freq = self.detector.last_freq
+            self._tuner_confidence = self.detector.last_confidence
             if result is not None:
                 elapsed_ms = (time.perf_counter() - self._start_time) * 1000
                 self.note_queue.put(TimestampedNote(note=result, timestamp_ms=elapsed_ms))
@@ -101,6 +109,14 @@ class AudioCapture:
         Thread-safe: single float attribute write is atomic under the GIL.
         """
         self.detector.set_noise_gate_db(db)
+
+    def get_signal_db(self) -> float:
+        """Return the latest signal level in dB. Thread-safe (single float read under GIL)."""
+        return self._signal_db
+
+    def get_tuner_data(self) -> tuple[float, float]:
+        """Return (frequency_hz, confidence) for tuner display. Thread-safe."""
+        return (self._tuner_freq, self._tuner_confidence)
 
     def get_notes(self) -> list[TimestampedNote]:
         """Drain all pending detected notes from the queue (non-blocking)."""

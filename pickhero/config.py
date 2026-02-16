@@ -12,6 +12,14 @@ CONFIG_FILE = CONFIG_DIR / "settings.json"
 
 
 @dataclass
+class StringCalibration:
+    """Calibration data for a single guitar string."""
+    midi_note: int        # detected MIDI note (e.g. 40 for E2)
+    frequency: float      # median detected frequency (Hz)
+    noise_floor_db: float  # noise floor measured before playing
+
+
+@dataclass
 class AudioConfig:
     """Audio capture and detection settings."""
     device_index: int | None = None  # None = system default
@@ -49,9 +57,29 @@ class Config:
     active_strings: list[bool] = field(default_factory=lambda: [True] * 6)
     chord_partial_credit: bool = True
     sort_mode: str = "name_asc"
+    calibration: dict = field(default_factory=dict)
 
     # Store default for HUD comparison (not serialized)
     _default_chord_partial_credit: bool = field(default=True, repr=False)
+
+    def get_string_calibration(self, string: int) -> StringCalibration | None:
+        """Return calibration for a string (1-6), or None if not calibrated."""
+        strings = self.calibration.get("strings", {})
+        data = strings.get(str(string))
+        if data is None:
+            return None
+        return StringCalibration(**data)
+
+    def set_string_calibration(self, string: int, cal: StringCalibration) -> None:
+        """Store calibration for a string (1-6)."""
+        if "strings" not in self.calibration:
+            self.calibration["strings"] = {}
+        self.calibration["strings"][str(string)] = asdict(cal)
+
+    def is_calibrated(self) -> bool:
+        """True if at least one string has been calibrated."""
+        strings = self.calibration.get("strings", {})
+        return len(strings) > 0
 
     def save(self):
         """Save settings to JSON file."""

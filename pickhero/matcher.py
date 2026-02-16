@@ -176,14 +176,17 @@ class NoteMatcher:
             if not pending:
                 continue
 
-            # Find closest match by semitone distance
+            # Find closest match by semitone distance (with octave equivalence)
             best = None
             best_dist = None
             for note in pending:
                 dist = semitone_distance(detected_midi, note.midi_note)
-                if best_dist is None or dist < best_dist:
+                # Octave equivalence: if off by ~12 semitones, treat as 0
+                octave_dist = dist % 12 if dist >= 12 else dist
+                effective = min(dist, octave_dist)
+                if best_dist is None or effective < best_dist:
                     best = note
-                    best_dist = dist
+                    best_dist = effective
 
             if best is None or best_dist is None:
                 continue

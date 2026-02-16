@@ -37,6 +37,7 @@ class PitchDetector:
         confidence_threshold: float = 0.8,
         onset_threshold: float = 0.3,
         noise_gate_db: float = -60.0,
+        calibration: dict | None = None,
     ):
         self.buf_size = buf_size
         self.hop_size = hop_size
@@ -44,6 +45,13 @@ class PitchDetector:
         self.confidence_threshold = confidence_threshold
         self.onset_threshold = onset_threshold
         self.noise_gate_db = noise_gate_db
+        self.last_signal_db: float = -120.0
+        self.last_freq: float = 0.0
+        self.last_confidence: float = 0.0
+
+        # Octave jump protection
+        self._prev_freq: float = 0.0
+        self._calibration = calibration
 
         # Pitch detector (YIN algorithm)
         self._pitch = aubio.pitch("yin", buf_size, hop_size, sample_rate)
@@ -74,12 +82,22 @@ class PitchDetector:
         else:
             db = -120.0
 
+        self.last_signal_db = db
+
         if db < self.noise_gate_db:
             return None
 
         # Detect pitch
-        freq = self._pitch(audio_buffer)[0]
-        confidence = self._pitch.get_confidence()
+        freq = float(self._pitch(audio_buffer)[0])
+        confidence = float(self._pitch.get_confidence())
+
+        # Correct octave jumps before exposing values
+        if freq > 0:
+            freq = self._correct_octave_jump(freq, confidence)
+
+        # Store values for tuner (after octave correction)
+        self.last_freq = freq
+        self.last_confidence = confidence
 
         # Detect onset
         is_onset = bool(self._onset(audio_buffer))
@@ -100,12 +118,52 @@ class PitchDetector:
             is_onset=is_onset,
         )
 
+    def _correct_octave_jump(self, freq: float, confidence: float) -> float:
+        """Suppress octave jumps caused by harmonic detection.
+
+        If the new frequency is ~2x or ~0.5x the previous, and confidence
+        isn't very high, prefer the previous frequency (likely the fundamental).
+        When calibration data is available, also check if freq/2 matches a
+        known open-string fundamental.
+        """
+        corrected = freq
+
+        # Calibration-based correction: if freq/2 is near a calibrated string,
+        # prefer freq/2 (the fundamental was likely the intended note)
+        if self._calibration and freq > 0:
+            cal_strings = self._calibration.get("strings", {})
+            half_freq = freq / 2.0
+            for cal in cal_strings.values():
+                cal_freq = cal.get("frequency", 0)
+                if cal_freq > 0:
+                    ratio = half_freq / cal_freq
+                    # Within ±1 semitone of a calibrated fundamental
+                    if 0.944 < ratio < 1.06:
+                        corrected = half_freq
+                        self._prev_freq = corrected
+                        return corrected
+
+        # Generic ratio-based correction
+        if self._prev_freq > 0 and confidence < 0.95:
+            ratio = freq / self._prev_freq
+            if 1.95 <= ratio <= 2.05:
+                # One octave up — prefer previous (fundamental)
+                corrected = self._prev_freq
+            elif 0.48 <= ratio <= 0.52:
+                # One octave down — prefer previous
+                corrected = self._prev_freq
+
+        self._prev_freq = corrected
+        return corrected
+
     def set_noise_gate_db(self, db: float) -> None:
         """Update the noise gate threshold (dB). Takes effect on next process() call."""
         self.noise_gate_db = db
 
     def reset(self):
         """Reset detector state. Call when starting a new song/session."""
+        self._prev_freq = 0.0
+
         # Re-create detectors to clear internal state
         self._pitch = aubio.pitch(
             "yin", self.buf_size, self.hop_size, self.sample_rate

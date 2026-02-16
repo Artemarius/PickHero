@@ -16,6 +16,7 @@ from pickhero.config import Config
 from pickhero.matcher import NoteMatcher
 from pickhero.progress import ProgressTracker
 from pickhero.tabs.timeline import NoteEvent, Timeline
+from pickhero.audio.note_utils import freq_to_cents_deviation, midi_to_name
 from pickhero.ui.colors import (
     STRING_COLORS,
     cycle_theme,
@@ -103,7 +104,7 @@ class PlayingScreen:
         self._audio_capture = None  # AudioCapture, created on demand
         self._matcher: NoteMatcher | None = None
         self._feedback = FeedbackRenderer()
-        self._audio_enabled = False
+        self._audio_enabled = True
         self._noise_gate_db: float = self._config.audio.noise_gate_db
 
         # Loop state
@@ -128,8 +129,22 @@ class PlayingScreen:
         self._max_fret: int = self._config.max_fret
         self._active_strings: list[bool] = list(self._config.active_strings)
 
+        # Signal level meter
+        self._signal_db: float = -120.0
+        self._signal_db_smooth: float = -120.0
+
+        # Tuner display
+        self._tuner_freq: float = 0.0
+        self._tuner_confidence: float = 0.0
+        self._tuner_freq_smooth: float = 0.0
+        self._tuner_displayed_note: int = -1
+        self._tuner_note_stable_frames: int = 0
+
         # Chord partial credit mode
         self._chord_partial_credit: bool = self._config.chord_partial_credit
+
+        # Help overlay
+        self._show_help: bool = False
 
     def _note_passes_filter(self, note: NoteEvent) -> bool:
         """Check if a note passes the difficulty filter."""
@@ -216,6 +231,45 @@ class PlayingScreen:
 
     def update(self) -> None:
         """Advance playback clock by real elapsed time."""
+        # Update signal level meter and tuner even when paused (so user can verify signal)
+        if self._audio_capture is not None:
+            raw_db = self._audio_capture.get_signal_db()
+            self._signal_db = raw_db
+            self._signal_db_smooth = self._signal_db_smooth * 0.7 + raw_db * 0.3
+            freq, conf = self._audio_capture.get_tuner_data()
+            self._tuner_freq = freq
+            self._tuner_confidence = conf
+            if freq > 0 and conf > 0.5:
+                # Frequency jump guard: ignore wild jumps (> 50% change)
+                if (self._tuner_freq_smooth > 0
+                        and abs(freq - self._tuner_freq_smooth) / self._tuner_freq_smooth > 0.5):
+                    # Wild jump — use very low alpha to dampen
+                    alpha = 0.02
+                else:
+                    # Adaptive EMA: high confidence → faster, low → slower
+                    alpha = 0.10 if conf > 0.8 else 0.03
+                if self._tuner_freq_smooth > 0:
+                    self._tuner_freq_smooth = self._tuner_freq_smooth * (1 - alpha) + freq * alpha
+                else:
+                    self._tuner_freq_smooth = freq
+                # Note hysteresis: only change displayed note after 8 stable frames (~130ms)
+                from pickhero.audio.note_utils import freq_to_midi
+                candidate_note = freq_to_midi(self._tuner_freq_smooth)
+                if candidate_note != self._tuner_displayed_note:
+                    self._tuner_note_stable_frames += 1
+                    if self._tuner_note_stable_frames >= 8:
+                        self._tuner_displayed_note = candidate_note
+                        self._tuner_note_stable_frames = 0
+                else:
+                    self._tuner_note_stable_frames = 0
+            else:
+                # Slow decay instead of instant reset
+                self._tuner_freq_smooth *= 0.92
+                if self._tuner_freq_smooth < 20.0:
+                    self._tuner_freq_smooth = 0.0
+                    self._tuner_displayed_note = -1
+                    self._tuner_note_stable_frames = 0
+
         if not self._playing:
             return
 
@@ -337,9 +391,9 @@ class PlayingScreen:
             self._toggle_loop()
         elif event.key == pygame.K_b:
             self._toggle_backing()
-        elif event.key == pygame.K_z:
-            self.set_noise_gate_db(self._noise_gate_db - 5)
         elif event.key == pygame.K_x:
+            self.set_noise_gate_db(self._noise_gate_db - 5)
+        elif event.key == pygame.K_c:
             self.set_noise_gate_db(self._noise_gate_db + 5)
         elif event.key == pygame.K_t:
             self._cycle_theme()
@@ -357,10 +411,12 @@ class PlayingScreen:
             self._toggle_string(5)
         elif event.key == pygame.K_F6:
             self._toggle_string(6)
-        elif event.key == pygame.K_c:
+        elif event.key == pygame.K_v:
             self._toggle_chord_mode()
         elif event.key == pygame.K_l:
             self._loop_weakest_section()
+        elif event.key == pygame.K_h:
+            self._show_help = not self._show_help
 
         return None
 
@@ -375,6 +431,9 @@ class PlayingScreen:
         self._draw_hit_zone(surface, layout)
         self._draw_notes(surface, layout)
         self._draw_hud(surface, layout)
+
+        if self._show_help:
+            self._draw_help_overlay(surface, layout)
 
     # -- Pure math helpers (testable without display) --
 
@@ -558,11 +617,18 @@ class PlayingScreen:
                 self._feedback.draw_stats(surface, stats, hint_font, w - 12, 36)
                 stats_bottom_y = 54
 
-        # Top-right: noise gate (below stats, only when audio enabled)
+        # Top-right: noise gate + signal meter + tuner (below stats, when audio capture exists)
         if self._audio_enabled:
             gate_text = f"Gate: {int(self._noise_gate_db)} dB"
             gate_surf = hint_font.render(gate_text, True, t.hud_accent)
             surface.blit(gate_surf, (w - gate_surf.get_width() - 12, stats_bottom_y))
+            if self._audio_capture is not None:
+                self._draw_signal_meter(surface, hint_font, w, stats_bottom_y + 18)
+                self._draw_tuner(surface, hint_font, w, stats_bottom_y + 36)
+        elif self._audio_capture is not None:
+            # Audio off but capture exists — still show meter and tuner
+            self._draw_signal_meter(surface, hint_font, w, stats_bottom_y)
+            self._draw_tuner(surface, hint_font, w, stats_bottom_y + 18)
 
         # Bottom-center: play state + controls
         if self._playback_ms < 0:
@@ -581,7 +647,7 @@ class PlayingScreen:
             backing_state = f"|  B: backing {'off' if self._backing_muted else 'ON'}  "
         hint = (
             f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
-            f"|  HOME: restart  |  PgDn/PgUp: tempo  |  Z/X: gate"
+            f"|  HOME: restart  |  PgDn/PgUp: tempo  |  X/C: gate"
             f"|  A: audio {audio_state}  "
             f"{backing_state}"
             f"|  I/O: loop {loop_state}  |  P: toggle  |  ESC: menu"
@@ -611,6 +677,124 @@ class PlayingScreen:
             chord_text = "Chords: strict" if self._chord_partial_credit else "Chords: easy"
             chord_surf = hint_font.render(chord_text, True, t.hud_accent)
             surface.blit(chord_surf, (12, info_y))
+
+    def _draw_signal_meter(self, surface: pygame.Surface, font: pygame.font.Font,
+                           screen_w: int, y: int) -> None:
+        """Draw a compact horizontal signal level meter with dB label."""
+        t = get_theme()
+        db = self._signal_db_smooth
+
+        bar_w = 100
+        bar_h = 8
+        db_min = -80.0
+        db_max = -10.0
+
+        # dB label
+        db_display = max(db_min, min(db_max, db))
+        label = f"Signal: {int(db_display)} dB"
+        label_surf = font.render(label, True, t.hud_text)
+        label_x = screen_w - label_surf.get_width() - 12
+        surface.blit(label_surf, (label_x, y))
+
+        # Bar position: to the left of the label
+        bar_x = label_x - bar_w - 8
+        bar_y = y + label_surf.get_height() // 2 - bar_h // 2
+
+        # Bar background
+        pygame.draw.rect(surface, t.signal_cold, (bar_x, bar_y, bar_w, bar_h))
+
+        # Fill proportion
+        fill_frac = max(0.0, min(1.0, (db - db_min) / (db_max - db_min)))
+        fill_w = int(fill_frac * bar_w)
+
+        if fill_w > 0:
+            if db >= -30:
+                color = t.signal_hot
+            elif db >= self._noise_gate_db:
+                color = t.signal_warm
+            else:
+                color = t.signal_cold
+            pygame.draw.rect(surface, color, (bar_x, bar_y, fill_w, bar_h))
+
+        # Bar border
+        pygame.draw.rect(surface, t.hud_text, (bar_x, bar_y, bar_w, bar_h), 1)
+
+        # Noise gate tick mark
+        gate_frac = max(0.0, min(1.0, (self._noise_gate_db - db_min) / (db_max - db_min)))
+        gate_x = bar_x + int(gate_frac * bar_w)
+        pygame.draw.line(surface, t.hud_accent, (gate_x, bar_y - 2), (gate_x, bar_y + bar_h + 2), 1)
+
+    def _draw_tuner(self, surface: pygame.Surface, font: pygame.font.Font,
+                    screen_w: int, y: int) -> None:
+        """Draw a compact tuner display with cents bar and note name."""
+        t = get_theme()
+
+        bar_w = 100
+        bar_h = 8
+
+        freq = self._tuner_freq_smooth
+
+        if freq <= 0 or self._tuner_displayed_note < 0:
+            # No pitch — show placeholder
+            label = "Tuner: ---"
+            label_surf = font.render(label, True, t.hud_text)
+            surface.blit(label_surf, (screen_w - label_surf.get_width() - 12, y))
+            return
+
+        # Use hysteresis-stabilized note for the label, smoothed freq for cents
+        midi_note, cents = freq_to_cents_deviation(freq)
+        if midi_note < 0:
+            return
+
+        note_name = midi_to_name(self._tuner_displayed_note)
+        # Recompute cents relative to the displayed note for consistency
+        from pickhero.audio.note_utils import midi_to_freq as _mtf
+        target_freq = _mtf(self._tuner_displayed_note)
+        if target_freq > 0:
+            import math
+            cents = 1200 * math.log2(freq / target_freq)
+
+        # Choose color based on cents deviation
+        abs_cents = abs(cents)
+        if abs_cents < 5:
+            fill_color = t.tuner_in_tune
+        elif abs_cents < 15:
+            fill_color = t.tuner_close
+        else:
+            fill_color = t.tuner_off
+
+        # Note name + cents label
+        sign = "+" if cents >= 0 else ""
+        label = f"{note_name} {sign}{int(cents)}\u00A2"
+        label_surf = font.render(label, True, fill_color)
+        label_x = screen_w - label_surf.get_width() - 12
+        surface.blit(label_surf, (label_x, y))
+
+        # Bar position: to the left of the label
+        bar_x = label_x - bar_w - 8
+        bar_y = y + label_surf.get_height() // 2 - bar_h // 2
+
+        # Bar background
+        pygame.draw.rect(surface, t.signal_cold, (bar_x, bar_y, bar_w, bar_h))
+
+        # Fill indicator: center = in-tune, left = flat, right = sharp
+        center_x = bar_x + bar_w // 2
+        fill_offset = int((cents / 50.0) * (bar_w // 2))
+        fill_offset = max(-bar_w // 2, min(bar_w // 2, fill_offset))
+
+        if fill_offset >= 0:
+            pygame.draw.rect(surface, fill_color,
+                             (center_x, bar_y, fill_offset, bar_h))
+        else:
+            pygame.draw.rect(surface, fill_color,
+                             (center_x + fill_offset, bar_y, -fill_offset, bar_h))
+
+        # Bar border
+        pygame.draw.rect(surface, t.hud_text, (bar_x, bar_y, bar_w, bar_h), 1)
+
+        # Center tick mark (in-tune reference)
+        pygame.draw.line(surface, t.hud_text,
+                         (center_x, bar_y - 2), (center_x, bar_y + bar_h + 2), 1)
 
     def _draw_completion_overlay(self, surface: pygame.Surface, layout: _Layout) -> None:
         """Draw the song completion results overlay."""
@@ -675,6 +859,129 @@ class PlayingScreen:
             hint_text = "SPACE to replay  |  ESC to menu"
             hint_surf = hint_font.render(hint_text, True, t.hud_text)
             surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, center_y + 70))
+
+    def _draw_help_overlay(self, surface: pygame.Surface, layout: _Layout) -> None:
+        """Draw a help overlay explaining the track, note colors, and controls."""
+        t = get_theme()
+        w, h = layout.screen_w, layout.screen_h
+
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        surface.blit(overlay, (0, 0))
+
+        title_font = _get_font("arial", 28)
+        section_font = _get_font("arial", 20)
+        body_font = _get_font("arial", 17)
+        hint_font = _get_font("arial", 14)
+
+        cx = w // 2
+        y = 30
+
+        title_surf = title_font.render("Help", True, t.hud_accent)
+        surface.blit(title_surf, (cx - title_surf.get_width() // 2, y))
+        y += 40
+
+        # -- How to read the track --
+        lx = cx - 260  # left edge for content
+        section = section_font.render("Reading the Track", True, t.hud_accent)
+        surface.blit(section, (lx, y))
+        y += 26
+
+        track_lines = [
+            "Notes scroll right-to-left toward the hit zone (white vertical line).",
+            "The number on each note is the fret to press (0 = open string).",
+            "Play the right fret on the right string as the note crosses the line.",
+        ]
+        for line in track_lines:
+            surf = body_font.render(line, True, t.hud_text)
+            surface.blit(surf, (lx, y))
+            y += 21
+        y += 6
+
+        # -- The 6 rows --
+        section = section_font.render("The 6 Rows = 6 Guitar Strings", True, t.hud_accent)
+        surface.blit(section, (lx, y))
+        y += 26
+
+        row_lines = [
+            "Each horizontal row is one guitar string, top to bottom:",
+        ]
+        for line in row_lines:
+            surf = body_font.render(line, True, t.hud_text)
+            surface.blit(surf, (lx, y))
+            y += 21
+
+        string_info = [
+            (1, "Row 1 (top)     = high E  (thinnest)"),
+            (2, "Row 2              = B"),
+            (3, "Row 3              = G"),
+            (4, "Row 4              = D"),
+            (5, "Row 5              = A"),
+            (6, "Row 6 (bottom) = low E  (thickest)"),
+        ]
+        for s, label in string_info:
+            color = STRING_COLORS.get(s, (180, 180, 180))
+            pygame.draw.rect(surface, color, (lx, y + 3, 14, 14),
+                             border_radius=2)
+            surf = body_font.render(label, True, t.hud_text)
+            surface.blit(surf, (lx + 20, y))
+            y += 20
+        y += 4
+
+        surf = body_font.render(
+            "A note's color tells you which string to play — it matches the row.",
+            True, t.hud_text)
+        surface.blit(surf, (lx, y))
+        y += 20
+        surf = body_font.render(
+            "Dimmed notes have already passed the hit zone.",
+            True, t.hud_text)
+        surface.blit(surf, (lx, y))
+        y += 24
+
+        # -- Feedback colors --
+        section = section_font.render("Scoring (colors change after you play)", True, t.hud_accent)
+        surface.blit(section, (lx, y))
+        y += 26
+
+        surf = body_font.render(
+            "When audio is on, notes change color after they pass the hit zone:",
+            True, t.hud_text)
+        surface.blit(surf, (lx, y))
+        y += 22
+
+        feedback = [
+            (t.feedback_hit, "Turns green", "you played the correct note"),
+            (t.feedback_close, "Turns yellow", "close, off by 1 semitone"),
+            (t.feedback_miss, "Turns red", "you missed it (not played in time)"),
+        ]
+        for color, label, desc in feedback:
+            pygame.draw.rect(surface, color, (lx + 10, y + 3, 14, 14),
+                             border_radius=2)
+            surf = body_font.render(f"{label} — {desc}", True, t.hud_text)
+            surface.blit(surf, (lx + 30, y))
+            y += 21
+        y += 10
+
+        # -- Controls --
+        section = section_font.render("Controls", True, t.hud_accent)
+        surface.blit(section, (lx, y))
+        y += 24
+
+        controls = [
+            "SPACE: play/pause    LEFT/RIGHT: seek    HOME: restart",
+            "A: toggle audio    PgDn/PgUp: tempo    X/C: noise gate",
+            "B: backing track    T: theme    I/O: loop markers    P: toggle loop",
+            "F: fret limit    F1-F6: toggle strings    V: chord mode    L: loop weakest",
+        ]
+        for line in controls:
+            surf = hint_font.render(line, True, t.hud_text)
+            surface.blit(surf, (lx, y))
+            y += 18
+
+        y += 10
+        close_surf = hint_font.render("Press H to close", True, t.hud_accent)
+        surface.blit(close_surf, (cx - close_surf.get_width() // 2, y))
 
     # -- Difficulty filter --
 
@@ -867,8 +1174,12 @@ class PlayingScreen:
     def _toggle_audio(self) -> None:
         """Toggle audio capture on/off."""
         self._audio_enabled = not self._audio_enabled
-        if self._audio_enabled and self._playing:
-            self._start_audio()
+        if self._audio_enabled:
+            if self._playing:
+                self._start_audio()
+            else:
+                # Start capture for signal monitoring even while paused
+                self._start_capture_only()
         else:
             self._stop_audio()
 
@@ -890,6 +1201,17 @@ class PlayingScreen:
             self._feedback.reset()
         except Exception as e:
             print(f"Audio start failed: {e}")
+            self._audio_enabled = False
+
+    def _start_capture_only(self) -> None:
+        """Start audio capture for signal monitoring (no matcher)."""
+        try:
+            from pickhero.audio.input import AudioCapture
+            if self._audio_capture is None:
+                self._audio_capture = AudioCapture(self._config)
+            self._audio_capture.start()
+        except Exception as e:
+            print(f"Audio capture start failed: {e}")
             self._audio_enabled = False
 
     def _stop_audio(self) -> None:

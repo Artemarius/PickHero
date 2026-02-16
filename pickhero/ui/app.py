@@ -14,6 +14,7 @@ from pickhero.config import Config
 from pickhero.progress import ProgressTracker
 from pickhero.tabs.loader import extract_backing_track, load_gp_file
 from pickhero.ui.colors import set_theme
+from pickhero.ui.calibration_menu import CalibrationMenuScreen
 from pickhero.ui.device_menu import DeviceMenuScreen
 from pickhero.ui.download_menu import DownloadMenuScreen
 from pickhero.ui.menu import MenuScreen
@@ -32,6 +33,7 @@ class App:
         self._playing_screen: PlayingScreen | None = None
         self._device_menu: DeviceMenuScreen | None = None
         self._download_menu: DownloadMenuScreen | None = None
+        self._calibration_menu: CalibrationMenuScreen | None = None
 
     def run(self) -> None:
         """Initialize PyGame, run main loop, clean up."""
@@ -90,6 +92,8 @@ class App:
                 self._handle_device_event(event)
             elif self._state == "download":
                 self._handle_download_event(event)
+            elif self._state == "calibration":
+                self._handle_calibration_event(event)
 
     def _handle_menu_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.KEYDOWN and not self._menu.is_searching:
@@ -101,6 +105,10 @@ class App:
                 songs_dir = Path(self._config.songs_dir)
                 self._download_menu = DownloadMenuScreen(songs_dir)
                 self._state = "download"
+                return
+            if event.key == pygame.K_g:
+                self._calibration_menu = CalibrationMenuScreen(self._config)
+                self._state = "calibration"
                 return
 
         result = self._menu.handle_event(event)
@@ -131,6 +139,22 @@ class App:
             if result == "downloaded":
                 self._menu.scan_files()
             self._download_menu = None
+            self._state = "menu"
+
+    def _handle_calibration_event(self, event: pygame.event.Event) -> None:
+        result = self._calibration_menu.handle_event(event)
+        if result == "back":
+            self._calibration_menu = None
+            self._state = "menu"
+        elif result == "complete":
+            # Save calibration results to config
+            from datetime import datetime
+            results = self._calibration_menu.get_results()
+            self._config.calibration = {"strings": {}, "calibrated_at": datetime.now().isoformat()}
+            for string_num, cal in results.items():
+                self._config.set_string_calibration(string_num, cal)
+            self._config.save()
+            self._calibration_menu = None
             self._state = "menu"
 
     def _load_song(self, path: Path) -> None:
@@ -175,6 +199,8 @@ class App:
     def _update(self) -> None:
         if self._state == "playing" and self._playing_screen is not None:
             self._playing_screen.update()
+        elif self._state == "calibration" and self._calibration_menu is not None:
+            self._calibration_menu.update()
 
     def _render(self, surface: pygame.Surface) -> None:
         if self._state == "menu" and self._menu is not None:
@@ -185,3 +211,5 @@ class App:
             self._device_menu.render(surface)
         elif self._state == "download" and self._download_menu is not None:
             self._download_menu.render(surface)
+        elif self._state == "calibration" and self._calibration_menu is not None:
+            self._calibration_menu.render(surface)

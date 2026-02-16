@@ -350,7 +350,7 @@ class MenuScreen:
             hint = "Type to filter  |  BACKSPACE: edit  |  ESC: exit filter  |  ENTER: select  |  UP/DOWN: navigate"
         else:
             sort_label = SORT_LABELS.get(self._sort_mode, "Name A-Z")
-            hint = f"F: filter  |  N: sort ({sort_label})  |  UP/DOWN: navigate  |  ENTER: select  |  S: search online  |  D: audio device  |  T: theme  |  ESC: quit"
+            hint = f"F: filter  |  N: sort ({sort_label})  |  UP/DOWN: navigate  |  ENTER: select  |  S: search online  |  D: audio device  |  G: calibrate  |  T: theme  |  ESC: quit"
         hint_surf = hint_font.render(hint, True, t.hud_text)
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, h - 36))
 
