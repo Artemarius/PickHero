@@ -96,6 +96,7 @@ PickHero/
 │   │   ├── app.py           # main game loop / window
 │   │   ├── scrolling.py     # scrolling note highway renderer
 │   │   ├── colors.py        # color constants, string palette
+│   │   ├── calibration_menu.py # guitar calibration wizard
 │   │   ├── device_menu.py   # audio input device selector
 │   │   ├── feedback.py      # hit/miss visual effects
 │   │   └── menu.py          # song selection, settings
@@ -134,13 +135,15 @@ PickHero/
 Run `python -m pickhero --console` to see detected notes printed live in the terminal. This helps isolate whether the issue is hardware (no signal) or software (signal present but not matching).
 
 **Audio detection not working in-game:**
-- Press **A** during playback to enable audio detection (it's off by default). The bottom status bar should show `A: audio ON`.
+- Audio detection is enabled by default. If you turned it off, press **A** during playback to re-enable it. The bottom status bar should show `A: audio ON`.
 - Press **D** on the menu screen to select the correct audio input device.
+- Press **G** on the menu screen to run guitar calibration — this improves detection accuracy by learning your guitar's actual frequencies.
 
 **High latency or missed notes:**
-- Lower the noise gate with **Z** during playback (default is -60 dB)
+- Lower the noise gate with **X** during playback (default is -60 dB)
 - Cheap USB cables can add 10-20ms of latency — this is usually fine but noticeable on fast passages
 - Slow the song down with **PgDn** while practicing
+- Press **H** during playback to see a full help overlay with controls and color legend
 
 ## References
 

@@ -98,6 +98,7 @@ pickhero/
 └── ui/
     ├── __init__.py
     ├── app.py
+    ├── calibration_menu.py  # Guitar calibration wizard
     ├── colors.py          # Theme system (dark/light)
     ├── scrolling.py
     ├── feedback.py
