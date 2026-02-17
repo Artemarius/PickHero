@@ -117,6 +117,17 @@ class NoteMatcher:
             self.misses += 1
             self._measure_stats[event.measure]["misses"] += 1
 
+    def has_pending_notes_at(self, playback_ms: float) -> bool:
+        """Return True if there are unmatched notes at or before playback_ms."""
+        window_start = playback_ms - self._timing_window_ms
+        candidates = self._timeline.get_notes_in_range(window_start, playback_ms + 1)
+        for note in candidates:
+            if self._is_filtered(note):
+                continue
+            if self._get_state(note) == MatchType.PENDING:
+                return True
+        return False
+
     def _mark_missed_notes(self, playback_ms: float) -> list[MatchResult]:
         """Mark PENDING notes that have passed the timing window as MISS."""
         results = []

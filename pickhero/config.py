@@ -56,6 +56,7 @@ class Config:
     max_fret: int = 24
     active_strings: list[bool] = field(default_factory=lambda: [True] * 6)
     chord_partial_credit: bool = True
+    wait_mode: bool = False
     sort_mode: str = "name_asc"
     calibration: dict = field(default_factory=dict)
 

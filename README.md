@@ -127,6 +127,7 @@ PickHero/
 3. ~~**Scrolling Display MVP** — PyGame window with 6 string lanes, tempo-synced scrolling~~ **Done**
 4. ~~**Live Matching & Feedback** — pitch comparison, hit/miss visuals, accuracy scoring~~ **Done**
 5. ~~**Polish** — tempo control, section looping, device selector, backing tracks, count-in, progress tracking, song browser, difficulty filter, themes, practice recommendations, `.exe` packaging~~ **Done**
+6. ~~**Wait Mode** — beginner-friendly practice mode that pauses playback when you haven't played the correct note, resumes instantly when you do. Toggle with **W** during playback.~~ **Done**
 
 ## Troubleshooting
 
@@ -144,6 +145,9 @@ Run `python -m pickhero --console` to see detected notes printed live in the ter
 - Audio detection is enabled by default. If you turned it off, press **A** during playback to re-enable it. The bottom status bar should show `A: audio ON`.
 - Press **D** on the menu screen to select the correct audio input device.
 - Press **G** on the menu screen to run guitar calibration — this improves detection accuracy by learning your guitar's actual frequencies.
+
+**Beginner tip — Wait Mode:**
+- Press **W** during playback to enable wait mode. The tab will pause whenever you haven't played the correct note yet and resume the moment you do. Great for learning new songs at your own pace without accumulating misses.
 
 **High latency or missed notes:**
 - Lower the noise gate with **X** during playback (default is -60 dB)

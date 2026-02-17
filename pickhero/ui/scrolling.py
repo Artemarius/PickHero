@@ -146,6 +146,10 @@ class PlayingScreen:
         # Help overlay
         self._show_help: bool = False
 
+        # Wait mode
+        self._wait_mode: bool = self._config.wait_mode
+        self._wait_mode_frozen: bool = False
+
     def _note_passes_filter(self, note: NoteEvent) -> bool:
         """Check if a note passes the difficulty filter."""
         if note.fret > self._max_fret:
@@ -280,6 +284,20 @@ class PlayingScreen:
             self._playback_ms += elapsed_ms
         self._last_tick = now
 
+        # Wait mode: freeze if there are pending notes the player hasn't hit yet
+        if (self._wait_mode and self._audio_enabled
+                and self._playback_ms >= 0 and self._matcher is not None):
+            if self._matcher.has_pending_notes_at(self._playback_ms):
+                self._playback_ms = prev_ms
+                self._last_tick = now
+                self._wait_mode_frozen = True
+                if self._midi_player is not None and not self._backing_muted:
+                    self._midi_player.pause()
+            elif self._wait_mode_frozen:
+                self._wait_mode_frozen = False
+                if self._midi_player is not None and not self._backing_muted:
+                    self._midi_player.seek(self._playback_ms)
+
         # Count-in: play metronome clicks and start audio/midi when crossing 0
         if prev_ms < 0:
             # Play count-in clicks at beat boundaries
@@ -304,6 +322,13 @@ class PlayingScreen:
             detected = self._audio_capture.get_notes()
             for d in detected:
                 d.timestamp_ms *= self._tempo_factor
+            # While frozen in wait mode, pin detected timestamps to the frozen
+            # playback position so matching hits the notes at the hit zone,
+            # not future notes that drift ahead as real time passes.
+            if self._wait_mode_frozen and detected:
+                pinned_ts = self._playback_ms - self._matcher.audio_offset_ms
+                for d in detected:
+                    d.timestamp_ms = pinned_ts
             results = self._matcher.process_detected_notes(detected, self._playback_ms)
             self._feedback.add_results(results, self._playback_ms)
             self._feedback.cleanup(self._playback_ms)
@@ -417,6 +442,8 @@ class PlayingScreen:
             self._loop_weakest_section()
         elif event.key == pygame.K_h:
             self._show_help = not self._show_help
+        elif event.key == pygame.K_w:
+            self._toggle_wait_mode()
 
         return None
 
@@ -634,7 +661,9 @@ class PlayingScreen:
         if self._playback_ms < 0:
             state = "Count-in"
         elif self._playing:
-            if self._audio_enabled:
+            if self._wait_mode_frozen:
+                state = "Waiting..."
+            elif self._audio_enabled:
                 state = "Playing"
             else:
                 state = "Auto-scroll"
@@ -645,11 +674,17 @@ class PlayingScreen:
         backing_state = ""
         if self._midi_player is not None:
             backing_state = f"|  B: backing {'off' if self._backing_muted else 'ON'}  "
+        wait_state = ""
+        if self._wait_mode:
+            wait_state = f"|  W: wait {'WAIT' if self._wait_mode_frozen else 'ON'}  "
+        elif self._audio_enabled:
+            wait_state = "|  W: wait off  "
         hint = (
             f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
             f"|  HOME: restart  |  PgDn/PgUp: tempo  |  X/C: gate"
             f"|  A: audio {audio_state}  "
             f"{backing_state}"
+            f"{wait_state}"
             f"|  I/O: loop {loop_state}  |  P: toggle  |  ESC: menu"
         )
         hint_surf = hint_font.render(hint, True, t.hud_text)
@@ -973,6 +1008,7 @@ class PlayingScreen:
             "A: toggle audio    PgDn/PgUp: tempo    X/C: noise gate",
             "B: backing track    T: theme    I/O: loop markers    P: toggle loop",
             "F: fret limit    F1-F6: toggle strings    V: chord mode    L: loop weakest",
+            "W: wait mode (pause until correct note played)",
         ]
         for line in controls:
             surf = hint_font.render(line, True, t.hud_text)
@@ -1045,6 +1081,16 @@ class PlayingScreen:
         self._config.save()
         if self._matcher:
             self._matcher.chord_partial_credit = self._chord_partial_credit
+
+    # -- Wait mode --
+
+    def _toggle_wait_mode(self) -> None:
+        """Toggle wait mode on/off."""
+        self._wait_mode = not self._wait_mode
+        self._config.wait_mode = self._wait_mode
+        self._config.save()
+        if not self._wait_mode:
+            self._wait_mode_frozen = False
 
     # -- Loop weakest section --
 
