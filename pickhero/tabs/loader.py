@@ -239,8 +239,13 @@ def _load_gp7_file(path: str | Path, track_index: int | None = None) -> Timeline
             nid = n.get("id", "")
             fret = None
             string_val = None
+            is_dead_or_muted = False
             for prop in n.findall(".//Property"):
                 pname = prop.get("name", "")
+                if pname in ("Dead", "Muted"):
+                    if prop.get("enable") == "true":
+                        is_dead_or_muted = True
+                        break
                 if pname == "Fret":
                     try:
                         fret = int(prop.findtext("Fret", "0"))
@@ -255,6 +260,8 @@ def _load_gp7_file(path: str | Path, track_index: int | None = None) -> Timeline
                         string_val = int(f)
                     except ValueError:
                         pass
+            if is_dead_or_muted:
+                continue
             if fret is not None and string_val is not None:
                 notes_map[nid] = (fret, string_val)
 
@@ -488,8 +495,13 @@ def _extract_gp7_backing_track(
             nid = n.get("id", "")
             fret = None
             string_val = None
+            is_dead_or_muted = False
             for prop in n.findall(".//Property"):
                 pname = prop.get("name", "")
+                if pname in ("Dead", "Muted"):
+                    if prop.get("enable") == "true":
+                        is_dead_or_muted = True
+                        break
                 if pname == "Fret":
                     try:
                         fret = int(prop.findtext("Fret", "0"))
@@ -502,6 +514,8 @@ def _extract_gp7_backing_track(
                         string_val = int(round(f))
                     except ValueError:
                         pass
+            if is_dead_or_muted:
+                continue
             if fret is not None and string_val is not None:
                 notes_map[nid] = (fret, string_val)
 

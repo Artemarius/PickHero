@@ -15,6 +15,14 @@ from typing import Callable
 from pickhero.audio.note_utils import semitone_distance
 from pickhero.audio.input import TimestampedNote
 from pickhero.tabs.timeline import NoteEvent, Timeline
+from pickhero.timing import (
+    PitchVerdict,
+    TimingObservation,
+    TimingVerdict,
+    classify_pitch_distance,
+    classify_timing_error,
+    compute_stats,
+)
 
 
 class MatchType(Enum):
@@ -47,6 +55,8 @@ class NoteMatcher:
         chord_threshold_ms: float = 50.0,
         note_filter: Callable[[NoteEvent], bool] | None = None,
         chord_partial_credit: bool = True,
+        timing_judge_enabled: bool = False,
+        pitch_strict: bool = False,
     ):
         self._timeline = timeline
         self._timing_window_ms = timing_window_ms
@@ -54,6 +64,8 @@ class NoteMatcher:
         self._chord_threshold_ms = chord_threshold_ms
         self.note_filter = note_filter
         self.chord_partial_credit = chord_partial_credit
+        self._timing_judge_enabled = timing_judge_enabled
+        self._pitch_strict = pitch_strict
 
         # State per note event, keyed by (timestamp_ms, string)
         self._note_states: dict[tuple[float, int], MatchType] = {}
@@ -68,6 +80,9 @@ class NoteMatcher:
             lambda: {"hits": 0, "close": 0, "misses": 0}
         )
 
+        # Timing Judge observations
+        self._timing_observations: list[TimingObservation] = []
+
     @property
     def audio_offset_ms(self) -> float:
         return self._audio_offset_ms
@@ -75,6 +90,31 @@ class NoteMatcher:
     @audio_offset_ms.setter
     def audio_offset_ms(self, value: float) -> None:
         self._audio_offset_ms = value
+
+    @property
+    def timing_judge_enabled(self) -> bool:
+        return self._timing_judge_enabled
+
+    @timing_judge_enabled.setter
+    def timing_judge_enabled(self, value: bool) -> None:
+        self._timing_judge_enabled = value
+
+    @property
+    def pitch_strict(self) -> bool:
+        return self._pitch_strict
+
+    @pitch_strict.setter
+    def pitch_strict(self, value: bool) -> None:
+        self._pitch_strict = value
+
+    def get_timing_observations(self) -> list[TimingObservation]:
+        """Return all timing observations recorded so far."""
+        return list(self._timing_observations)
+
+    def get_timing_stats(self) -> "TimingStats":
+        """Compute and return timing statistics from observations."""
+        from pickhero.timing import TimingStats
+        return compute_stats(self._timing_observations)
 
     def _note_key(self, event: NoteEvent) -> tuple[float, int]:
         return (event.timestamp_ms, event.string)
@@ -147,6 +187,19 @@ class NoteMatcher:
                     matched_events=[note],
                     semitone_distance=None,
                 ))
+                # Record timing observation for missed note
+                if self._timing_judge_enabled:
+                    self._timing_observations.append(TimingObservation(
+                        detected_ms=float("nan"),
+                        expected_ms=note.timestamp_ms,
+                        timing_error_ms=float("nan"),
+                        verdict=TimingVerdict.MISSED,
+                        midi_note=0,
+                        expected_midi=note.midi_note,
+                        measure=note.measure,
+                        confidence=0.0,
+                        pitch_verdict=PitchVerdict.UNKNOWN,
+                    ))
         return results
 
     def process_detected_notes(
@@ -185,16 +238,44 @@ class NoteMatcher:
                 if self._get_state(n) == MatchType.PENDING and not self._is_filtered(n)
             ]
             if not pending:
+                # Timing Judge: record extra (stray) onset with no matching note
+                if self._timing_judge_enabled:
+                    # Find nearest note for reference (even if already matched)
+                    nearest = None
+                    nearest_dist = None
+                    for n in candidates:
+                        d = abs(n.timestamp_ms - adjusted_ms)
+                        if nearest_dist is None or d < nearest_dist:
+                            nearest = n
+                            nearest_dist = d
+                    expected_ms = nearest.timestamp_ms if nearest else adjusted_ms
+                    measure = nearest.measure if nearest else -1
+                    expected_midi = nearest.midi_note if nearest else 0
+                    self._timing_observations.append(TimingObservation(
+                        detected_ms=adjusted_ms,
+                        expected_ms=expected_ms,
+                        timing_error_ms=adjusted_ms - expected_ms,
+                        verdict=TimingVerdict.EXTRA,
+                        midi_note=detected_midi,
+                        expected_midi=expected_midi,
+                        measure=measure,
+                        confidence=ts_note.note.confidence,
+                        pitch_verdict=PitchVerdict.UNKNOWN,
+                    ))
                 continue
 
-            # Find closest match by semitone distance (with octave equivalence)
+            # Find closest match by semitone distance
             best = None
             best_dist = None
             for note in pending:
                 dist = semitone_distance(detected_midi, note.midi_note)
-                # Octave equivalence: if off by ~12 semitones, treat as 0
-                octave_dist = dist % 12 if dist >= 12 else dist
-                effective = min(dist, octave_dist)
+                if self._pitch_strict:
+                    # Strict mode: no octave equivalence
+                    effective = dist
+                else:
+                    # Arcade mode: octave equivalence
+                    octave_dist = dist % 12 if dist >= 12 else dist
+                    effective = min(dist, octave_dist)
                 if best_dist is None or effective < best_dist:
                     best = note
                     best_dist = effective
@@ -205,11 +286,41 @@ class NoteMatcher:
             # Classify match
             if best_dist == 0:
                 match_type = MatchType.HIT
-            elif best_dist == 1:
+            elif best_dist == 1 and not self._pitch_strict:
                 match_type = MatchType.CLOSE
             else:
-                # Too far off — ignore this detection, no penalty
+                # Too far off, or strict mode with !=0 — ignore but record timing
+                if self._timing_judge_enabled:
+                    pitch_v = classify_pitch_distance(best_dist)
+                    self._timing_observations.append(TimingObservation(
+                        detected_ms=adjusted_ms,
+                        expected_ms=best.timestamp_ms,
+                        timing_error_ms=adjusted_ms - best.timestamp_ms,
+                        verdict=TimingVerdict.EXTRA,
+                        midi_note=detected_midi,
+                        expected_midi=best.midi_note,
+                        measure=best.measure,
+                        confidence=ts_note.note.confidence,
+                        pitch_verdict=pitch_v,
+                    ))
                 continue
+
+            # Record timing observation for the matched note
+            if self._timing_judge_enabled:
+                timing_error_ms = adjusted_ms - best.timestamp_ms
+                verdict = classify_timing_error(timing_error_ms)
+                pitch_v = classify_pitch_distance(best_dist)
+                self._timing_observations.append(TimingObservation(
+                    detected_ms=adjusted_ms,
+                    expected_ms=best.timestamp_ms,
+                    timing_error_ms=timing_error_ms,
+                    verdict=verdict,
+                    midi_note=detected_midi,
+                    expected_midi=best.midi_note,
+                    measure=best.measure,
+                    confidence=ts_note.note.confidence,
+                    pitch_verdict=pitch_v,
+                ))
 
             # Chord handling
             siblings = self._find_chord_siblings(best)
@@ -255,6 +366,65 @@ class NoteMatcher:
                 matched_events=matched_events,
                 semitone_distance=best_dist,
             ))
+
+        return results
+
+    def verify_chord_at(
+        self,
+        playback_ms: float,
+        chord_detector=None,
+    ) -> list[MatchResult]:
+        """Verify chords at the hit zone using FFT spectral analysis.
+
+        Called when there are multiple pending notes at the same timestamp.
+        Uses the ChordDetector to check if expected frequencies are present.
+        """
+        if chord_detector is None:
+            return []
+
+        results: list[MatchResult] = []
+
+        # Find pending notes at the current playback position
+        candidates = self._timeline.get_active_notes_at_time(
+            playback_ms, self._timing_window_ms
+        )
+        pending = [
+            n for n in candidates
+            if self._get_state(n) == MatchType.PENDING and not self._is_filtered(n)
+        ]
+        if len(pending) < 2:
+            return []  # Not a chord — single notes use YIN
+
+        # Group by timestamp (chord = same timestamp)
+        chord_groups: dict[float, list[NoteEvent]] = {}
+        for note in pending:
+            ts = round(note.timestamp_ms, 0)
+            chord_groups.setdefault(ts, []).append(note)
+
+        for ts, group in chord_groups.items():
+            if len(group) < 2:
+                continue  # Single note, not a chord
+
+            # Verify via FFT
+            expected_midi = [n.midi_note for n in group]
+            present = chord_detector.verify_chord(expected_midi)
+
+            matched_events = []
+            all_present = True
+            for note, is_present in zip(group, present):
+                if is_present:
+                    if self._get_state(note) == MatchType.PENDING:
+                        self._record_match(note, MatchType.HIT)
+                        matched_events.append(note)
+                else:
+                    all_present = False
+
+            if matched_events:
+                results.append(MatchResult(
+                    match_type=MatchType.HIT if all_present else MatchType.CLOSE,
+                    matched_events=matched_events,
+                    semitone_distance=0,
+                ))
 
         return results
 
@@ -341,3 +511,4 @@ class NoteMatcher:
         self.close = 0
         self.misses = 0
         self._measure_stats.clear()
+        self._timing_observations.clear()

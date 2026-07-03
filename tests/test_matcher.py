@@ -6,6 +6,7 @@ from pickhero.audio.detector import DetectedNote
 from pickhero.audio.input import TimestampedNote
 from pickhero.matcher import MatchType, MatchResult, NoteMatcher
 from pickhero.tabs.timeline import NoteEvent, SongMetadata, Timeline
+from pickhero.timing import PitchVerdict, TimingVerdict
 
 
 def _note_event(timestamp_ms: float, midi_note: int = 64, string: int = 1,
@@ -276,3 +277,109 @@ class TestAudioOffset:
 
         hits = [r for r in results if r.match_type == MatchType.HIT]
         assert len(hits) == 1
+
+class TestTimingObservations:
+    """Test the Timing Judge observation recording."""
+
+    def _make_timing_matcher(self, notes, **kwargs):
+        timeline = Timeline(notes, SongMetadata(title="Test", tempo=120))
+        return NoteMatcher(
+            timeline,
+            timing_window_ms=kwargs.get("timing_window_ms", 100.0),
+            audio_offset_ms=kwargs.get("audio_offset_ms", 0.0),
+            chord_threshold_ms=kwargs.get("chord_threshold_ms", 50.0),
+            timing_judge_enabled=True,
+            pitch_strict=kwargs.get("pitch_strict", False),
+        )
+
+    def test_on_time_observation(self):
+        """Detection within ±25ms produces ON_TIME."""
+        tab = _note_event(1000.0, midi_note=64)
+        matcher = self._make_timing_matcher([tab])
+        matcher.process_detected_notes([_detected(64, 1010.0)], 1050.0)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].verdict == TimingVerdict.ON_TIME
+        assert obs[0].timing_error_ms == pytest.approx(10.0)
+        assert obs[0].pitch_verdict == PitchVerdict.CORRECT
+
+    def test_early_observation(self):
+        """Detection >25ms early produces EARLY."""
+        tab = _note_event(1000.0, midi_note=64)
+        matcher = self._make_timing_matcher([tab])
+        matcher.process_detected_notes([_detected(64, 960.0)], 1050.0)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].verdict == TimingVerdict.EARLY
+        assert obs[0].timing_error_ms == pytest.approx(-40.0)
+
+    def test_late_observation(self):
+        """Detection >25ms late produces LATE."""
+        tab = _note_event(1000.0, midi_note=64)
+        matcher = self._make_timing_matcher([tab])
+        matcher.process_detected_notes([_detected(64, 1040.0)], 1050.0)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].verdict == TimingVerdict.LATE
+        assert obs[0].timing_error_ms == pytest.approx(40.0)
+
+    def test_missed_note_observation(self):
+        """A note that passes the window unmatched produces a MISSED observation."""
+        tab = _note_event(1000.0, midi_note=64)
+        matcher = self._make_timing_matcher([tab])
+        # Advance past the window (1000 + 100 = 1100 cutoff)
+        matcher.process_detected_notes([], 1200.0)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].verdict == TimingVerdict.MISSED
+        assert obs[0].expected_ms == 1000.0
+
+    def test_extra_onset_observation(self):
+        """An onset with no pending note produces EXTRA."""
+        tab = _note_event(1000.0, midi_note=64)
+        matcher = self._make_timing_matcher([tab])
+        # First, match the tab note
+        matcher.process_detected_notes([_detected(64, 1000.0)], 1050.0)
+        # Now detect another onset — no pending notes left
+        matcher.process_detected_notes([_detected(64, 1050.0)], 1050.0)
+        obs = matcher.get_timing_observations()
+        # First obs is the match, second is extra
+        assert len(obs) == 2
+        assert obs[1].verdict == TimingVerdict.EXTRA
+
+    def test_pitch_strict_reclassifies_close_as_miss(self):
+        """In pitch_strict mode, ±1 semitone is not CLOSE — it's ignored."""
+        tab = _note_event(1000.0, midi_note=64)
+        matcher = self._make_timing_matcher([tab], pitch_strict=True)
+        matcher.process_detected_notes([_detected(65, 1000.0)], 1050.0)
+        # Should not match (strict), but should record EXTRA with NEAR pitch
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].pitch_verdict == PitchVerdict.NEAR
+        # The note should remain PENDING (not matched in strict mode)
+        assert matcher.get_note_state(tab) == MatchType.PENDING
+
+    def test_no_observations_when_timing_judge_disabled(self):
+        """Arcade mode (timing_judge_enabled=False) produces no observations."""
+        tab = _note_event(1000.0, midi_note=64)
+        matcher = _make_matcher([tab])
+        matcher.process_detected_notes([_detected(64, 1000.0)], 1050.0)
+        assert matcher.get_timing_observations() == []
+
+    def test_reset_clears_observations(self):
+        """reset() clears timing observations."""
+        tab = _note_event(1000.0, midi_note=64)
+        matcher = self._make_timing_matcher([tab])
+        matcher.process_detected_notes([_detected(64, 1000.0)], 1050.0)
+        assert len(matcher.get_timing_observations()) == 1
+        matcher.reset()
+        assert matcher.get_timing_observations() == []
+
+    def test_get_timing_stats(self):
+        """get_timing_stats returns computed stats."""
+        tab = _note_event(1000.0, midi_note=64)
+        matcher = self._make_timing_matcher([tab])
+        matcher.process_detected_notes([_detected(64, 1000.0)], 1050.0)
+        stats = matcher.get_timing_stats()
+        assert stats.count == 1
+        assert stats.on_time_count == 1

@@ -119,3 +119,51 @@ class FeedbackRenderer:
         """Clear all effects and streak."""
         self._effects.clear()
         self._streak = 0
+
+
+class TimingOverlay:
+    """Manages short-lived early/late indicators for matched notes.
+
+    Stores timing error per note for a short duration (EFFECT_DURATION_MS)
+    so the scrolling display can draw early/late arrows on recently-played notes.
+    """
+
+    def __init__(self):
+        self._effects: dict[tuple[float, int], tuple[float, float]] = {}
+
+    def add(self, event: NoteEvent, error_ms: float, playback_ms: float) -> None:
+        """Record a timing effect for a note.
+
+        Args:
+            event: The tab note event that was matched.
+            error_ms: Timing error (negative = early, positive = late).
+            playback_ms: Current playback position when the effect was created.
+        """
+        key = (event.timestamp_ms, event.string)
+        self._effects[key] = (playback_ms, error_ms)
+
+    def get_indicator(
+        self, event: NoteEvent, playback_ms: float
+    ) -> float | None:
+        """Return the timing error for a note if still active, else None."""
+        key = (event.timestamp_ms, event.string)
+        entry = self._effects.get(key)
+        if entry is None:
+            return None
+        start_ms, error_ms = entry
+        if playback_ms - start_ms > EFFECT_DURATION_MS * 2:
+            return None
+        return error_ms
+
+    def cleanup(self, playback_ms: float) -> None:
+        """Remove expired effects."""
+        expired = [
+            key for key, (start_ms, _) in self._effects.items()
+            if playback_ms - start_ms > EFFECT_DURATION_MS * 2
+        ]
+        for key in expired:
+            del self._effects[key]
+
+    def reset(self) -> None:
+        """Clear all effects."""
+        self._effects.clear()

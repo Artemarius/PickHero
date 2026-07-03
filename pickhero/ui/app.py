@@ -12,7 +12,7 @@ import pygame
 from pickhero.audio.input import validate_device_index
 from pickhero.config import Config
 from pickhero.progress import ProgressTracker
-from pickhero.tabs.loader import extract_backing_track, load_gp_file
+from pickhero.tabs.loader import extract_backing_track, list_tracks, load_gp_file
 from pickhero.ui.colors import set_theme
 from pickhero.ui.calibration_menu import CalibrationMenuScreen
 from pickhero.ui.device_menu import DeviceMenuScreen
@@ -27,13 +27,16 @@ class App:
     def __init__(self, config: Config | None = None):
         self._config = config or Config.load()
         self._progress = ProgressTracker()
-        self._running = False
         self._state = "menu"
         self._menu: MenuScreen | None = None
         self._playing_screen: PlayingScreen | None = None
         self._device_menu: DeviceMenuScreen | None = None
         self._download_menu: DownloadMenuScreen | None = None
         self._calibration_menu: CalibrationMenuScreen | None = None
+        # Track switching state
+        self._song_path: Path | None = None
+        self._track_index: int = 0
+        self._track_count: int = 0
 
     def run(self) -> None:
         """Initialize PyGame, run main loop, clean up."""
@@ -54,8 +57,9 @@ class App:
         pygame.display.set_caption("PickHero")
 
         dc = self._config.display
+        flags = pygame.RESIZABLE | pygame.SCALED
         surface = pygame.display.set_mode(
-            (dc.width, dc.height), pygame.RESIZABLE
+            (dc.width, dc.height), flags, vsync=1
         )
         clock = pygame.time.Clock()
 
@@ -69,7 +73,10 @@ class App:
             self._update()
             self._render(surface)
             pygame.display.flip()
-            clock.tick(60)
+            if self._state == "playing":
+                clock.tick_busy_loop(60)
+            else:
+                clock.tick(60)
 
         pygame.quit()
 
@@ -81,7 +88,7 @@ class App:
 
             if event.type == pygame.VIDEORESIZE:
                 surface = pygame.display.set_mode(
-                    (event.w, event.h), pygame.RESIZABLE
+                    (event.w, event.h), pygame.RESIZABLE | pygame.SCALED, vsync=1
                 )
 
             if self._state == "menu":
@@ -115,15 +122,23 @@ class App:
         if result == "escape":
             self._running = False
         elif isinstance(result, Path):
-            self._load_song(result)
+            self._load_song(result, -1)
 
     def _handle_playing_event(self, event: pygame.event.Event) -> None:
         result = self._playing_screen.handle_event(event)
         if result == "menu":
+            pygame.display.set_caption("PickHero")
             self._playing_screen.stop_audio()
             self._playing_screen = None
             self._state = "menu"
             self._menu.scan_files()
+        elif result == "next_track":
+            # Cycle to next track
+            if self._song_path is not None and self._track_count > 1:
+                next_idx = (self._track_index + 1) % self._track_count
+                self._playing_screen.stop_audio()
+                self._playing_screen = None
+                self._load_song(self._song_path, next_idx)
 
     def _handle_device_event(self, event: pygame.event.Event) -> None:
         result = self._device_menu.handle_event(event)
@@ -157,16 +172,28 @@ class App:
             self._calibration_menu = None
             self._state = "menu"
 
-    def _load_song(self, path: Path) -> None:
-        """Load a GP file and switch to playing state."""
+    def _load_song(self, path: Path, track_index: int = 0) -> None:
+        """Load a GP file and switch to playing state.
+
+        If track_index is -1, auto-selects the first guitar track.
+        """
         try:
-            timeline = load_gp_file(path)
+            timeline = load_gp_file(path, track_index if track_index >= 0 else None)
         except Exception as e:
             try:
                 print(f"Error loading {path}: {e}")
             except UnicodeEncodeError:
                 print(f"Error loading {path}: {type(e).__name__}")
             return
+
+        self._song_path = path
+        self._track_index = timeline.metadata.track_index
+
+        # Determine total track count from the file
+        try:
+            self._track_count = len(list_tracks(path))
+        except Exception:
+            self._track_count = 1
 
         # Extract backing track (non-guitar tracks as MIDI)
         backing_track = None
@@ -188,6 +215,10 @@ class App:
             song_key=path.stem,
         )
         self._state = "playing"
+        pygame.display.set_caption(
+            f"PickHero — {timeline.metadata.artist} — {timeline.metadata.title}"
+            .replace(" —  — ", " — ")
+        )
 
         # Skip ahead so the first note is just entering the visible window
         if timeline.notes:

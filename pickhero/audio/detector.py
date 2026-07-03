@@ -20,6 +20,7 @@ class DetectedNote:
     confidence: float
     name: str
     is_onset: bool  # True if a new note strike was detected
+    onset_sample: int | None = None  # absolute sample position of onset (from aubio get_last)
 
 
 class PitchDetector:
@@ -102,8 +103,24 @@ class PitchDetector:
         # Detect onset
         is_onset = bool(self._onset(audio_buffer))
 
-        # Filter: need minimum confidence and valid frequency
+        # Filter: need minimum confidence and valid frequency.
+        # BUT: an onset is a timing event independent of pitch confidence.
+        # If onset fires, return the note (with whatever pitch was detected) so
+        # the Timing Judge can record the timing even if pitch is uncertain.
         if confidence < self.confidence_threshold or freq <= 0:
+            if is_onset:
+                # Low-confidence onset — return with best-effort pitch (may be 0)
+                midi_note = freq_to_midi(freq) if freq > 0 else 0
+                if midi_note == 0 or not is_in_guitar_range(midi_note):
+                    midi_note = 0  # unknown pitch, but timing is still valid
+                return DetectedNote(
+                    midi_note=midi_note,
+                    frequency=freq,
+                    confidence=confidence,
+                    name=midi_to_name(midi_note) if midi_note > 0 else "?",
+                    is_onset=True,
+                    onset_sample=self._onset.get_last(),
+                )
             return None
 
         midi_note = freq_to_midi(freq)
@@ -116,6 +133,7 @@ class PitchDetector:
             confidence=confidence,
             name=midi_to_name(midi_note),
             is_onset=is_onset,
+            onset_sample=self._onset.get_last() if is_onset else None,
         )
 
     def _correct_octave_jump(self, freq: float, confidence: float) -> float:

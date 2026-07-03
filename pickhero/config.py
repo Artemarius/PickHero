@@ -22,13 +22,23 @@ class StringCalibration:
 @dataclass
 class AudioConfig:
     """Audio capture and detection settings."""
-    device_index: int | None = None  # None = system default
+    device_index: int | None = None  # resolved at runtime
+    device_name: str = ""  # preferred device name (resolved to index at runtime)
     sample_rate: int = 44100
     buf_size: int = 2048
     hop_size: int = 512
     confidence_threshold: float = 0.8
     onset_threshold: float = 0.3
     noise_gate_db: float = -60.0  # ignore signals below this dB level
+    latency_mode: str = "medium"  # "low", "medium", "high"
+
+
+# Latency presets: (buf_size, hop_size, description)
+LATENCY_PRESETS = {
+    "low": (1024, 256, "~12ms (may miss low notes)"),
+    "medium": (2048, 512, "~23ms (balanced)"),
+    "high": (4096, 1024, "~46ms (best detection)"),
+}
 
 
 @dataclass
@@ -57,6 +67,8 @@ class Config:
     active_strings: list[bool] = field(default_factory=lambda: [True] * 6)
     chord_partial_credit: bool = True
     wait_mode: bool = False
+    timing_judge_mode: bool = False
+    pitch_strict_mode: bool = False
     sort_mode: str = "name_asc"
     calibration: dict = field(default_factory=dict)
 

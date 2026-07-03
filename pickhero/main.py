@@ -19,6 +19,10 @@ def _resolve_songs_dir(config: Config) -> None:
 
 
 def main():
+    if "--version" in sys.argv:
+        from pickhero import __version__
+        print(f"PickHero {__version__}")
+        sys.exit(0)
     if "--console" in sys.argv:
         # Phase 1 console demo for audio testing
         from pickhero.audio.input import run_console_demo

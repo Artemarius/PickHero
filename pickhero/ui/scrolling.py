@@ -23,7 +23,27 @@ from pickhero.ui.colors import (
     dimmed,
     get_theme,
 )
-from pickhero.ui.feedback import FeedbackRenderer
+from pickhero.ui.feedback import FeedbackRenderer, TimingOverlay
+from pickhero.timing import TimingVerdict
+
+
+class _FontCache:
+    """Cache rendered font surfaces to avoid repeated font.render() calls."""
+    def __init__(self):
+        self._cache: dict[tuple, pygame.Surface] = {}
+
+    def render(self, font: pygame.font.Font, text: str, antialias: bool, color: tuple) -> pygame.Surface:
+        key = (id(font), text, antialias, color)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        surf = font.render(text, antialias, color)
+        surf = surf.convert_alpha()
+        self._cache[key] = surf
+        return surf
+
+
+_font_cache = _FontCache()
 
 # Layout constants
 LANE_TOP_MARGIN = 80
@@ -150,6 +170,14 @@ class PlayingScreen:
         self._wait_mode: bool = self._config.wait_mode
         self._wait_mode_frozen: bool = False
 
+        # Timing Judge mode
+        self._timing_judge: bool = self._config.timing_judge_mode
+        self._pitch_strict: bool = self._config.pitch_strict_mode
+        self._last_obs_count: int = 0
+        self._timing_overlay: TimingOverlay | None = None
+        self._timing_summary = None
+        self._timing_worst_measures: list[tuple[int, float, float]] = []
+
     def _note_passes_filter(self, note: NoteEvent) -> bool:
         """Check if a note passes the difficulty filter."""
         if note.fret > self._max_fret:
@@ -172,9 +200,25 @@ class PlayingScreen:
             self._is_new_best = False
             self._weakest_sections = []
             self._recommendations = []
+            self._timing_summary = None
+            self._timing_worst_measures = []
+            self._last_obs_count = 0
             if self._matcher:
                 self._matcher.reset()
             self._feedback.reset()
+            if self._timing_overlay:
+                self._timing_overlay.reset()
+        elif self._playback_ms == 0.0 and not self._playing and self._count_in_ms > 0:
+            # Starting from the very beginning — add count-in
+            self._playback_ms = -self._count_in_ms
+            self._last_count_in_beat = -1
+            self._song_completed = False
+            self._is_new_best = False
+            self._weakest_sections = []
+            self._recommendations = []
+            self._timing_summary = None
+            self._timing_worst_measures = []
+            self._last_obs_count = 0
         elif self._playback_ms == 0.0 and not self._playing and self._count_in_ms > 0:
             # Starting from the very beginning — add count-in
             self._playback_ms = -self._count_in_ms
@@ -330,8 +374,32 @@ class PlayingScreen:
                 for d in detected:
                     d.timestamp_ms = pinned_ts
             results = self._matcher.process_detected_notes(detected, self._playback_ms)
+            # FFT-based chord verification for multi-note passages
+            if (self._audio_capture is not None
+                    and self._audio_capture.chord_detector is not None):
+                results.extend(self._matcher.verify_chord_at(
+                    self._playback_ms,
+                    self._audio_capture.chord_detector,
+                ))
             self._feedback.add_results(results, self._playback_ms)
             self._feedback.cleanup(self._playback_ms)
+
+            # Feed timing observations to the overlay (delta since last frame)
+            if self._timing_judge and self._timing_overlay is not None:
+                observations = self._matcher.get_timing_observations()
+                new_obs = observations[self._last_obs_count:]
+                for obs in new_obs:
+                    if obs.verdict in (TimingVerdict.EARLY, TimingVerdict.LATE, TimingVerdict.ON_TIME):
+                        # Find the matching NoteEvent to key the overlay
+                        for note in self._timeline.get_active_notes_at_time(
+                            obs.expected_ms, self._config.timing_window_ms
+                        ):
+                            if (note.midi_note == obs.expected_midi
+                                    and note.timestamp_ms == obs.expected_ms):
+                                self._timing_overlay.add(note, obs.timing_error_ms, self._playback_ms)
+                                break
+                self._last_obs_count = len(observations)
+                self._timing_overlay.cleanup(self._playback_ms)
 
         # Advance MIDI backing track (only during actual song)
         if self._playback_ms >= 0 and self._midi_player is not None:
@@ -381,6 +449,9 @@ class PlayingScreen:
                         )
                         self._weakest_sections = weakest
                         self._song_completed = True
+                        # Compute timing summary if Timing Judge is active
+                        if self._timing_judge:
+                            self._compute_timing_summary()
                 elif not self._audio_enabled:
                     # Auto-scroll (passive) completion
                     self._weakest_sections = []
@@ -444,6 +515,12 @@ class PlayingScreen:
             self._show_help = not self._show_help
         elif event.key == pygame.K_w:
             self._toggle_wait_mode()
+        elif event.key == pygame.K_j:
+            self._toggle_timing_judge()
+        elif event.key == pygame.K_k:
+            self._toggle_pitch_strict()
+        elif event.key == pygame.K_TAB:
+            return "next_track"
 
         return None
 
@@ -566,16 +643,40 @@ class PlayingScreen:
 
             # Fret number with outline, left-aligned inside note
             fret_label = str(note.fret)
-            fret_text = fret_font.render(fret_label, True, t.note_text)
+            fret_text = _font_cache.render(fret_font, fret_label, True, t.note_text)
             if fret_text.get_width() + 4 <= rect.width:
                 tx = rect.x + 4
                 ty = rect.y + rect.height // 2 - fret_text.get_height() // 2
                 # Black outline (render at offsets)
-                outline = fret_font.render(fret_label, True, (0, 0, 0))
+                outline = _font_cache.render(fret_font, fret_label, True, (0, 0, 0))
                 for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                     surface.blit(outline, (tx + dx, ty + dy))
                 surface.blit(fret_text, (tx, ty))
 
+            # Timing Judge: draw early/late indicator above the note
+            if self._timing_judge and self._timing_overlay is not None:
+                error = self._timing_overlay.get_indicator(note, self._playback_ms)
+                if error is not None:
+                    indicator_y = int(y) - 12
+                    cx = int(x) + int(w) // 2
+                    if error < -25:
+                        # Early: blue left-pointing arrow
+                        col = t.timing_early
+                        pygame.draw.polygon(surface, col, [
+                            (cx - 8, indicator_y), (cx + 2, indicator_y - 5),
+                            (cx + 2, indicator_y + 5),
+                        ])
+                    elif error > 25:
+                        # Late: red right-pointing arrow
+                        col = t.timing_late
+                        pygame.draw.polygon(surface, col, [
+                            (cx + 8, indicator_y), (cx - 2, indicator_y - 5),
+                            (cx - 2, indicator_y + 5),
+                        ])
+                    else:
+                        # On time: green dot
+                        col = t.timing_on_time
+                        pygame.draw.circle(surface, col, (cx, indicator_y), 3)
     def _draw_hud(self, surface: pygame.Surface, layout: _Layout) -> None:
         t = get_theme()
         title_font = _get_font("arial", 20)
@@ -591,9 +692,7 @@ class PlayingScreen:
             remaining_beats = int(-self._playback_ms / self._ms_per_beat) + 1
             remaining_beats = min(remaining_beats, self._config.count_in_beats)
             countdown_font = _get_font("arial", 120)
-            countdown_surf = countdown_font.render(
-                str(remaining_beats), True, t.hud_accent
-            )
+            countdown_surf = _font_cache.render(countdown_font, str(remaining_beats), True, t.hud_accent)
             surface.blit(
                 countdown_surf,
                 (w // 2 - countdown_surf.get_width() // 2,
@@ -608,13 +707,13 @@ class PlayingScreen:
         title = meta.title or "Untitled"
         if meta.artist:
             title = f"{meta.artist} — {title}"
-        title_surf = title_font.render(title, True, t.hud_text)
+        title_surf = _font_cache.render(title_font, title, True, t.hud_text)
         surface.blit(title_surf, (12, 12))
 
         # Top-center: BPM with tempo percentage (and streak below it)
         pct = int(self._tempo_factor * 100)
         bpm_text = f"{meta.tempo} BPM ({pct}%)"
-        bpm_surf = title_font.render(bpm_text, True, t.hud_accent)
+        bpm_surf = _font_cache.render(title_font, bpm_text, True, t.hud_accent)
         surface.blit(bpm_surf, (w // 2 - bpm_surf.get_width() // 2, 12))
 
         # Loop status below BPM
@@ -622,18 +721,33 @@ class PlayingScreen:
         loop_info = self._loop_hud_text()
         if loop_info:
             loop_color = t.hud_accent if self._loop_enabled else t.hud_text
-            loop_surf = hint_font.render(loop_info, True, loop_color)
+            loop_surf = _font_cache.render(hint_font, loop_info, True, loop_color)
             surface.blit(loop_surf, (w // 2 - loop_surf.get_width() // 2, loop_y))
             loop_y += 18
 
         if self._audio_enabled:
             self._feedback.draw_streak(surface, title_font, w // 2, loop_y)
 
+        # Timing Judge live readout (below streak)
+        if self._timing_judge and self._matcher is not None:
+            tstats = self._matcher.get_timing_stats()
+            tj_y = loop_y + 20
+            tj_text = (
+                f"TIMING JUDGE  |  "
+                f"Early: {tstats.early_count}  Late: {tstats.late_count}  "
+                f"\u03c3: {tstats.std_dev_ms:.0f}ms"
+            )
+            tj_surf = _font_cache.render(hint_font, tj_text, True, t.hud_accent)
+            surface.blit(tj_surf, (w // 2 - tj_surf.get_width() // 2, tj_y))
+            tj_y += 16
+            if self._pitch_strict:
+                ps_surf = _font_cache.render(hint_font, "STRICT PITCH", True, t.feedback_close)
+                surface.blit(ps_surf, (w // 2 - ps_surf.get_width() // 2, tj_y))
         # Top-right: time
         current = format_time(self._playback_ms)
         total = format_time(self._timeline.duration_ms)
         time_text = f"{current} / {total}"
-        time_surf = time_font.render(time_text, True, t.hud_text)
+        time_surf = _font_cache.render(time_font, time_text, True, t.hud_text)
         surface.blit(time_surf, (w - time_surf.get_width() - 12, 12))
 
         # Top-right second line: accuracy stats
@@ -647,7 +761,7 @@ class PlayingScreen:
         # Top-right: noise gate + signal meter + tuner (below stats, when audio capture exists)
         if self._audio_enabled:
             gate_text = f"Gate: {int(self._noise_gate_db)} dB"
-            gate_surf = hint_font.render(gate_text, True, t.hud_accent)
+            gate_surf = _font_cache.render(hint_font, gate_text, True, t.hud_accent)
             surface.blit(gate_surf, (w - gate_surf.get_width() - 12, stats_bottom_y))
             if self._audio_capture is not None:
                 self._draw_signal_meter(surface, hint_font, w, stats_bottom_y + 18)
@@ -679,38 +793,40 @@ class PlayingScreen:
             wait_state = f"|  W: wait {'WAIT' if self._wait_mode_frozen else 'ON'}  "
         elif self._audio_enabled:
             wait_state = "|  W: wait off  "
+        timing_state = f"|  J: timing {'ON' if self._timing_judge else 'off'}  "
+        if self._pitch_strict:
+            timing_state += "|  K: strict ON  "
         hint = (
             f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
             f"|  HOME: restart  |  PgDn/PgUp: tempo  |  X/C: gate"
             f"|  A: audio {audio_state}  "
             f"{backing_state}"
             f"{wait_state}"
+            f"{timing_state}"
             f"|  I/O: loop {loop_state}  |  P: toggle  |  ESC: menu"
         )
-        hint_surf = hint_font.render(hint, True, t.hud_text)
+        hint_surf = _font_cache.render(hint_font, hint, True, t.hud_text)
         y = layout.screen_h - LANE_BOTTOM_MARGIN + 8
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, y))
 
         # Top-left second line: track name + filter info
         info_y = 38
         if meta.track_name:
-            track_surf = hint_font.render(
-                f"Track: {meta.track_name}", True, t.hud_text
-            )
+            track_surf = _font_cache.render(hint_font, f"Track: {meta.track_name}", True, t.hud_text)
             surface.blit(track_surf, (12, info_y))
             info_y += 16
 
         # Difficulty filter HUD
         filter_text = self._filter_hud_text()
         if filter_text:
-            filter_surf = hint_font.render(filter_text, True, t.hud_accent)
+            filter_surf = _font_cache.render(hint_font, filter_text, True, t.hud_accent)
             surface.blit(filter_surf, (12, info_y))
             info_y += 16
 
         # Chord mode HUD
         if self._chord_partial_credit != self._config._default_chord_partial_credit:
             chord_text = "Chords: strict" if self._chord_partial_credit else "Chords: easy"
-            chord_surf = hint_font.render(chord_text, True, t.hud_accent)
+            chord_surf = _font_cache.render(hint_font, chord_text, True, t.hud_accent)
             surface.blit(chord_surf, (12, info_y))
 
     def _draw_signal_meter(self, surface: pygame.Surface, font: pygame.font.Font,
@@ -727,7 +843,7 @@ class PlayingScreen:
         # dB label
         db_display = max(db_min, min(db_max, db))
         label = f"Signal: {int(db_display)} dB"
-        label_surf = font.render(label, True, t.hud_text)
+        label_surf = _font_cache.render(font, label, True, t.hud_text)
         label_x = screen_w - label_surf.get_width() - 12
         surface.blit(label_surf, (label_x, y))
 
@@ -772,7 +888,7 @@ class PlayingScreen:
         if freq <= 0 or self._tuner_displayed_note < 0:
             # No pitch — show placeholder
             label = "Tuner: ---"
-            label_surf = font.render(label, True, t.hud_text)
+            label_surf = _font_cache.render(font, label, True, t.hud_text)
             surface.blit(label_surf, (screen_w - label_surf.get_width() - 12, y))
             return
 
@@ -801,7 +917,7 @@ class PlayingScreen:
         # Note name + cents label
         sign = "+" if cents >= 0 else ""
         label = f"{note_name} {sign}{int(cents)}\u00A2"
-        label_surf = font.render(label, True, fill_color)
+        label_surf = _font_cache.render(font, label, True, fill_color)
         label_x = screen_w - label_surf.get_width() - 12
         surface.blit(label_surf, (label_x, y))
 
@@ -848,7 +964,7 @@ class PlayingScreen:
         center_y = h // 2 - 80
 
         # "Song Complete!" header
-        header_surf = header_font.render("Song Complete!", True, t.hud_accent)
+        header_surf = _font_cache.render(header_font, "Song Complete!", True, t.hud_accent)
         surface.blit(header_surf, (w // 2 - header_surf.get_width() // 2, center_y))
 
         if self._audio_enabled and self._matcher is not None:
@@ -858,12 +974,12 @@ class PlayingScreen:
                 f"Accuracy: {stats['accuracy_percent']:.1f}%  "
                 f"({stats['hits']}/{stats['total']})"
             )
-            acc_surf = stat_font.render(accuracy_text, True, t.hud_text)
+            acc_surf = _font_cache.render(stat_font, accuracy_text, True, t.hud_text)
             surface.blit(acc_surf, (w // 2 - acc_surf.get_width() // 2, center_y + 60))
 
             # "New Best!" indicator
             if self._is_new_best:
-                best_surf = stat_font.render("New Best!", True, (255, 220, 50))
+                best_surf = _font_cache.render(stat_font, "New Best!", True, (255, 220, 50))
                 surface.blit(best_surf, (w // 2 - best_surf.get_width() // 2, center_y + 100))
 
             # Weakest sections
@@ -874,27 +990,167 @@ class PlayingScreen:
                     f"Weakest: bars {section[0]+1}-{section[1]+1} "
                     f"({section[2]:.0f}%) -- press L to loop"
                 )
-                weak_surf = hint_font.render(weak_text, True, t.feedback_close)
+                weak_surf = _font_cache.render(hint_font, weak_text, True, t.feedback_close)
                 surface.blit(weak_surf, (w // 2 - weak_surf.get_width() // 2, center_y + 140))
 
             # Practice recommendations
             rec_y = center_y + 170
             for rec in self._recommendations:
-                rec_surf = hint_font.render(rec, True, t.hud_accent)
+                rec_surf = _font_cache.render(hint_font, rec, True, t.hud_accent)
                 surface.blit(rec_surf, (w // 2 - rec_surf.get_width() // 2, rec_y))
                 rec_y += 24
 
             # Controls hint
             hint_y = max(center_y + 180, rec_y + 10)
             hint_text = "SPACE to replay  |  L to loop weak section  |  ESC to menu"
-            hint_surf = hint_font.render(hint_text, True, t.hud_text)
+            hint_surf = _font_cache.render(hint_font, hint_text, True, t.hud_text)
             surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, hint_y))
         else:
             # Auto-scroll completion — no stats
             hint_text = "SPACE to replay  |  ESC to menu"
-            hint_surf = hint_font.render(hint_text, True, t.hud_text)
+            hint_surf = _font_cache.render(hint_font, hint_text, True, t.hud_text)
             surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, center_y + 70))
 
+        # Timing Judge summary (augments the completion overlay)
+        if self._timing_judge and self._timing_summary is not None:
+            self._draw_timing_summary(surface, layout)
+
+    def _compute_timing_summary(self) -> None:
+        """Compute timing stats and worst measures for the summary screen."""
+        if self._matcher is None:
+            return
+        stats = self._matcher.get_timing_stats()
+        self._timing_summary = stats
+        # Find worst 3 measures by abs(mean_error_ms) descending
+        if stats.per_measure:
+            sorted_measures = sorted(
+                stats.per_measure.items(),
+                key=lambda x: abs(x[1].mean_error_ms),
+                reverse=True,
+            )
+            self._timing_worst_measures = [
+                (idx, ms.mean_error_ms, ms.std_dev_ms)
+                for idx, ms in sorted_measures[:3]
+            ]
+
+    def _draw_timing_summary(self, surface: pygame.Surface, layout: _Layout) -> None:
+        """Draw the Timing Judge results panel within the completion overlay."""
+        t = get_theme()
+        w, h = layout.screen_w, layout.screen_h
+        stats = self._timing_summary
+        if stats is None:
+            return
+
+        stat_font = _get_font("consolas", 22)
+        small_font = _get_font("arial", 16)
+        hist_font = _get_font("consolas", 14)
+
+        # Panel position: right side of the completion overlay
+        panel_x = w - 460
+        panel_y = h // 2 - 100
+
+        # Title
+        title_surf = _font_cache.render(stat_font, "Timing Judge", True, t.hud_accent)
+        surface.blit(title_surf, (panel_x, panel_y))
+        panel_y += 30
+
+        if stats.count == 0:
+            no_data = _font_cache.render(
+                small_font,
+                "No timing data -- enable audio (A) and play a take",
+                True, t.hud_text,
+            )
+            surface.blit(no_data, (panel_x, panel_y))
+            return
+
+        # Mean error
+        mean_sign = "+" if stats.mean_error_ms >= 0 else ""
+        mean_text = f"\u03bc = {mean_sign}{stats.mean_error_ms:.1f} ms"
+        mean_color = t.timing_late if stats.mean_error_ms > 5 else (
+            t.timing_early if stats.mean_error_ms < -5 else t.timing_on_time
+        )
+        mean_surf = _font_cache.render(stat_font, mean_text, True, mean_color)
+        surface.blit(mean_surf, (panel_x, panel_y))
+        panel_y += 28
+
+        # Std dev
+        std_text = f"\u03c3 = {stats.std_dev_ms:.1f} ms"
+        std_surf = _font_cache.render(stat_font, std_text, True, t.hud_text)
+        surface.blit(std_surf, (panel_x, panel_y))
+        panel_y += 28
+
+        # Counts
+        counts_text = (
+            f"Early: {stats.early_count}  On-time: {stats.on_time_count}  "
+            f"Late: {stats.late_count}"
+        )
+        counts_surf = _font_cache.render(small_font, counts_text, True, t.hud_text)
+        surface.blit(counts_surf, (panel_x, panel_y))
+        panel_y += 20
+
+        missed_extra = f"Missed: {stats.missed_count}  Extra: {stats.extra_count}"
+        me_surf = _font_cache.render(small_font, missed_extra, True, t.hud_text)
+        surface.blit(me_surf, (panel_x, panel_y))
+        panel_y += 28
+
+        # Histogram
+        hist_label = _font_cache.render(small_font, "Error Distribution", True, t.hud_accent)
+        surface.blit(hist_label, (panel_x, panel_y))
+        panel_y += 20
+
+        hist_w = 400
+        hist_h = 100
+        hist_x = panel_x
+        hist_y = panel_y
+
+        # Background
+        pygame.draw.rect(surface, t.signal_cold, (hist_x, hist_y, hist_w, hist_h))
+
+        max_bin = max(stats.histogram_bins) if stats.histogram_bins else 0
+        bar_w = hist_w // len(stats.histogram_bins)
+        center_bin = len(stats.histogram_bins) // 2
+
+        for i, count in enumerate(stats.histogram_bins):
+            if count == 0 or max_bin == 0:
+                continue
+            bar_h = int((count / max_bin) * (hist_h - 4))
+            bx = hist_x + i * bar_w
+            by = hist_y + hist_h - bar_h
+            if i < center_bin:
+                color = t.timing_early
+            elif i > center_bin:
+                color = t.timing_late
+            else:
+                color = t.timing_on_time
+            pygame.draw.rect(surface, color, (bx + 1, by, bar_w - 2, bar_h))
+
+        # Center line (0ms reference)
+        center_x = hist_x + center_bin * bar_w + bar_w // 2
+        pygame.draw.line(surface, t.hud_text, (center_x, hist_y - 2), (center_x, hist_y + hist_h + 2), 1)
+
+        # Axis labels
+        left_label = _font_cache.render(hist_font, "-100ms", True, t.hud_text)
+        right_label = _font_cache.render(hist_font, "+100ms", True, t.hud_text)
+        zero_label = _font_cache.render(hist_font, "0", True, t.hud_text)
+        surface.blit(left_label, (hist_x, hist_y + hist_h + 2))
+        surface.blit(right_label, (hist_x + hist_w - right_label.get_width(), hist_y + hist_h + 2))
+        surface.blit(zero_label, (center_x - zero_label.get_width() // 2, hist_y + hist_h + 2))
+        panel_y += hist_h + 22
+
+        # Worst 3 bars
+        if self._timing_worst_measures:
+            worst_label = _font_cache.render(small_font, "Worst Bars:", True, t.hud_accent)
+            surface.blit(worst_label, (panel_x, panel_y))
+            panel_y += 20
+            for measure_idx, mean_err, std_dev in self._timing_worst_measures:
+                sign = "+" if mean_err >= 0 else ""
+                line = f"  Bar {measure_idx + 1}: \u03bc={sign}{mean_err:.0f}ms  \u03c3={std_dev:.0f}ms"
+                worst_color = t.timing_late if mean_err > 5 else (
+                    t.timing_early if mean_err < -5 else t.timing_on_time
+                )
+                worst_surf = _font_cache.render(small_font, line, True, worst_color)
+                surface.blit(worst_surf, (panel_x, panel_y))
+                panel_y += 18
     def _draw_help_overlay(self, surface: pygame.Surface, layout: _Layout) -> None:
         """Draw a help overlay explaining the track, note colors, and controls."""
         t = get_theme()
@@ -912,13 +1168,13 @@ class PlayingScreen:
         cx = w // 2
         y = 30
 
-        title_surf = title_font.render("Help", True, t.hud_accent)
+        title_surf = _font_cache.render(title_font, "Help", True, t.hud_accent)
         surface.blit(title_surf, (cx - title_surf.get_width() // 2, y))
         y += 40
 
         # -- How to read the track --
         lx = cx - 260  # left edge for content
-        section = section_font.render("Reading the Track", True, t.hud_accent)
+        section = _font_cache.render(section_font, "Reading the Track", True, t.hud_accent)
         surface.blit(section, (lx, y))
         y += 26
 
@@ -928,13 +1184,13 @@ class PlayingScreen:
             "Play the right fret on the right string as the note crosses the line.",
         ]
         for line in track_lines:
-            surf = body_font.render(line, True, t.hud_text)
+            surf = _font_cache.render(body_font, line, True, t.hud_text)
             surface.blit(surf, (lx, y))
             y += 21
         y += 6
 
         # -- The 6 rows --
-        section = section_font.render("The 6 Rows = 6 Guitar Strings", True, t.hud_accent)
+        section = _font_cache.render(section_font, "The 6 Rows = 6 Guitar Strings", True, t.hud_accent)
         surface.blit(section, (lx, y))
         y += 26
 
@@ -942,7 +1198,7 @@ class PlayingScreen:
             "Each horizontal row is one guitar string, top to bottom:",
         ]
         for line in row_lines:
-            surf = body_font.render(line, True, t.hud_text)
+            surf = _font_cache.render(body_font, line, True, t.hud_text)
             surface.blit(surf, (lx, y))
             y += 21
 
@@ -958,30 +1214,24 @@ class PlayingScreen:
             color = STRING_COLORS.get(s, (180, 180, 180))
             pygame.draw.rect(surface, color, (lx, y + 3, 14, 14),
                              border_radius=2)
-            surf = body_font.render(label, True, t.hud_text)
+            surf = _font_cache.render(body_font, label, True, t.hud_text)
             surface.blit(surf, (lx + 20, y))
             y += 20
         y += 4
 
-        surf = body_font.render(
-            "A note's color tells you which string to play — it matches the row.",
-            True, t.hud_text)
+        surf = _font_cache.render(body_font, "A note's color tells you which string to play — it matches the row.", True, t.hud_text)
         surface.blit(surf, (lx, y))
         y += 20
-        surf = body_font.render(
-            "Dimmed notes have already passed the hit zone.",
-            True, t.hud_text)
+        surf = _font_cache.render(body_font, "Dimmed notes have already passed the hit zone.", True, t.hud_text)
         surface.blit(surf, (lx, y))
         y += 24
 
         # -- Feedback colors --
-        section = section_font.render("Scoring (colors change after you play)", True, t.hud_accent)
+        section = _font_cache.render(section_font, "Scoring (colors change after you play)", True, t.hud_accent)
         surface.blit(section, (lx, y))
         y += 26
 
-        surf = body_font.render(
-            "When audio is on, notes change color after they pass the hit zone:",
-            True, t.hud_text)
+        surf = _font_cache.render(body_font, "When audio is on, notes change color after they pass the hit zone:", True, t.hud_text)
         surface.blit(surf, (lx, y))
         y += 22
 
@@ -993,13 +1243,13 @@ class PlayingScreen:
         for color, label, desc in feedback:
             pygame.draw.rect(surface, color, (lx + 10, y + 3, 14, 14),
                              border_radius=2)
-            surf = body_font.render(f"{label} — {desc}", True, t.hud_text)
+            surf = _font_cache.render(body_font, f"{label} — {desc}", True, t.hud_text)
             surface.blit(surf, (lx + 30, y))
             y += 21
         y += 10
 
         # -- Controls --
-        section = section_font.render("Controls", True, t.hud_accent)
+        section = _font_cache.render(section_font, "Controls", True, t.hud_accent)
         surface.blit(section, (lx, y))
         y += 24
 
@@ -1011,12 +1261,12 @@ class PlayingScreen:
             "W: wait mode (pause until correct note played)",
         ]
         for line in controls:
-            surf = hint_font.render(line, True, t.hud_text)
+            surf = _font_cache.render(hint_font, line, True, t.hud_text)
             surface.blit(surf, (lx, y))
             y += 18
 
         y += 10
-        close_surf = hint_font.render("Press H to close", True, t.hud_accent)
+        close_surf = _font_cache.render(hint_font, "Press H to close", True, t.hud_accent)
         surface.blit(close_surf, (cx - close_surf.get_width() // 2, y))
 
     # -- Difficulty filter --
@@ -1092,16 +1342,63 @@ class PlayingScreen:
         if not self._wait_mode:
             self._wait_mode_frozen = False
 
-    # -- Loop weakest section --
+    # -- Timing Judge mode --
+
+    def _toggle_timing_judge(self) -> None:
+        """Toggle Timing Judge mode on/off."""
+        self._timing_judge = not self._timing_judge
+        self._config.timing_judge_mode = self._timing_judge
+        self._config.save()
+        if self._timing_judge and self._timing_overlay is None:
+            self._timing_overlay = TimingOverlay()
+        if self._matcher:
+            self._matcher.timing_judge_enabled = self._timing_judge
+        if not self._timing_judge:
+            self._last_obs_count = 0
+
+    # -- Pitch strict mode --
+
+    def _toggle_pitch_strict(self) -> None:
+        """Toggle pitch strict mode on/off."""
+        self._pitch_strict = not self._pitch_strict
+        self._config.pitch_strict_mode = self._pitch_strict
+        self._config.save()
+        if self._matcher:
+            self._matcher.pitch_strict = self._pitch_strict
 
     def _loop_weakest_section(self) -> None:
-        """Set loop to weakest section from completion screen."""
+        """Set loop to weakest section from completion screen.
+
+        When Timing Judge is active, prefer the timing-based worst bar.
+        Otherwise, use the accuracy-based weakest section.
+        """
+        if not self._song_completed:
+            return
+
+        # Timing Judge: prefer timing-based worst bar
+        if self._timing_judge and self._timing_worst_measures:
+            measure_idx = self._timing_worst_measures[0][0]
+            measures = self._timeline.measures
+            if measures and measure_idx < len(measures):
+                start_ms = measures[measure_idx].start_ms
+                end_ms = measures[measure_idx].end_ms
+                self._loop_start_ms = start_ms
+                self._loop_end_ms = end_ms
+                self._loop_enabled = True
+                self._song_completed = False
+                self._is_new_best = False
+                self._weakest_sections = []
+                self._timing_summary = None
+                self._timing_worst_measures = []
+                self.seek(start_ms)
+                return
+
+        # Accuracy-based weakest section
         weak = getattr(self, "_weakest_sections", [])
-        if not weak or not self._song_completed:
+        if not weak:
             return
         section = weak[0]
         start_measure, end_measure = section[0], section[1]
-        # Get measure time ranges from timeline
         measures = self._timeline.measures
         if not measures or start_measure >= len(measures):
             return
@@ -1114,6 +1411,8 @@ class PlayingScreen:
         self._song_completed = False
         self._is_new_best = False
         self._weakest_sections = []
+        self._timing_summary = None
+        self._timing_worst_measures = []
         self.seek(start_ms)
 
     # -- Loop control --
@@ -1243,7 +1542,11 @@ class PlayingScreen:
                 chord_threshold_ms=self._config.chord_threshold_ms,
                 note_filter=self._note_passes_filter if self._is_filter_active() else None,
                 chord_partial_credit=self._chord_partial_credit,
+                timing_judge_enabled=self._timing_judge,
+                pitch_strict=self._pitch_strict,
             )
+            if self._timing_judge and self._timing_overlay is None:
+                self._timing_overlay = TimingOverlay()
             self._feedback.reset()
         except Exception as e:
             print(f"Audio start failed: {e}")

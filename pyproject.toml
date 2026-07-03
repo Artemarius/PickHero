@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pickhero"
+version = "1.2.0"
+description = "Free, open-source desktop guitar practice app with real-time pitch detection"
+license = { text = "MIT" }
+dependencies = [
+    "pygame>=2.5.0",
+    "sounddevice>=0.4.6",
+    "pyguitarpro>=0.9",
+]
+requires-python = ">=3.10"
+
+[project.scripts]
+pickhero = "pickhero.main:main"
+
+[tool.setuptools.packages.find]
+include = ["pickhero*"]

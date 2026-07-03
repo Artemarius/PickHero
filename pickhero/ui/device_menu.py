@@ -9,7 +9,7 @@ from __future__ import annotations
 import pygame
 
 from pickhero.audio.input import list_audio_devices
-from pickhero.config import Config
+from pickhero.config import Config, LATENCY_PRESETS
 from pickhero.ui.colors import get_theme
 
 # Max items visible before scrolling
@@ -80,6 +80,8 @@ class DeviceMenuScreen:
             self._ensure_visible()
         elif event.key == pygame.K_r:
             self._refresh_devices()
+        elif event.key == pygame.K_l:
+            self._cycle_latency()
         elif event.key == pygame.K_RETURN:
             self._apply_selection()
             return "selected"
@@ -90,9 +92,34 @@ class DeviceMenuScreen:
         """Persist the selected device to config."""
         if self._selected == 0:
             self._config.audio.device_index = None
+            self._config.audio.device_name = ""
         else:
             dev = self._devices[self._selected - 1]
-            self._config.audio.device_index = dev["index"]
+            idx = dev["index"]
+            name = dev["name"]
+            self._config.audio.device_index = idx
+            self._config.audio.device_name = name
+            # Match sample rate to device default
+            import sounddevice as sd
+            info = sd.query_devices(idx)
+            if info["default_samplerate"]:
+                self._config.audio.sample_rate = int(info["default_samplerate"])
+        self._config.save()
+
+    def _cycle_latency(self) -> None:
+        """Cycle through latency presets and apply immediately."""
+        modes = list(LATENCY_PRESETS.keys())
+        current = self._config.audio.latency_mode
+        try:
+            idx = modes.index(current)
+        except ValueError:
+            idx = 0
+        next_idx = (idx + 1) % len(modes)
+        new_mode = modes[next_idx]
+        self._config.audio.latency_mode = new_mode
+        buf, hop, _ = LATENCY_PRESETS[new_mode]
+        self._config.audio.buf_size = buf
+        self._config.audio.hop_size = hop
         self._config.save()
 
     def render(self, surface: pygame.Surface) -> None:
@@ -114,7 +141,16 @@ class DeviceMenuScreen:
         )
         surface.blit(sub_surf, (w // 2 - sub_surf.get_width() // 2, 68))
 
-        list_top = 110
+        # Latency preset display
+        mode = self._config.audio.latency_mode
+        _, _, desc = LATENCY_PRESETS[mode]
+        lat_surf = hint_font.render(
+            f"Latency: {mode.upper()} — {desc}  [L to change]",
+            True, t.hud_accent,
+        )
+        surface.blit(lat_surf, (w // 2 - lat_surf.get_width() // 2, 92))
+
+        list_top = 130
         item_h = 30
         list_left = 60
         list_width = w - 120
@@ -164,7 +200,7 @@ class DeviceMenuScreen:
             surface.blit(arrow, (w // 2 - arrow.get_width() // 2, y_bottom))
 
         # Hints
-        hint = "UP/DOWN: navigate  |  ENTER: select  |  R: refresh  |  ESC: back"
+        hint = "UP/DOWN: navigate  |  ENTER: select  |  R: refresh  |  L: latency  |  ESC: back"
         hint_surf = hint_font.render(hint, True, t.hud_text)
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, h - 36))
 

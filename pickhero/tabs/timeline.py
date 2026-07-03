@@ -69,6 +69,9 @@ class Timeline:
         self.metadata = metadata or SongMetadata()
         self._measures = measures or []
         self._cursor = 0
+        # Active-window cursor for get_active_notes_at_time optimization
+        self._active_cursor = 0
+        self._last_query_time = -1.0
 
     def __len__(self) -> int:
         return len(self._notes)
@@ -101,15 +104,30 @@ class Timeline:
         """Return notes that overlap the window [time_ms - window_ms, time_ms + window_ms].
 
         A note is active if its sounding range [timestamp_ms, end_ms] overlaps the window.
+        Uses a monotonic cursor for amortized O(1) per call during forward playback.
+        Falls back to scanning from 0 on backward queries (seek).
         """
         window_start = time_ms - window_ms
         window_end = time_ms + window_ms
 
+        # Reset cursor on backward seek
+        if time_ms < self._last_query_time:
+            self._active_cursor = 0
+        self._last_query_time = time_ms
+
         # Find candidates: notes that start before window_end
         right = bisect.bisect_right(self._timestamps, window_end)
 
+        # Advance cursor past notes that have fully ended before the window
+        while self._active_cursor < right:
+            note = self._notes[self._active_cursor]
+            if note.end_ms < window_start:
+                self._active_cursor += 1
+            else:
+                break
+
         result = []
-        for i in range(right):
+        for i in range(self._active_cursor, right):
             note = self._notes[i]
             if note.end_ms >= window_start and note.timestamp_ms <= window_end:
                 result.append(note)
@@ -118,6 +136,8 @@ class Timeline:
     def seek(self, time_ms: float) -> None:
         """Move the cursor to the first note at or after time_ms."""
         self._cursor = bisect.bisect_left(self._timestamps, time_ms)
+        self._active_cursor = self._cursor
+        self._last_query_time = time_ms
 
     def get_next_notes(self, count: int = 1) -> list[NoteEvent]:
         """Return up to `count` notes from the cursor, advancing it."""

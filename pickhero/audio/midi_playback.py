@@ -82,14 +82,36 @@ class MidiPlayer:
         self._opened = False
 
     def open(self) -> bool:
-        """Initialize pygame.midi and open the default output device.
+        """Initialize pygame.midi and open the best available output device.
+
+        Skips the kernel Midi Through port (which produces no sound) and
+        prefers real synthesizers like FluidSynth or PipeWire MIDI bridges.
 
         Returns True on success, False if MIDI is unavailable.
         """
         try:
             import pygame.midi
             pygame.midi.init()
-            device_id = pygame.midi.get_default_output_id()
+
+            # Scan devices for the best output: skip Midi Through (port 0/14),
+            # prefer something with "Synth", "Fluid", or "PipeWire" in the name.
+            device_id = -1
+            for i in range(pygame.midi.get_count()):
+                info = pygame.midi.get_device_info(i)
+                is_output = info[3]
+                if not is_output:
+                    continue
+                name = info[1].decode()
+                if name == "Midi Through Port-0":
+                    continue  # produces no audio
+                # Found a usable output device
+                device_id = i
+                break
+
+            # Fallback: try default if nothing better found
+            if device_id == -1:
+                device_id = pygame.midi.get_default_output_id()
+
             if device_id == -1:
                 print("No MIDI output device found")
                 return False
