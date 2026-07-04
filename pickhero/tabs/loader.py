@@ -105,6 +105,28 @@ def _extract_tuning(track: guitarpro.Track) -> dict[int, int]:
     return {i + 1: s.value for i, s in enumerate(track.strings)}
 
 
+def _extract_articulation(note) -> str | None:
+    """Map pyguitarpro note effects to our articulation string.
+
+    Priority: harmonic > palm_mute > bend > slide > hammer > vibrato.
+    Returns None for normal notes with no articulation effects.
+    """
+    eff = note.effect
+    if eff.harmonic is not None:
+        return "harmonic"
+    if eff.palmMute:
+        return "palm_mute"
+    if eff.bend is not None:
+        return "bend"
+    if eff.slides:
+        return "slide"
+    if eff.hammer:
+        return "hammer_on"
+    if eff.vibrato:
+        return "vibrato"
+    return None
+
+
 def _extract_notes(track: guitarpro.Track, tempo_map: TempoMap) -> list[NoteEvent]:
     """Extract all playable notes from a track."""
     notes = []
@@ -127,6 +149,7 @@ def _extract_notes(track: guitarpro.Track, tempo_map: TempoMap) -> list[NoteEven
                             string=note.string,
                             fret=note.value,
                             measure=measure_idx,
+                            expected_articulation=_extract_articulation(note),
                         )
                     )
     return notes

@@ -20,6 +20,7 @@ class NoteEvent:
     string: int  # 1-6 (1=high E)
     fret: int    # 0=open
     measure: int = 0  # measure index (0-based)
+    expected_articulation: str | None = None  # "hammer_on", "pull_off", "bend", "vibrato", "slide", "palm_mute", "harmonic"
 
     def __post_init__(self):
         if self.timestamp_ms < 0:

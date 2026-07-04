@@ -316,6 +316,15 @@ class NoteMatcher:
                 timing_error_ms = adjusted_ms - best.timestamp_ms
                 verdict = classify_timing_error(timing_error_ms)
                 pitch_v = classify_pitch_distance(best_dist)
+                # Compare detected articulation against expected from tab
+                detected_art = ts_note.note.articulation
+                expected_art = best.expected_articulation
+                if expected_art is None and detected_art is None:
+                    art_match = True  # both normal — correct
+                elif expected_art is not None and detected_art == expected_art:
+                    art_match = True
+                else:
+                    art_match = False
                 self._timing_observations.append(TimingObservation(
                     detected_ms=adjusted_ms,
                     expected_ms=best.timestamp_ms,
@@ -326,7 +335,8 @@ class NoteMatcher:
                     measure=best.measure,
                     confidence=ts_note.note.confidence,
                     pitch_verdict=pitch_v,
-                    articulation=ts_note.note.articulation,
+                    articulation=detected_art,
+                    articulation_match=art_match,
                 ))
 
             # Chord handling
@@ -439,12 +449,29 @@ class NoteMatcher:
         """Return current match statistics."""
         total = self.hits + self.close + self.misses
         accuracy = (self.hits / total * 100) if total > 0 else 0.0
+
+        # Technique accuracy: how many matched notes used the correct articulation
+        technique_correct = 0
+        technique_total = 0
+        for obs in self._timing_observations:
+            if obs.articulation_match is not None:
+                technique_total += 1
+                if obs.articulation_match:
+                    technique_correct += 1
+        technique_accuracy = (
+            (technique_correct / technique_total * 100)
+            if technique_total > 0 else 0.0
+        )
+
         return {
             "hits": self.hits,
             "close": self.close,
             "misses": self.misses,
             "total": total,
             "accuracy_percent": accuracy,
+            "technique_correct": technique_correct,
+            "technique_total": technique_total,
+            "technique_accuracy_percent": technique_accuracy,
         }
 
     def get_weakest_sections(

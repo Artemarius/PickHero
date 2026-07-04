@@ -68,7 +68,8 @@ class TimingObservation:
     measure: int
     confidence: float
     pitch_verdict: PitchVerdict = PitchVerdict.UNKNOWN
-    articulation: str | None = None  # detected articulation (hammer_on, pull_off, etc.)
+    articulation: str | None = None  # detected articulation
+    articulation_match: bool | None = None  # True if detected matches expected from tab
 
 
 @dataclass

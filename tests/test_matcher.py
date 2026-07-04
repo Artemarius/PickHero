@@ -10,18 +10,21 @@ from pickhero.timing import PitchVerdict, TimingVerdict
 
 
 def _note_event(timestamp_ms: float, midi_note: int = 64, string: int = 1,
-                fret: int = 0, duration_ms: float = 500.0) -> NoteEvent:
+                fret: int = 0, duration_ms: float = 500.0,
+                expected_articulation: str | None = None) -> NoteEvent:
     return NoteEvent(
         timestamp_ms=timestamp_ms,
         duration_ms=duration_ms,
         midi_note=midi_note,
         string=string,
         fret=fret,
+        expected_articulation=expected_articulation,
     )
 
 
 def _detected(midi_note: int, timestamp_ms: float, is_onset: bool = True,
-              confidence: float = 0.95) -> TimestampedNote:
+              confidence: float = 0.95,
+              articulation: str | None = None) -> TimestampedNote:
     return TimestampedNote(
         note=DetectedNote(
             midi_note=midi_note,
@@ -29,6 +32,7 @@ def _detected(midi_note: int, timestamp_ms: float, is_onset: bool = True,
             confidence=confidence,
             name="A4",  # placeholder
             is_onset=is_onset,
+            articulation=articulation,
         ),
         timestamp_ms=timestamp_ms,
     )
@@ -390,5 +394,57 @@ class TestTimingObservations:
         # Detect MIDI 76 (E5, exactly 12 semitones up)
         matcher.process_detected_notes([_detected(76, 1000.0)], 1050.0)
         obs = matcher.get_timing_observations()
-        assert len(obs) == 1
         assert obs[0].pitch_verdict == PitchVerdict.CORRECT
+
+    def test_articulation_match_correct(self):
+        """Detected articulation matches expected → articulation_match=True."""
+        tab = _note_event(1000.0, midi_note=64, expected_articulation="hammer_on")
+        matcher = self._make_timing_matcher([tab])
+        matcher.process_detected_notes([_detected(64, 1000.0, articulation="hammer_on")], 1050.0)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].articulation == "hammer_on"
+        assert obs[0].articulation_match is True
+
+    def test_articulation_match_wrong(self):
+        """Detected articulation doesn't match expected → articulation_match=False."""
+        tab = _note_event(1000.0, midi_note=64, expected_articulation="hammer_on")
+        matcher = self._make_timing_matcher([tab])
+        matcher.process_detected_notes([_detected(64, 1000.0, articulation="bend")], 1050.0)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].articulation_match is False
+
+    def test_articulation_match_no_expected(self):
+        """No expected articulation, none detected → match=True (both normal)."""
+        tab = _note_event(1000.0, midi_note=64)  # no expected_articulation
+        matcher = self._make_timing_matcher([tab])
+        matcher.process_detected_notes([_detected(64, 1000.0)], 1050.0)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].articulation_match is True
+
+    def test_articulation_match_expected_none_detected(self):
+        """Expected articulation but none detected → match=False."""
+        tab = _note_event(1000.0, midi_note=64, expected_articulation="bend")
+        matcher = self._make_timing_matcher([tab])
+        matcher.process_detected_notes([_detected(64, 1000.0)], 1050.0)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].articulation_match is False
+
+    def test_technique_accuracy_stats(self):
+        """get_statistics includes technique accuracy."""
+        notes = [
+            _note_event(1000.0, midi_note=64, expected_articulation="hammer_on"),
+            _note_event(2000.0, midi_note=64, expected_articulation="bend"),
+        ]
+        matcher = self._make_timing_matcher(notes)
+        # Match first with correct articulation
+        matcher.process_detected_notes([_detected(64, 1000.0, articulation="hammer_on")], 1050.0)
+        # Match second with wrong articulation
+        matcher.process_detected_notes([_detected(64, 2000.0, articulation="vibrato")], 2050.0)
+        stats = matcher.get_statistics()
+        assert stats["technique_total"] == 2
+        assert stats["technique_correct"] == 1
+        assert stats["technique_accuracy_percent"] == 50.0

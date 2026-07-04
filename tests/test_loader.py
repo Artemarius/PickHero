@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from pickhero.audio.note_utils import STANDARD_TUNING
-from pickhero.tabs.loader import TempoMap, is_guitar_track, list_tracks, load_gp_file
+from pickhero.tabs.loader import TempoMap, is_guitar_track, list_tracks, load_gp_file, _extract_articulation
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -187,3 +187,66 @@ class TestLoadGPFile:
             assert tl.duration_ms > 0
             for note in tl.notes:
                 assert note.duration_ms > 0, f"{fname}: note with 0 duration"
+
+
+class TestExtractArticulation:
+    """Test the _extract_articulation helper function."""
+
+    def _make_note(self, **effect_kwargs):
+        """Create a mock note with effect attributes."""
+        from unittest.mock import MagicMock
+        note = MagicMock()
+        note.effect = MagicMock()
+        # Set defaults
+        note.effect.hammer = False
+        note.effect.palmMute = False
+        note.effect.vibrato = False
+        note.effect.letRing = False
+        note.effect.staccato = False
+        note.effect.ghostNote = False
+        note.effect.accentuatedNote = False
+        note.effect.slides = []
+        note.effect.bend = None
+        note.effect.harmonic = None
+        # Apply overrides
+        for k, v in effect_kwargs.items():
+            setattr(note.effect, k, v)
+        return note
+
+    def test_normal_note_returns_none(self):
+        note = self._make_note()
+        assert _extract_articulation(note) is None
+
+    def test_hammer_on(self):
+        note = self._make_note(hammer=True)
+        assert _extract_articulation(note) == "hammer_on"
+
+    def test_palm_mute(self):
+        note = self._make_note(palmMute=True)
+        assert _extract_articulation(note) == "palm_mute"
+
+    def test_vibrato(self):
+        note = self._make_note(vibrato=True)
+        assert _extract_articulation(note) == "vibrato"
+
+    def test_bend(self):
+        note = self._make_note(bend=object())  # non-None = bend present
+        assert _extract_articulation(note) == "bend"
+
+    def test_slide(self):
+        note = self._make_note(slides=[object()])  # non-empty list
+        assert _extract_articulation(note) == "slide"
+
+    def test_harmonic(self):
+        note = self._make_note(harmonic=object())  # non-None
+        assert _extract_articulation(note) == "harmonic"
+
+    def test_priority_harmonic_over_palm_mute(self):
+        """Harmonic takes priority over palm mute."""
+        note = self._make_note(harmonic=object(), palmMute=True)
+        assert _extract_articulation(note) == "harmonic"
+
+    def test_priority_palm_mute_over_bend(self):
+        """Palm mute takes priority over bend."""
+        note = self._make_note(palmMute=True, bend=object())
+        assert _extract_articulation(note) == "palm_mute"

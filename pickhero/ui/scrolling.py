@@ -675,6 +675,10 @@ class PlayingScreen:
             else:
                 color = dimmed(base_color) if past_hit_zone else base_color
 
+            # Palm mute: dim the note color to indicate muted technique
+            if note.expected_articulation == "palm_mute":
+                color = dimmed(color)
+
             rect = pygame.Rect(int(x), int(y), int(w), int(layout.note_h))
             pygame.draw.rect(surface, color, rect, border_radius=NOTE_CORNER_RADIUS)
             pygame.draw.rect(surface, t.note_border, rect, width=2, border_radius=NOTE_CORNER_RADIUS)
@@ -690,6 +694,25 @@ class PlayingScreen:
                 for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                     surface.blit(outline, (tx + dx, ty + dy))
                 surface.blit(fret_text, (tx, ty))
+
+            # Articulation icon: small letter on the right side of the note
+            if note.expected_articulation:
+                art_icons = {
+                    "hammer_on": "H",
+                    "pull_off": "P",
+                    "bend": "B",
+                    "vibrato": "V",
+                    "slide": "S",
+                    "palm_mute": "M",
+                    "harmonic": "*",
+                }
+                icon_char = art_icons.get(note.expected_articulation, "")
+                if icon_char and rect.width > 24:
+                    icon_font = _get_font("consolas", max(10, fret_font_size - 2))
+                    icon_text = _font_cache.render(icon_font, icon_char, True, t.hud_accent)
+                    ix = rect.right - icon_text.get_width() - 3
+                    iy = rect.y + rect.height // 2 - icon_text.get_height() // 2
+                    surface.blit(icon_text, (ix, iy))
 
             # Timing Judge: draw early/late indicator above the note
             if self._timing_judge and self._timing_overlay is not None:
@@ -797,6 +820,37 @@ class PlayingScreen:
             art_text = self._last_articulation.replace("_", " ").upper()
             art_surf = _font_cache.render(hint_font, art_text, True, t.hud_accent)
             surface.blit(art_surf, (12, 36))
+
+            # Vibrato: draw a cents deviation bar below the articulation label
+            if self._last_articulation == "vibrato" and self._audio_capture is not None:
+                freq, conf = self._audio_capture.get_tuner_data()
+                if freq > 0 and conf > 0.5:
+                    from pickhero.audio.note_utils import freq_to_midi, midi_to_freq
+                    midi = freq_to_midi(freq)
+                    target = midi_to_freq(midi)
+                    if target > 0:
+                        import math
+                        cents = 1200 * math.log2(freq / target)
+                        # Draw cents bar: -50 to +50 cents, 100px wide
+                        bar_w = 100
+                        bar_h = 6
+                        bar_x = 12
+                        bar_y = 54
+                        pygame.draw.rect(surface, t.signal_cold, (bar_x, bar_y, bar_w, bar_h))
+                        center_x = bar_x + bar_w // 2
+                        deviation = max(-25, min(25, int(cents)))
+                        fill_w = abs(deviation) * 2  # scale to bar
+                        if deviation >= 0:
+                            fill_color = t.tuner_in_tune
+                            pygame.draw.rect(surface, fill_color,
+                                           (center_x, bar_y, fill_w, bar_h))
+                        else:
+                            fill_color = t.tuner_close
+                            pygame.draw.rect(surface, fill_color,
+                                           (center_x - fill_w, bar_y, fill_w, bar_h))
+                        # Center line
+                        pygame.draw.line(surface, t.hud_text,
+                                        (center_x, bar_y - 1), (center_x, bar_y + bar_h + 1), 1)
 
         # Top-right: time
         current = format_time(self._playback_ms)
