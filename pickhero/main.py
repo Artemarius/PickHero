@@ -4,7 +4,6 @@ import argparse
 import sys
 from pathlib import Path
 
-from pickhero.audio.console import build_console_parser, options_from_args, run_console_test
 from pickhero.config import Config
 
 
@@ -20,6 +19,24 @@ def _resolve_songs_dir(config: Config) -> None:
         config.songs_dir = str(base_dir / songs_path)
 
 
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="pickhero", allow_abbrev=False)
+    parser.add_argument("--version", action="store_true", help="Show version and exit.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    console = subparsers.add_parser(
+        "console",
+        help="Run the audio input testing console.",
+        description="Audio input testing console for pitch, chord, and synth modes.",
+        allow_abbrev=False,
+    )
+    from pickhero.audio.console import build_console_parser
+
+    build_console_parser(console)
+
+    return parser
+
+
 def main():
     # Force X11 for stable rendering even on Wayland sessions. PyGame/SDL's
     # Wayland backend is currently unreliable here (tearing, input issues).
@@ -27,14 +44,7 @@ def main():
     if os.environ.get('WAYLAND_DISPLAY') and not os.environ.get('SDL_VIDEODRIVER'):
         os.environ['SDL_VIDEODRIVER'] = 'x11'
 
-    parser = argparse.ArgumentParser(prog="pickhero", allow_abbrev=False)
-    parser.add_argument("--version", action="store_true", help="Show version and exit.")
-    parser.add_argument(
-        "--console",
-        action="store_true",
-        help="Run the audio input testing console instead of the GUI.",
-    )
-    build_console_parser(parser)
+    parser = _build_parser()
     args = parser.parse_args()
 
     if args.version:
@@ -42,7 +52,9 @@ def main():
         print(f"PickHero {__version__}")
         sys.exit(0)
 
-    if args.console:
+    if args.command == "console":
+        from pickhero.audio.console import options_from_args, run_console_test
+
         try:
             run_console_test(options_from_args(args))
         except KeyboardInterrupt:

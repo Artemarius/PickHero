@@ -9,7 +9,7 @@ import pytest
 
 from pickhero.audio.console import (
     ConsoleOptions,
-    _parse_note_list,
+    _parse_notes,
     _run_synth_mode,
     _synthetic_signal,
     build_console_parser,
@@ -19,15 +19,34 @@ from pickhero.audio.detector import PitchDetector
 from pickhero.config import Config
 
 
-class TestNoteListParsing:
-    def test_parses_comma_separated_integers(self):
-        assert _parse_note_list("40,47") == [40, 47]
+class TestNoteParsing:
+    def test_parses_midi_numbers(self):
+        assert _parse_notes(["40", "47"]) == [40, 47]
 
-    def test_ignores_whitespace_and_empty_items(self):
-        assert _parse_note_list(" 40 , , 47 ") == [40, 47]
+    def test_parses_note_names(self):
+        assert _parse_notes(["E2", "B2"]) == [40, 47]
 
-    def test_returns_empty_for_empty_string(self):
-        assert _parse_note_list("") == []
+    def test_parses_sharp_names(self):
+        assert _parse_notes(["C#4"]) == [61]
+
+    def test_parses_flat_names(self):
+        assert _parse_notes(["Db4"]) == [61]
+
+    def test_parses_mixed_names_and_numbers(self):
+        assert _parse_notes(["E2", "47", "D3"]) == [40, 47, 50]
+
+    def test_parses_comma_separated_tokens(self):
+        assert _parse_notes(["E2,B2", "D3"]) == [40, 47, 50]
+
+    def test_ignores_whitespace(self):
+        assert _parse_notes(["  E2 ", " 47 "]) == [40, 47]
+
+    def test_returns_empty_for_empty_list(self):
+        assert _parse_notes([]) == []
+
+    def test_raises_on_invalid_note(self):
+        with pytest.raises(ValueError, match="Invalid note"):
+            _parse_notes(["X9"])
 
 
 class TestSyntheticSignal:
@@ -69,25 +88,40 @@ class TestSyntheticSignal:
 
 
 class TestArgumentParsing:
-    def test_build_and_parse_defaults(self):
+    def _parse(self, *argv: str) -> ConsoleOptions:
         parser = argparse.ArgumentParser(allow_abbrev=False)
         build_console_parser(parser)
-        args = parser.parse_args([])
-        opts = options_from_args(args)
+        return options_from_args(parser.parse_args(list(argv)))
+
+    def test_defaults_to_pitch_mode(self):
+        opts = self._parse()
         assert opts.mode == "pitch"
         assert opts.target_notes == []
         assert opts.synth_duration_ms == 2000.0
         assert opts.noise_gate_db == -60.0
+        assert opts.sample_rate == 48000
 
-    def test_parse_synth_mode_with_notes(self):
-        parser = argparse.ArgumentParser(allow_abbrev=False)
-        build_console_parser(parser)
-        args = parser.parse_args([
-            "--console-mode", "synth",
-            "--console-notes", "40,47",
-            "--console-duration", "500",
-            "--console-gate", "-50",
-        ])
+    def test_explicit_mode_with_note_names(self):
+        opts = self._parse("chord", "E2", "A2", "D3")
+        assert opts.mode == "chord"
+        assert opts.target_notes == [40, 45, 50]
+
+    def test_synth_mode_with_notes_and_options(self):
+        opts = self._parse("synth", "E2,B2", "--duration", "500", "--gate", "-50")
+        assert opts.mode == "synth"
+        assert opts.target_notes == [40, 47]
+        assert opts.synth_duration_ms == 500.0
+        assert opts.noise_gate_db == -50.0
+
+    def test_short_flags(self):
+        opts = self._parse("pitch", "-d", "2", "-r", "44100", "-g", "-45")
+        assert opts.device_index == 2
+        assert opts.sample_rate == 44100
+        assert opts.noise_gate_db == -45.0
+
+    def test_mixed_notes_and_numbers(self):
+        opts = self._parse("synth", "E2", "47", "D3")
+        assert opts.target_notes == [40, 47, 50]
 
 
 class TestSynthModeOutput:
@@ -107,5 +141,43 @@ class TestSynthModeOutput:
 
         text = out.getvalue()
         assert "Synthetic signal" in text
-        assert "MIDI [40]" in text
-        assert "Chord present" in text
+        assert "E2" in text
+        assert "Chord verification" in text
+        assert "yes" in text  # E2 should be detected as present
+
+    def test_synth_mode_with_note_name_in_output(self):
+        opts = ConsoleOptions(
+            mode="synth",
+            device_index=None,
+            sample_rate=48000,
+            target_notes=[64],  # E4
+            synth_duration_ms=500.0,
+            noise_gate_db=-80.0,
+        )
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            _run_synth_mode(opts)
+
+        text = out.getvalue()
+        assert "E4" in text
+
+
+class TestListMode:
+    def test_list_mode_runs_without_error(self, monkeypatch):
+        """List mode should call _print_device_list without crashing."""
+        from pickhero.audio import console
+
+        called = []
+        monkeypatch.setattr(console, "_print_device_list", lambda: called.append(True))
+
+        opts = ConsoleOptions(
+            mode="list",
+            device_index=None,
+            sample_rate=48000,
+            target_notes=[],
+            synth_duration_ms=2000.0,
+            noise_gate_db=-60.0,
+        )
+        console._run_list_mode(opts)
+        assert called == [True]

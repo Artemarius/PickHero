@@ -90,7 +90,7 @@ pickhero/
 │   ├── __init__.py
 │   ├── input.py
 │   ├── detector.py
-│   ├── console.py       # audio input testing console (pitch/chord/synth modes)
+│   ├── console.py       # audio testing console (pitch/chord/synth/list subcommands)
 │   ├── midi_playback.py
 │   └── note_utils.py
 ├── tabs/
@@ -124,11 +124,16 @@ pickhero/
 pip install -r requirements.txt
 python -m pickhero
 
+# Audio testing console (no GUI)
+python -m pickhero console                    # live pitch detection
+python -m pickhero console list               # list audio input devices
+python -m pickhero console chord E2 A2 D3     # FFT chord verification
+python -m pickhero console synth E2 A2 D3    # synthetic signal test
+
 # Package for distribution
 pip install pyinstaller
 pyinstaller pickhero.spec --noconfirm
 # Or use build.bat on Windows
-```
 
 ## What NOT To Do
 

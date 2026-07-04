@@ -139,7 +139,15 @@ PickHero/
 - In Windows: `Settings > System > Sound > Input` — select "USB Audio" and check the volume slider isn't at zero. You should see the input meter move when you strum.
 
 **Testing your setup:**
-Run `python -m pickhero --console` to see detected notes printed live in the terminal. This helps isolate whether the issue is hardware (no signal) or software (signal present but not matching).
+Run `python -m pickhero console` to see detected notes printed live in the terminal. This helps isolate whether the issue is hardware (no signal) or software (signal present but not matching).
+
+The console has four modes:
+- `python -m pickhero console` — live pitch detection (default)
+- `python -m pickhero console list` — list available audio input devices
+- `python -m pickhero console chord E2 A2 D3` — FFT-based chord verification for the given notes
+- `python -m pickhero console synth E2 A2 D3` — run detection on a synthetic signal (no audio device needed)
+
+Notes can be given as names (`E2`, `C#4`, `Db4`) or MIDI numbers (`40`, `61`). Common options: `-d INDEX` (device), `-r SR` (sample rate), `-g DB` (noise gate), `--duration MS` (synth signal length). Run `python -m pickhero console --help` for details.
 
 **Audio detection not working in-game:**
 - Audio detection is enabled by default. If you turned it off, press **A** during playback to re-enable it. The bottom status bar should show `A: audio ON`.
