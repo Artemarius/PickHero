@@ -68,6 +68,7 @@ class TimingObservation:
     measure: int
     confidence: float
     pitch_verdict: PitchVerdict = PitchVerdict.UNKNOWN
+    articulation: str | None = None  # detected articulation (hammer_on, pull_off, etc.)
 
 
 @dataclass
@@ -98,6 +99,8 @@ class TimingStats:
     per_measure: dict[int, MeasureTimingStats] = field(default_factory=dict)
     histogram_bins: list[int] = field(default_factory=list)
     histogram_range_ms: float = HISTOGRAM_RANGE_MS
+    timing_slope_ms_per_measure: float = 0.0
+    trend: str = "stable"  # "rushing", "dragging", "fatiguing", "improving", "stable"
 
 
 def classify_timing_error(error_ms: float) -> TimingVerdict:
@@ -210,5 +213,34 @@ def compute_stats(observations: list[TimingObservation]) -> TimingStats:
             elif v == TimingVerdict.MISSED:
                 ms.missed_count += 1
         stats.per_measure[measure_idx] = ms
+
+    # Timing trend: linear regression of error vs measure index
+    trend_points = [
+        (o.measure, o.timing_error_ms)
+        for o in observations
+        if o.verdict not in (TimingVerdict.MISSED, TimingVerdict.EXTRA)
+        and not math.isnan(o.timing_error_ms)
+        and o.measure >= 0
+    ]
+    if len(trend_points) >= 3:
+        n = len(trend_points)
+        sum_x = sum(x for x, _ in trend_points)
+        sum_y = sum(y for _, y in trend_points)
+        sum_xy = sum(x * y for x, y in trend_points)
+        sum_x2 = sum(x * x for x, _ in trend_points)
+        denom = n * sum_x2 - sum_x * sum_x
+        if denom != 0:
+            slope = (n * sum_xy - sum_x * sum_y) / denom
+            stats.timing_slope_ms_per_measure = slope
+            if slope < -0.5:
+                stats.trend = "improving"
+            elif slope > 0.5:
+                stats.trend = "fatiguing"
+            elif stats.mean_error_ms < -10:
+                stats.trend = "rushing"
+            elif stats.mean_error_ms > 10:
+                stats.trend = "dragging"
+            else:
+                stats.trend = "stable"
 
     return stats

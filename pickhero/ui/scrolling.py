@@ -178,6 +178,16 @@ class PlayingScreen:
         self._timing_summary = None
         self._timing_worst_measures: list[tuple[int, float, float]] = []
 
+        # Guided practice
+        self._guided_practice: bool = False
+        self._guided_loop_count: int = 0
+        self._guided_target_accuracy: float = 90.0
+        self._guided_consecutive_successes: int = 0
+        self._guided_start_tempo: float = 0.0
+
+        # Last detected articulation (for HUD display)
+        self._last_articulation: str | None = None
+
     def _note_passes_filter(self, note: NoteEvent) -> bool:
         """Check if a note passes the difficulty filter."""
         if note.fret > self._max_fret:
@@ -203,6 +213,7 @@ class PlayingScreen:
             self._timing_summary = None
             self._timing_worst_measures = []
             self._last_obs_count = 0
+            self._last_articulation = None
             if self._matcher:
                 self._matcher.reset()
             self._feedback.reset()
@@ -219,14 +230,8 @@ class PlayingScreen:
             self._timing_summary = None
             self._timing_worst_measures = []
             self._last_obs_count = 0
-        elif self._playback_ms == 0.0 and not self._playing and self._count_in_ms > 0:
-            # Starting from the very beginning — add count-in
-            self._playback_ms = -self._count_in_ms
-            self._last_count_in_beat = -1
-            self._song_completed = False
-            self._is_new_best = False
-            self._weakest_sections = []
-            self._recommendations = []
+            self._last_articulation = None
+
         self._playing = not self._playing
         if self._playing:
             self._last_tick = time.perf_counter()
@@ -382,6 +387,22 @@ class PlayingScreen:
                     self._audio_capture.chord_detector,
                 ))
             self._feedback.add_results(results, self._playback_ms)
+
+            # Track last detected articulation for HUD display.
+            # Clear if an onset fires without articulation detected.
+            new_articulation = None
+            has_onset = False
+            for d in detected:
+                if d.note.is_onset:
+                    has_onset = True
+                if d.note.articulation:
+                    new_articulation = d.note.articulation
+                    break
+            if new_articulation:
+                self._last_articulation = new_articulation
+            elif has_onset:
+                self._last_articulation = None
+
             self._feedback.cleanup(self._playback_ms)
 
             # Feed timing observations to the overlay (delta since last frame)
@@ -422,6 +443,23 @@ class PlayingScreen:
             if self._audio_enabled and self._playing:
                 self._stop_audio()
                 self._start_audio()
+
+            # Guided practice auto-progression
+            if self._guided_practice and self._matcher is not None:
+                stats = self._matcher.get_statistics()
+                section_acc = stats.get("accuracy_percent", 0.0)
+                self._guided_loop_count += 1
+                if section_acc >= self._guided_target_accuracy:
+                    self._guided_consecutive_successes += 1
+                    if self._guided_consecutive_successes >= 3:
+                        # Auto-increase tempo
+                        new_factor = min(1.0, self._tempo_factor + 0.05)
+                        self.set_tempo_factor(new_factor)
+                        self._guided_consecutive_successes = 0
+                else:
+                    self._guided_consecutive_successes = 0
+                    if section_acc < 60.0 and self._tempo_factor > 0.5:
+                        self.set_tempo_factor(max(0.5, self._tempo_factor - 0.05))
             return
 
         if self._playback_ms >= self._timeline.duration_ms:
@@ -445,6 +483,7 @@ class PlayingScreen:
                             self._progress_tracker.record_detailed_result(
                                 self._song_key, stats,
                                 weakest, self._tempo_factor,
+                                song_bpm=getattr(self._timeline.metadata, 'tempo', 0) or 0,
                             )
                         )
                         self._weakest_sections = weakest
@@ -511,17 +550,16 @@ class PlayingScreen:
             self._toggle_chord_mode()
         elif event.key == pygame.K_l:
             self._loop_weakest_section()
-        elif event.key == pygame.K_h:
-            self._show_help = not self._show_help
+        elif event.key == pygame.K_k:
+            self._toggle_pitch_strict()
+        elif event.key == pygame.K_g:
+            self._toggle_guided_practice()
         elif event.key == pygame.K_w:
             self._toggle_wait_mode()
         elif event.key == pygame.K_j:
             self._toggle_timing_judge()
-        elif event.key == pygame.K_k:
-            self._toggle_pitch_strict()
         elif event.key == pygame.K_TAB:
             return "next_track"
-
         return None
 
     def render(self, surface: pygame.Surface) -> None:
@@ -743,6 +781,23 @@ class PlayingScreen:
             if self._pitch_strict:
                 ps_surf = _font_cache.render(hint_font, "STRICT PITCH", True, t.feedback_close)
                 surface.blit(ps_surf, (w // 2 - ps_surf.get_width() // 2, tj_y))
+
+        # Guided practice HUD
+        if self._guided_practice:
+            gp_text = (
+                f"GUIDED PRACTICE  |  Loop: {self._guided_loop_count}  "
+                f"Streak: {self._guided_consecutive_successes}/3  "
+                f"Tempo: {int(self._tempo_factor * 100)}%"
+            )
+            gp_surf = _font_cache.render(hint_font, gp_text, True, t.hud_accent)
+            surface.blit(gp_surf, (w // 2 - gp_surf.get_width() // 2, 56))
+
+        # Articulation indicator (top-left, below title)
+        if self._last_articulation:
+            art_text = self._last_articulation.replace("_", " ").upper()
+            art_surf = _font_cache.render(hint_font, art_text, True, t.hud_accent)
+            surface.blit(art_surf, (12, 36))
+
         # Top-right: time
         current = format_time(self._playback_ms)
         total = format_time(self._timeline.duration_ms)
@@ -766,10 +821,23 @@ class PlayingScreen:
             if self._audio_capture is not None:
                 self._draw_signal_meter(surface, hint_font, w, stats_bottom_y + 18)
                 self._draw_tuner(surface, hint_font, w, stats_bottom_y + 36)
+                # XRun counter: show if any audio dropouts occurred
+                if self._audio_capture is not None:
+                    xruns = self._audio_capture.get_xrun_count()
+                    if xruns > 0:
+                        xrun_text = f"XRuns: {xruns}"
+                        xrun_surf = _font_cache.render(hint_font, xrun_text, True, t.feedback_miss)
+                        surface.blit(xrun_surf, (w - xrun_surf.get_width() - 12, stats_bottom_y + 54))
         elif self._audio_capture is not None:
             # Audio off but capture exists — still show meter and tuner
             self._draw_signal_meter(surface, hint_font, w, stats_bottom_y)
             self._draw_tuner(surface, hint_font, w, stats_bottom_y + 18)
+            # XRun counter also shown when audio is off
+            xruns = self._audio_capture.get_xrun_count()
+            if xruns > 0:
+                xrun_text = f"XRuns: {xruns}"
+                xrun_surf = _font_cache.render(hint_font, xrun_text, True, t.feedback_miss)
+                surface.blit(xrun_surf, (w - xrun_surf.get_width() - 12, stats_bottom_y + 36))
 
         # Bottom-center: play state + controls
         if self._playback_ms < 0:
@@ -803,7 +871,7 @@ class PlayingScreen:
             f"{backing_state}"
             f"{wait_state}"
             f"{timing_state}"
-            f"|  I/O: loop {loop_state}  |  P: toggle  |  ESC: menu"
+            f"|  I/O: loop {loop_state}  |  P: toggle  |  G: guided  |  ESC: menu"
         )
         hint_surf = _font_cache.render(hint_font, hint, True, t.hud_text)
         y = layout.screen_h - LANE_BOTTOM_MARGIN + 8
@@ -1151,6 +1219,33 @@ class PlayingScreen:
                 worst_surf = _font_cache.render(small_font, line, True, worst_color)
                 surface.blit(worst_surf, (panel_x, panel_y))
                 panel_y += 18
+
+        # Timing trend
+        if stats.timing_slope_ms_per_measure != 0.0:
+            trend_text = f"Trend: {stats.trend} ({stats.timing_slope_ms_per_measure:+.2f} ms/measure)"
+            trend_color = t.timing_on_time if stats.trend in ("stable", "improving") else t.feedback_close
+            trend_surf = _font_cache.render(small_font, trend_text, True, trend_color)
+            surface.blit(trend_surf, (panel_x, panel_y))
+            panel_y += 18
+
+        # Articulation summary
+        if self._timing_judge and self._matcher is not None:
+            observations = self._matcher.get_timing_observations()
+            art_counts: dict[str, int] = {}
+            for obs in observations:
+                if obs.articulation:
+                    art_counts[obs.articulation] = art_counts.get(obs.articulation, 0) + 1
+            if art_counts:
+                art_label = _font_cache.render(small_font, "Articulations:", True, t.hud_accent)
+                surface.blit(art_label, (panel_x, panel_y))
+                panel_y += 18
+                for art_name, count in sorted(art_counts.items()):
+                    display = art_name.replace("_", " ").title()
+                    line = f"  {display}: {count}"
+                    art_surf = _font_cache.render(small_font, line, True, t.hud_text)
+                    surface.blit(art_surf, (panel_x, panel_y))
+                    panel_y += 16
+
     def _draw_help_overlay(self, surface: pygame.Surface, layout: _Layout) -> None:
         """Draw a help overlay explaining the track, note colors, and controls."""
         t = get_theme()
@@ -1365,6 +1460,44 @@ class PlayingScreen:
         self._config.save()
         if self._matcher:
             self._matcher.pitch_strict = self._pitch_strict
+
+    def _toggle_guided_practice(self) -> None:
+        """Toggle guided practice mode on/off."""
+        if not self._song_completed and not self._weakest_sections:
+            # Need a completed run to know the weakest section
+            return
+        self._guided_practice = not self._guided_practice
+        if self._guided_practice:
+            self._start_guided_practice()
+
+    def _start_guided_practice(self) -> None:
+        """Start guided practice: loop weakest section at reduced tempo."""
+        weak = getattr(self, "_weakest_sections", [])
+        if not weak:
+            return
+        section = weak[0]
+        start_measure, end_measure = section[0], section[1]
+        measures = self._timeline.measures
+        if not measures or start_measure >= len(measures):
+            return
+        # Set loop markers
+        start_ms = measures[start_measure].start_ms
+        end_idx = min(end_measure + 1, len(measures) - 1)
+        end_ms = measures[end_idx].end_ms if end_idx < len(measures) else self._timeline.duration_ms
+        self._loop_start_ms = start_ms
+        self._loop_end_ms = end_ms
+        self._loop_enabled = True
+        self._song_completed = False
+        # Set tempo to 50% or cliff_bpm - 10 if available
+        cliff = getattr(self, '_guided_cliff_bpm', None)
+        if cliff and self._timeline.metadata.tempo > 0:
+            target_factor = max(0.5, min(1.0, (cliff - 10) / self._timeline.metadata.tempo))
+        else:
+            target_factor = 0.5
+        self.set_tempo_factor(target_factor)
+        self._guided_consecutive_successes = 0
+        self._guided_loop_count = 0
+        self.seek(start_ms)
 
     def _loop_weakest_section(self) -> None:
         """Set loop to weakest section from completion screen.

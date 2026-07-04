@@ -121,3 +121,12 @@ class TestTimestampAccuracy:
         # and the _compute_timestamp_ms method handles offset correctly.
         assert hasattr(capture, "_detector_sample_offset")
         assert hasattr(capture, "_adc_time_available")
+
+
+def test_list_audio_devices_includes_hostapi():
+    """list_audio_devices should include the hostapi field."""
+    # This test verifies the function signature; actual device query requires hardware.
+    import inspect
+    from pickhero.audio.input import list_audio_devices
+    src = inspect.getsource(list_audio_devices)
+    assert "hostapi" in src

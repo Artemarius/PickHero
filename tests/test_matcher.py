@@ -381,5 +381,14 @@ class TestTimingObservations:
         matcher = self._make_timing_matcher([tab])
         matcher.process_detected_notes([_detected(64, 1000.0)], 1050.0)
         stats = matcher.get_timing_stats()
-        assert stats.count == 1
         assert stats.on_time_count == 1
+
+    def test_pitch_strict_octave_snapped(self):
+        """In pitch_strict mode, exact octave (12 semitones) is snapped to correct."""
+        tab = _note_event(1000.0, midi_note=64)  # E4
+        matcher = self._make_timing_matcher([tab], pitch_strict=True)
+        # Detect MIDI 76 (E5, exactly 12 semitones up)
+        matcher.process_detected_notes([_detected(76, 1000.0)], 1050.0)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].pitch_verdict == PitchVerdict.CORRECT

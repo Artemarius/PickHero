@@ -243,3 +243,25 @@ class TestComputeStats:
         stats = compute_stats(obs)
         assert 0 in stats.per_measure
         assert -1 not in stats.per_measure
+
+
+class TestTimingTrend:
+    """Test timing trend analysis."""
+
+    def test_trend_rushing(self):
+        """All-early observations produce 'rushing' trend."""
+        obs = [_obs(-30.0, measure=0), _obs(-30.0, measure=1), _obs(-30.0, measure=2)]
+        stats = compute_stats(obs)
+        assert stats.trend == "rushing"
+
+    def test_trend_fatiguing(self):
+        """Errors increasing over measures produce 'fatiguing' trend."""
+        obs = [_obs(-20.0, measure=0), _obs(0.0, measure=1), _obs(20.0, measure=2)]
+        stats = compute_stats(obs)
+        assert stats.trend == "fatiguing"
+
+    def test_trend_stable(self):
+        """Consistent on-time observations produce 'stable' trend."""
+        obs = [_obs(1.0, measure=0), _obs(0.0, measure=1), _obs(1.0, measure=2)]
+        stats = compute_stats(obs)
+        assert stats.trend == "stable"

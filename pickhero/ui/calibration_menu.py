@@ -49,7 +49,7 @@ class CalibrationMenuScreen:
     def __init__(self, config: Config):
         self._config = config
         self._capture: AudioCapture | None = None
-        self._state = "intro"  # intro, noise, waiting, listen, confirm, done
+        self._state = "intro"  # intro, noise, waiting, listen, confirm, done, latency_intro, latency_measure, latency_result
         self._string_idx = 0  # index into STRING_ORDER
         self._start_time: float = 0.0
         self._waiting_start: float = 0.0
@@ -63,6 +63,13 @@ class CalibrationMenuScreen:
 
         # Results per string number
         self._results: dict[int, StringCalibration] = {}
+
+        # Latency calibration
+        self._latency_offsets: list[float] = []
+        self._latency_flash_time: float = 0.0
+        self._latency_round: int = 0
+        self._latency_result_ms: float = 0.0
+        self._latency_waiting_for_note: bool = False
 
     @property
     def _current_string(self) -> int:
@@ -88,6 +95,19 @@ class CalibrationMenuScreen:
             if event.key == pygame.K_RETURN:
                 self._start_capture()
                 self._begin_noise()
+            elif event.key == pygame.K_y:
+                self._state = "latency_intro"
+            return None
+
+        if self._state == "latency_intro":
+            if event.key == pygame.K_RETURN:
+                self._start_capture()
+                self._begin_latency_measure()
+            return None
+
+        if self._state == "latency_result":
+            if event.key == pygame.K_RETURN:
+                self._state = "intro"
             return None
 
         if self._state == "confirm":
@@ -146,6 +166,9 @@ class CalibrationMenuScreen:
             if elapsed >= COLLECT_SECONDS:
                 self._finish_listen()
 
+        elif self._state == "latency_measure":
+            self._update_latency_measure()
+
     def render(self, surface: pygame.Surface) -> None:
         """Draw the calibration screen."""
         t = get_theme()
@@ -169,7 +192,7 @@ class CalibrationMenuScreen:
             self._render_centered(surface, body_font,
                                   "Play each open string when prompted.", t.hud_text, cy + 32)
             self._render_centered(surface, hint_font,
-                                  "ENTER: begin  |  ESC: cancel", t.hud_text, h - 36)
+                                  "ENTER: begin  |  Y: latency calibration  |  ESC: cancel", t.hud_text, h - 36)
 
         elif self._state == "noise":
             self._render_centered(surface, body_font,
@@ -248,6 +271,49 @@ class CalibrationMenuScreen:
                                       "Try again — play louder or check your cable.", t.hud_text, cy + 40)
             self._render_centered(surface, hint_font,
                                   "ENTER: accept  |  R: retry  |  ESC: cancel", t.hud_text, h - 36)
+
+        elif self._state == "latency_intro":
+            self._render_centered(surface, body_font,
+                                  "Latency Calibration", t.hud_accent, cy - 40)
+            self._render_centered(surface, body_font,
+                                  "Play any note when the screen flashes.", t.hud_text, cy)
+            self._render_centered(surface, body_font,
+                                  f"5 rounds will measure your audio latency.", t.hud_text, cy + 32)
+            current_offset = getattr(self._config, 'audio_latency_offset_ms', 0.0)
+            if current_offset:
+                self._render_centered(surface, hint_font,
+                                      f"Current offset: {current_offset:.0f} ms", t.hud_text, cy + 70)
+            self._render_centered(surface, hint_font,
+                                  "ENTER: begin  |  ESC: cancel", t.hud_text, h - 36)
+
+        elif self._state == "latency_measure":
+            round_num = min(self._latency_round + 1, 5)
+            self._render_centered(surface, body_font,
+                                  f"Latency Calibration  ({round_num}/5)", t.hud_accent, cy - 40)
+            if self._latency_waiting_for_note:
+                # Flash the screen
+                flash_elapsed = time.perf_counter() - self._latency_flash_time
+                if flash_elapsed < 0.3:
+                    pygame.draw.rect(surface, t.hud_accent, (0, 0, w, h))
+                self._render_centered(surface, big_font,
+                                      "PLAY NOW!", t.feedback_miss, cy + 20)
+            else:
+                self._render_centered(surface, body_font,
+                                      "Get ready...", t.hud_text, cy + 20)
+            self._render_centered(surface, hint_font,
+                                  "ESC: cancel", t.hud_text, h - 36)
+
+        elif self._state == "latency_result":
+            self._render_centered(surface, big_font,
+                                  "Latency Calibration Complete", t.hud_accent, cy - 40)
+            self._render_centered(surface, body_font,
+                                  f"Measured latency: {self._latency_result_ms:.0f} ms",
+                                  t.hud_accent, cy + 20)
+            self._render_centered(surface, hint_font,
+                                  f"(median of {len(self._latency_offsets)} rounds)",
+                                  t.hud_text, cy + 55)
+            self._render_centered(surface, hint_font,
+                                  "ENTER: save and return  |  ESC: discard", t.hud_text, h - 36)
 
         elif self._state == "done":
             self._render_centered(surface, big_font,
@@ -340,3 +406,70 @@ class CalibrationMenuScreen:
         # If no samples were collected, _results won't have an entry for this string
 
         self._state = "confirm"
+
+    # -- Latency calibration --
+
+    LATENCY_ROUNDS = 5
+    _LATENCY_FLASH_DELAY = 1.5  # seconds before flash
+    _LATENCY_NOTE_WINDOW = 2.0  # seconds to wait for note
+
+    def _begin_latency_measure(self) -> None:
+        """Start latency measurement rounds."""
+        self._latency_offsets = []
+        self._latency_round = 0
+        self._latency_waiting_for_note = False
+        self._state = "latency_measure"
+        self._start_time = time.perf_counter()
+
+    def _update_latency_measure(self) -> None:
+        """Drive the latency measurement state machine."""
+        if self._capture is None:
+            return
+
+        elapsed = time.perf_counter() - self._start_time
+
+        if not self._latency_waiting_for_note:
+            # Wait for the flash delay, then flash
+            if elapsed >= self._LATENCY_FLASH_DELAY:
+                self._latency_flash_time = time.perf_counter()
+                self._latency_waiting_for_note = True
+                self._start_time = time.perf_counter()
+                # Drain any stale notes
+                self._capture.get_notes()
+            return
+
+        # Waiting for note onset
+        note_elapsed = time.perf_counter() - self._latency_flash_time
+        if note_elapsed > self._LATENCY_NOTE_WINDOW:
+            # Timeout — skip this round
+            self._latency_round += 1
+            if self._latency_round >= self.LATENCY_ROUNDS:
+                self._finish_latency_measure()
+            else:
+                self._latency_waiting_for_note = False
+                self._start_time = time.perf_counter()
+            return
+
+        # Check for detected note onset
+        notes = self._capture.get_notes()
+        if notes:
+            # Use the first detected note's timestamp
+            onset_ms = notes[0].timestamp_ms
+            flash_ms = self._latency_flash_time * 1000.0
+            offset_ms = onset_ms - flash_ms
+            self._latency_offsets.append(offset_ms)
+            self._latency_round += 1
+            if self._latency_round >= self.LATENCY_ROUNDS:
+                self._finish_latency_measure()
+            else:
+                self._latency_waiting_for_note = False
+                self._start_time = time.perf_counter()
+
+    def _finish_latency_measure(self) -> None:
+        """Compute median latency and store result."""
+        self._stop_capture()
+        if self._latency_offsets:
+            self._latency_result_ms = statistics.median(self._latency_offsets)
+            self._config.audio_latency_offset_ms = round(self._latency_result_ms, 1)
+            self._config.save()
+        self._state = "latency_result"

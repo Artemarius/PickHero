@@ -6,6 +6,7 @@ Detected notes are pushed to a thread-safe queue for consumption by the main thr
 
 import queue
 import time
+import sys
 from dataclasses import dataclass
 
 import numpy as np
@@ -55,13 +56,14 @@ class AudioCapture:
         self.chord_detector = ChordDetector(sample_rate=ac.sample_rate)
         # Absolute sample offset consumed by the detector (advances by hop per process() call)
         self._detector_sample_offset: int = 0
-        # Whether time_info.inputBufferAdcTime is available on this backend
         self._adc_time_available: bool | None = None
+        self._xrun_count: int = 0
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
         """Sounddevice callback — runs in audio thread."""
         if status:
-            # Overflow or other issue — skip this buffer
+            # Overflow or other issue — count and skip this buffer
+            self._xrun_count += 1
             return
 
         # indata shape: (frames, channels) — take first channel
@@ -205,16 +207,40 @@ class AudioCapture:
         # Reset timing state — detector was recreated, so sample offsets restart at 0
         self._detector_sample_offset = 0
         self._adc_time_available = None
+        self._xrun_count = 0
         # _start_time will be set on first callback from time_info.inputBufferAdcTime
         self._start_time = 0.0
-        self._stream = sd.InputStream(
-            device=resolved,
-            channels=1,
-            samplerate=ac.sample_rate,
-            blocksize=ac.hop_size,
-            dtype="float32",
-            callback=self._audio_callback,
-        )
+        # Low-latency mode: uses default_low_input_latency (~9ms vs ~35ms default_high).
+        # On Windows, request WASAPI exclusive mode for ~3ms hardware latency.
+        extra = None
+        if sys.platform == 'win32':
+            try:
+                extra = sd.WasapiSettings(exclusive=True)
+            except (AttributeError, Exception):
+                pass
+
+        try:
+            self._stream = sd.InputStream(
+                device=resolved,
+                channels=1,
+                samplerate=ac.sample_rate,
+                blocksize=ac.hop_size,
+                dtype="float32",
+                latency='low',
+                extra_settings=extra,
+                callback=self._audio_callback,
+            )
+        except sd.PortAudioError:
+            # Device doesn't support latency='low' — retry with default latency
+            self._stream = sd.InputStream(
+                device=resolved,
+                channels=1,
+                samplerate=ac.sample_rate,
+                blocksize=ac.hop_size,
+                dtype="float32",
+                extra_settings=extra,
+                callback=self._audio_callback,
+            )
         self._stream.start()
 
     def stop(self):
@@ -239,6 +265,10 @@ class AudioCapture:
         """Return (frequency_hz, confidence) for tuner display. Thread-safe."""
         return (self._tuner_freq, self._tuner_confidence)
 
+    def get_xrun_count(self) -> int:
+        """Return the number of buffer overflows since start. Thread-safe."""
+        return self._xrun_count
+
     def get_notes(self) -> list[TimestampedNote]:
         """Drain all pending detected notes from the queue (non-blocking)."""
         notes = []
@@ -253,14 +283,17 @@ class AudioCapture:
 def list_audio_devices() -> list[dict]:
     """List available audio input devices."""
     devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
     inputs = []
     for i, dev in enumerate(devices):
         if dev["max_input_channels"] > 0:
+            api_name = hostapis[dev["hostapi"]]["name"] if dev["hostapi"] < len(hostapis) else "?"
             inputs.append({
                 "index": i,
                 "name": dev["name"],
                 "channels": dev["max_input_channels"],
                 "sample_rate": dev["default_samplerate"],
+                "hostapi": api_name,
             })
     return inputs
 

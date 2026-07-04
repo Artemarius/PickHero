@@ -261,6 +261,7 @@ class NoteMatcher:
                         measure=measure,
                         confidence=ts_note.note.confidence,
                         pitch_verdict=PitchVerdict.UNKNOWN,
+                        articulation=ts_note.note.articulation,
                     ))
                 continue
 
@@ -283,6 +284,10 @@ class NoteMatcher:
             if best is None or best_dist is None:
                 continue
 
+            # Tab-guided octave correction: in strict mode, an exact octave
+            # (12 semitones) means the fundamental was detected as a harmonic — snap to correct.
+            if self._pitch_strict and best_dist == 12:
+                best_dist = 0
             # Classify match
             if best_dist == 0:
                 match_type = MatchType.HIT
@@ -302,6 +307,7 @@ class NoteMatcher:
                         measure=best.measure,
                         confidence=ts_note.note.confidence,
                         pitch_verdict=pitch_v,
+                        articulation=ts_note.note.articulation,
                     ))
                 continue
 
@@ -320,6 +326,7 @@ class NoteMatcher:
                     measure=best.measure,
                     confidence=ts_note.note.confidence,
                     pitch_verdict=pitch_v,
+                    articulation=ts_note.note.articulation,
                 ))
 
             # Chord handling

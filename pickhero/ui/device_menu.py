@@ -161,7 +161,7 @@ class DeviceMenuScreen:
         items: list[tuple[str, bool]] = []
         items.append(("System Default", current_device_index is None))
         for dev in self._devices:
-            label = f"[{dev['index']}] {dev['name']}  ({dev['sample_rate']:.0f} Hz)"
+            label = f"[{dev['index']}] {dev['name']}  ({dev['sample_rate']:.0f} Hz, {dev.get('hostapi', '?')})"
             is_active = dev["index"] == current_device_index
             items.append((label, is_active))
 

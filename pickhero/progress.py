@@ -32,6 +32,15 @@ class SongRecord:
     # Each entry: {"attempt": N, "tempo_factor": float, "accuracy": float}
     tempo_history: list[dict] = field(default_factory=list)
 
+    # SM-2 spaced repetition state
+    review_ease_factor: float = 2.5
+    review_interval_days: int = 0
+    review_repetitions: int = 0
+    review_next_due: str = ""  # ISO datetime
+
+    # Detected tempo where accuracy drops sharply
+    cliff_bpm: float | None = None
+
 
 class ProgressTracker:
     """Loads and saves per-song progress data."""
@@ -63,6 +72,7 @@ class ProgressTracker:
         stats: dict,
         weakest_sections: list[tuple[int, int, float]],
         tempo_factor: float,
+        song_bpm: int = 0,
     ) -> tuple[bool, list[str]]:
         """Record a completed attempt with section-level detail.
 
@@ -106,6 +116,25 @@ class ProgressTracker:
             record.section_history = record.section_history[-50:]
         if len(record.tempo_history) > 50:
             record.tempo_history = record.tempo_history[-50:]
+
+        # Update spaced-repetition review state
+        from pickhero.scheduler import ReviewState, update_review
+        review_state = ReviewState(
+            ease_factor=record.review_ease_factor,
+            interval_days=record.review_interval_days,
+            repetitions=record.review_repetitions,
+            next_review=record.review_next_due,
+        )
+        new_review = update_review(review_state, accuracy)
+        record.review_ease_factor = new_review.ease_factor
+        record.review_interval_days = new_review.interval_days
+        record.review_repetitions = new_review.repetitions
+        record.review_next_due = new_review.next_review
+
+        # Detect tempo cliff if BPM is available
+        if song_bpm > 0:
+            from pickhero.recommendations import detect_cliff
+            record.cliff_bpm = detect_cliff(record, song_bpm)
 
         self._save()
 

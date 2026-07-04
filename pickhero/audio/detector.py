@@ -10,6 +10,7 @@ import aubio
 import numpy as np
 
 from pickhero.audio.note_utils import freq_to_midi, midi_to_name, is_in_guitar_range
+from pickhero.audio.articulation import ArticulationDetector
 
 
 @dataclass
@@ -21,6 +22,7 @@ class DetectedNote:
     name: str
     is_onset: bool  # True if a new note strike was detected
     onset_sample: int | None = None  # absolute sample position of onset (from aubio get_last)
+    articulation: str | None = None  # "hammer_on", "pull_off", "bend", "vibrato", "slide", "palm_mute", "harmonic"
 
 
 class PitchDetector:
@@ -52,16 +54,21 @@ class PitchDetector:
 
         # Octave jump protection
         self._prev_freq: float = 0.0
+        self._freq_history: list[float] = []
         self._calibration = calibration
 
-        # Pitch detector (YIN algorithm)
-        self._pitch = aubio.pitch("yin", buf_size, hop_size, sample_rate)
+        # Pitch detector (YIN-fast: ~3x faster than yin with same accuracy)
+        self._pitch = aubio.pitch("yinfast", buf_size, hop_size, sample_rate)
         self._pitch.set_unit("Hz")
         self._pitch.set_tolerance(confidence_threshold)
 
         # Onset detector
         self._onset = aubio.onset("default", buf_size, hop_size, sample_rate)
         self._onset.set_threshold(onset_threshold)
+
+        # Articulation detector
+        self._articulation = ArticulationDetector(sample_rate, hop_size, buf_size)
+        self._articulation_frame: int = 0
 
     def process(self, audio_buffer: np.ndarray) -> DetectedNote | None:
         """Process a single audio buffer (hop_size float32 samples).
@@ -103,6 +110,14 @@ class PitchDetector:
         # Detect onset
         is_onset = bool(self._onset(audio_buffer))
 
+        # Detect articulation (runs on every frame, using pitch + onset + audio)
+        # Use a frame-relative timestamp (ms from detector start)
+        articulation = self._articulation.process(
+            freq, confidence, is_onset, audio_buffer,
+            self._articulation_frame * self.hop_size / self.sample_rate * 1000.0,
+        )
+        self._articulation_frame += 1
+
         # Filter: need minimum confidence and valid frequency.
         # BUT: an onset is a timing event independent of pitch confidence.
         # If onset fires, return the note (with whatever pitch was detected) so
@@ -120,6 +135,7 @@ class PitchDetector:
                     name=midi_to_name(midi_note) if midi_note > 0 else "?",
                     is_onset=True,
                     onset_sample=self._onset.get_last(),
+                    articulation=articulation,
                 )
             return None
 
@@ -134,6 +150,7 @@ class PitchDetector:
             name=midi_to_name(midi_note),
             is_onset=is_onset,
             onset_sample=self._onset.get_last() if is_onset else None,
+            articulation=articulation,
         )
 
     def _correct_octave_jump(self, freq: float, confidence: float) -> float:
@@ -144,6 +161,22 @@ class PitchDetector:
         When calibration data is available, also check if freq/2 matches a
         known open-string fundamental.
         """
+        # Median filter: suppress single-frame octave jumps
+        if len(self._freq_history) >= 3:
+            valid = [f for f in self._freq_history if f > 0]
+            if valid and freq > 0:
+                median = sorted(valid)[len(valid) // 2]
+                ratio = freq / median
+                if ratio > 1.5:
+                    freq = freq / 2.0
+                elif ratio < 0.6:
+                    freq = freq * 2.0
+
+        # Update history (keep last 5)
+        self._freq_history.append(freq)
+        if len(self._freq_history) > 5:
+            self._freq_history.pop(0)
+
         corrected = freq
 
         # Calibration-based correction: if freq/2 is near a calibrated string,
@@ -181,10 +214,13 @@ class PitchDetector:
     def reset(self):
         """Reset detector state. Call when starting a new song/session."""
         self._prev_freq = 0.0
+        self._freq_history = []
+        self._articulation_frame = 0
+        self._articulation.reset()
 
         # Re-create detectors to clear internal state
         self._pitch = aubio.pitch(
-            "yin", self.buf_size, self.hop_size, self.sample_rate
+            "yinfast", self.buf_size, self.hop_size, self.sample_rate
         )
         self._pitch.set_unit("Hz")
         self._pitch.set_tolerance(self.confidence_threshold)

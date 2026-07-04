@@ -19,6 +19,11 @@ def _resolve_songs_dir(config: Config) -> None:
 
 
 def main():
+    # Auto-detect Wayland for native rendering (avoids XWayland blur/tearing)
+    import os
+    if os.environ.get('WAYLAND_DISPLAY') and not os.environ.get('SDL_VIDEODRIVER'):
+        os.environ['SDL_VIDEODRIVER'] = 'wayland'
+
     if "--version" in sys.argv:
         from pickhero import __version__
         print(f"PickHero {__version__}")

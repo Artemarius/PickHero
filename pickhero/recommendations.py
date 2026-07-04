@@ -146,11 +146,10 @@ def _improvement_recommendation(
 def _tempo_recommendation(
     record: SongRecord, accuracy: float, tempo_factor: float,
 ) -> str | None:
-    """Suggest tempo changes based on accuracy at current speed."""
+    """Suggest tempo changes based on accuracy and detected cliff zone."""
     pct = int(tempo_factor * 100)
 
     if tempo_factor >= 1.0:
-        # Already at full speed
         if accuracy >= _TEMPO_UP_ACCURACY:
             return "Full speed at 90%+ accuracy -- well done!"
         if accuracy < _TEMPO_DOWN_ACCURACY:
@@ -158,7 +157,6 @@ def _tempo_recommendation(
         return None
 
     if accuracy >= _TEMPO_UP_ACCURACY:
-        # Doing great at reduced tempo -- suggest increase
         new_pct = min(100, pct + 5)
         return f"90%+ at {pct}% speed -- try bumping to {new_pct}%."
 
@@ -167,6 +165,37 @@ def _tempo_recommendation(
         return f"Consider slowing to {new_pct}% to nail trouble spots."
 
     return None
+
+
+def detect_cliff(record: SongRecord, song_bpm: int) -> float | None:
+    """Detect the tempo (BPM) where accuracy drops sharply.
+
+    Examines tempo_history to find the cliff zone (typically 110-130 BPM
+    where accuracy drops from >85% to ~62%). Returns the BPM at the cliff,
+    or None if insufficient data.
+    """
+    if len(record.tempo_history) < 3:
+        return None
+
+    # Build (effective_bpm, accuracy) pairs sorted by BPM
+    points = []
+    for entry in record.tempo_history:
+        bpm = song_bpm * entry.get("tempo_factor", 1.0)
+        acc = entry.get("accuracy", 0.0)
+        points.append((bpm, acc))
+
+    points.sort(key=lambda x: x[0])
+
+    # Find the largest accuracy drop between consecutive tempos
+    max_drop = 0.0
+    cliff_bpm = None
+    for i in range(1, len(points)):
+        drop = points[i - 1][1] - points[i][1]
+        if drop > max_drop and drop > 20.0:  # 20% accuracy drop threshold
+            max_drop = drop
+            cliff_bpm = points[i][0]
+
+    return cliff_bpm
 
 
 def _section_recommendation(

@@ -24,7 +24,7 @@ class ChordDetector:
     significant energy relative to the spectral peak.
     """
 
-    def __init__(self, sample_rate: int = 48000, fft_size: int = 8192):
+    def __init__(self, sample_rate: int = 48000, fft_size: int = 16384):
         self.sample_rate = sample_rate
         self.fft_size = fft_size
         self._buffer = np.zeros(fft_size, dtype=np.float32)
