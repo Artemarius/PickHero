@@ -316,13 +316,18 @@ class NoteMatcher:
                 timing_error_ms = adjusted_ms - best.timestamp_ms
                 verdict = classify_timing_error(timing_error_ms)
                 pitch_v = classify_pitch_distance(best_dist)
-                # Compare detected articulation against expected from tab
+                # Compare detected articulation against expected from tab.
+                # pyguitarpro encodes both hammer-ons and pull-offs as hammer=True,
+                # so the tab never expects "pull_off" — treat them as equivalent.
                 detected_art = ts_note.note.articulation
                 expected_art = best.expected_articulation
                 if expected_art is None and detected_art is None:
                     art_match = True  # both normal — correct
-                elif expected_art is not None and detected_art == expected_art:
-                    art_match = True
+                elif expected_art is not None and detected_art is not None:
+                    # Normalize: pull_off and hammer_on are the same tab effect
+                    norm_detected = "hammer_on" if detected_art in ("hammer_on", "pull_off") else detected_art
+                    norm_expected = "hammer_on" if expected_art in ("hammer_on", "pull_off") else expected_art
+                    art_match = norm_detected == norm_expected
                 else:
                     art_match = False
                 self._timing_observations.append(TimingObservation(

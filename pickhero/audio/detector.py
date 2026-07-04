@@ -57,8 +57,12 @@ class PitchDetector:
         self._freq_history: list[float] = []
         self._calibration = calibration
 
-        # Pitch detector (YIN-fast: ~3x faster than yin with same accuracy)
-        self._pitch = aubio.pitch("yinfast", buf_size, hop_size, sample_rate)
+        # Pitch detector: YIN-fast is ~3x faster than yin with same accuracy.
+        # Fall back to "yin" if the installed aubio doesn't have yinfast.
+        try:
+            self._pitch = aubio.pitch("yinfast", buf_size, hop_size, sample_rate)
+        except (RuntimeError, ValueError):
+            self._pitch = aubio.pitch("yin", buf_size, hop_size, sample_rate)
         self._pitch.set_unit("Hz")
         self._pitch.set_tolerance(confidence_threshold)
 
@@ -219,9 +223,14 @@ class PitchDetector:
         self._articulation.reset()
 
         # Re-create detectors to clear internal state
-        self._pitch = aubio.pitch(
-            "yinfast", self.buf_size, self.hop_size, self.sample_rate
-        )
+        try:
+            self._pitch = aubio.pitch(
+                "yinfast", self.buf_size, self.hop_size, self.sample_rate
+            )
+        except (RuntimeError, ValueError):
+            self._pitch = aubio.pitch(
+                "yin", self.buf_size, self.hop_size, self.sample_rate
+            )
         self._pitch.set_unit("Hz")
         self._pitch.set_tolerance(self.confidence_threshold)
 

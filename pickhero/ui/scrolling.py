@@ -821,36 +821,36 @@ class PlayingScreen:
             art_surf = _font_cache.render(hint_font, art_text, True, t.hud_accent)
             surface.blit(art_surf, (12, 36))
 
-            # Vibrato: draw a cents deviation bar below the articulation label
-            if self._last_articulation == "vibrato" and self._audio_capture is not None:
-                freq, conf = self._audio_capture.get_tuner_data()
-                if freq > 0 and conf > 0.5:
-                    from pickhero.audio.note_utils import freq_to_midi, midi_to_freq
-                    midi = freq_to_midi(freq)
-                    target = midi_to_freq(midi)
-                    if target > 0:
-                        import math
-                        cents = 1200 * math.log2(freq / target)
-                        # Draw cents bar: -50 to +50 cents, 100px wide
-                        bar_w = 100
-                        bar_h = 6
-                        bar_x = 12
-                        bar_y = 54
-                        pygame.draw.rect(surface, t.signal_cold, (bar_x, bar_y, bar_w, bar_h))
-                        center_x = bar_x + bar_w // 2
-                        deviation = max(-25, min(25, int(cents)))
-                        fill_w = abs(deviation) * 2  # scale to bar
-                        if deviation >= 0:
-                            fill_color = t.tuner_in_tune
-                            pygame.draw.rect(surface, fill_color,
-                                           (center_x, bar_y, fill_w, bar_h))
-                        else:
-                            fill_color = t.tuner_close
-                            pygame.draw.rect(surface, fill_color,
-                                           (center_x - fill_w, bar_y, fill_w, bar_h))
-                        # Center line
-                        pygame.draw.line(surface, t.hud_text,
-                                        (center_x, bar_y - 1), (center_x, bar_y + bar_h + 1), 1)
+        # Cents deviation bar: shows live pitch deviation from nearest semitone.
+        # Visible whenever audio capture has a confident pitch — the bar oscillates
+        # during vibrato and stays near center for steady notes.
+        if self._audio_capture is not None:
+            freq, conf = self._audio_capture.get_tuner_data()
+            if freq > 0 and conf > 0.5:
+                from pickhero.audio.note_utils import freq_to_midi, midi_to_freq
+                import math
+                midi = freq_to_midi(freq)
+                target = midi_to_freq(midi)
+                if target > 0:
+                    cents = 1200 * math.log2(freq / target)
+                    bar_w = 100
+                    bar_h = 6
+                    bar_x = 12
+                    bar_y = 54
+                    pygame.draw.rect(surface, t.signal_cold, (bar_x, bar_y, bar_w, bar_h))
+                    center_x = bar_x + bar_w // 2
+                    deviation = max(-25, min(25, int(cents)))
+                    fill_w = abs(deviation) * 2
+                    if deviation >= 0:
+                        fill_color = t.tuner_in_tune
+                        pygame.draw.rect(surface, fill_color,
+                                       (center_x, bar_y, fill_w, bar_h))
+                    else:
+                        fill_color = t.tuner_close
+                        pygame.draw.rect(surface, fill_color,
+                                       (center_x - fill_w, bar_y, fill_w, bar_h))
+                    pygame.draw.line(surface, t.hud_text,
+                                    (center_x, bar_y - 1), (center_x, bar_y + bar_h + 1), 1)
 
         # Top-right: time
         current = format_time(self._playback_ms)
@@ -1099,10 +1099,18 @@ class PlayingScreen:
             acc_surf = _font_cache.render(stat_font, accuracy_text, True, t.hud_text)
             surface.blit(acc_surf, (w // 2 - acc_surf.get_width() // 2, center_y + 60))
 
-            # "New Best!" indicator
+            # Technique accuracy (if any notes had expected articulations)
+            if stats.get("technique_total", 0) > 0:
+                tech_text = (
+                    f"Technique: {stats['technique_accuracy_percent']:.0f}%  "
+                    f"({stats['technique_correct']}/{stats['technique_total']})"
+                )
+                tech_color = t.hud_accent if stats["technique_accuracy_percent"] >= 70 else t.feedback_close
+                tech_surf = _font_cache.render(stat_font, tech_text, True, tech_color)
+                surface.blit(tech_surf, (w // 2 - tech_surf.get_width() // 2, center_y + 90))
             if self._is_new_best:
                 best_surf = _font_cache.render(stat_font, "New Best!", True, (255, 220, 50))
-                surface.blit(best_surf, (w // 2 - best_surf.get_width() // 2, center_y + 100))
+                surface.blit(best_surf, (w // 2 - best_surf.get_width() // 2, center_y + 115))
 
             # Weakest sections
             weak = getattr(self, "_weakest_sections", [])
@@ -1113,17 +1121,17 @@ class PlayingScreen:
                     f"({section[2]:.0f}%) -- press L to loop"
                 )
                 weak_surf = _font_cache.render(hint_font, weak_text, True, t.feedback_close)
-                surface.blit(weak_surf, (w // 2 - weak_surf.get_width() // 2, center_y + 140))
+                surface.blit(weak_surf, (w // 2 - weak_surf.get_width() // 2, center_y + 150))
 
             # Practice recommendations
-            rec_y = center_y + 170
+            rec_y = center_y + 180
             for rec in self._recommendations:
                 rec_surf = _font_cache.render(hint_font, rec, True, t.hud_accent)
                 surface.blit(rec_surf, (w // 2 - rec_surf.get_width() // 2, rec_y))
                 rec_y += 24
 
             # Controls hint
-            hint_y = max(center_y + 180, rec_y + 10)
+            hint_y = max(center_y + 190, rec_y + 10)
             hint_text = "SPACE to replay  |  L to loop weak section  |  ESC to menu"
             hint_surf = _font_cache.render(hint_font, hint_text, True, t.hud_text)
             surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, hint_y))
@@ -1543,7 +1551,11 @@ class PlayingScreen:
         self._loop_enabled = True
         self._song_completed = False
         # Set tempo to 50% or cliff_bpm - 10 if available
-        cliff = getattr(self, '_guided_cliff_bpm', None)
+        cliff = None
+        if self._progress_tracker is not None and self._song_key:
+            record = self._progress_tracker.get_best(self._song_key)
+            if record is not None:
+                cliff = record.cliff_bpm
         if cliff and self._timeline.metadata.tempo > 0:
             target_factor = max(0.5, min(1.0, (cliff - 10) / self._timeline.metadata.tempo))
         else:

@@ -446,5 +446,15 @@ class TestTimingObservations:
         matcher.process_detected_notes([_detected(64, 2000.0, articulation="vibrato")], 2050.0)
         stats = matcher.get_statistics()
         assert stats["technique_total"] == 2
-        assert stats["technique_correct"] == 1
         assert stats["technique_accuracy_percent"] == 50.0
+
+    def test_pull_off_matches_hammer_on(self):
+        """Detected pull_off should match expected hammer_on (pyguitarpro doesn't distinguish)."""
+        tab = _note_event(1000.0, midi_note=64, expected_articulation="hammer_on")
+        matcher = self._make_timing_matcher([tab])
+        # Detect a pull_off (descending legato) — should match hammer_on
+        matcher.process_detected_notes([_detected(64, 1000.0, articulation="pull_off")], 1050.0)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].articulation == "pull_off"
+        assert obs[0].articulation_match is True

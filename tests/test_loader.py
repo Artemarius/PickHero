@@ -188,6 +188,23 @@ class TestLoadGPFile:
             for note in tl.notes:
                 assert note.duration_ms > 0, f"{fname}: note with 0 duration"
 
+    def test_slides_gp5_has_articulation(self):
+        """Slides.gp5 should load notes with expected_articulation='slide'."""
+        tl = load_gp_file(FIXTURES / "Slides.gp5")
+        art_notes = [n for n in tl.notes if n.expected_articulation is not None]
+        assert len(art_notes) > 0, "Slides.gp5 should have notes with articulations"
+        # All articulation notes in Slides.gp5 are slides
+        for note in art_notes:
+            assert note.expected_articulation == "slide", (
+                f"Expected 'slide', got '{note.expected_articulation}'"
+            )
+
+    def test_notes_gp5_no_articulation(self):
+        """notes.gp5 should have no articulation effects (basic notes)."""
+        tl = load_gp_file(FIXTURES / "notes.gp5")
+        art_notes = [n for n in tl.notes if n.expected_articulation is not None]
+        assert len(art_notes) == 0, f"notes.gp5 should have no articulations, got {len(art_notes)}"
+
 
 class TestExtractArticulation:
     """Test the _extract_articulation helper function."""
