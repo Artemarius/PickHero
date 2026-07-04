@@ -386,22 +386,24 @@ class PlayingScreen:
                 for d in detected:
                     d.timestamp_ms = pinned_ts
             results = self._matcher.process_detected_notes(detected, self._playback_ms)
+            # Check if any detected note has an onset — used to gate FFT
+            # chord verification (fresh analysis on new strikes, cached
+            # result during sustain to avoid flutter).
+            has_onset = any(d.note.is_onset for d in detected)
             # FFT-based chord verification for multi-note passages
             if (self._audio_capture is not None
                     and self._audio_capture.chord_detector is not None):
                 results.extend(self._matcher.verify_chord_at(
                     self._playback_ms,
                     self._audio_capture.chord_detector,
+                    has_onset,
                 ))
             self._feedback.add_results(results, self._playback_ms)
 
             # Track last detected articulation for HUD display.
             # Clear if an onset fires without articulation detected.
             new_articulation = None
-            has_onset = False
             for d in detected:
-                if d.note.is_onset:
-                    has_onset = True
                 if d.note.articulation:
                     new_articulation = d.note.articulation
                     break

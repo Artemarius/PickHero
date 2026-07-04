@@ -405,11 +405,14 @@ class NoteMatcher:
         self,
         playback_ms: float,
         chord_detector=None,
+        has_onset: bool = False,
     ) -> list[MatchResult]:
         """Verify chords at the hit zone using FFT spectral analysis.
 
         Called when there are multiple pending notes at the same timestamp.
         Uses the ChordDetector to check if expected frequencies are present.
+        When ``has_onset`` is True, a fresh FFT analysis is triggered;
+        otherwise the cached result from the last onset is returned.
         """
         if chord_detector is None:
             return []
@@ -439,9 +442,10 @@ class NoteMatcher:
             if not any(self._get_state(n) == MatchType.PENDING for n in group):
                 continue
 
-            # Verify via FFT
+            # Verify via FFT (onset-gated: fresh analysis on new strikes,
+            # cached result during sustain to avoid flutter).
             expected_midi = [n.midi_note for n in group]
-            present = chord_detector.verify_chord(expected_midi)
+            present = chord_detector.verify_chord_with_onset(expected_midi, has_onset)
 
             matched_events = []
             all_present = True

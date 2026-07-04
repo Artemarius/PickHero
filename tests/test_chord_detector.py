@@ -337,3 +337,157 @@ class TestThresholdSanity:
         assert results[1] is False, (
             f"Fifth at 10× imbalance falls below 15%-of-peak threshold, got {results}"
         )
+
+
+# ===================================================================
+# Onset-gated verification
+# ===================================================================
+
+class TestOnsetGating:
+    """verify_chord_with_onset caches results between onsets."""
+
+    def test_fresh_analysis_on_onset(self, detector: ChordDetector) -> None:
+        """has_onset=True triggers a fresh FFT analysis."""
+        e2 = midi_to_freq(E2)
+        b2 = midi_to_freq(B2)
+        signal = generate_sine(e2) + generate_sine(b2)
+        signal = (signal / np.max(np.abs(signal)) * 0.5).astype(np.float32)
+        push_in_chunks(detector, signal)
+
+        results = detector.verify_chord_with_onset([E2, B2], has_onset=True)
+        assert results == [True, True], f"Expected [True, True], got {results}"
+
+    def test_cached_result_without_onset(self, detector: ChordDetector) -> None:
+        """Without onset, cached result is returned (no re-analysis)."""
+        e2 = midi_to_freq(E2)
+        b2 = midi_to_freq(B2)
+        signal = generate_sine(e2) + generate_sine(b2)
+        signal = (signal / np.max(np.abs(signal)) * 0.5).astype(np.float32)
+        push_in_chunks(detector, signal)
+
+        # First call with onset populates the cache.
+        r1 = detector.verify_chord_with_onset([E2, B2], has_onset=True)
+        # Second call without onset returns the cached result.
+        r2 = detector.verify_chord_with_onset([E2, B2], has_onset=False)
+        assert r1 == r2, f"Cached result should match: {r1} vs {r2}"
+
+    def test_verify_chord_uses_cache(self, detector: ChordDetector) -> None:
+        """verify_chord (no onset arg) also uses the cache."""
+        e2 = midi_to_freq(E2)
+        b2 = midi_to_freq(B2)
+        signal = generate_sine(e2) + generate_sine(b2)
+        signal = (signal / np.max(np.abs(signal)) * 0.5).astype(np.float32)
+        push_in_chunks(detector, signal)
+
+        # Populate cache via verify_chord_with_onset.
+        r1 = detector.verify_chord_with_onset([E2, B2], has_onset=True)
+        # verify_chord should return the cached result.
+        r2 = detector.verify_chord([E2, B2])
+        assert r1 == r2, f"verify_chord should return cached: {r1} vs {r2}"
+
+    def test_reset_clears_cache(self, detector: ChordDetector) -> None:
+        """After reset, the onset cache is cleared."""
+        e2 = midi_to_freq(E2)
+        signal = generate_sine(e2)
+        push_in_chunks(detector, signal)
+        detector.verify_chord_with_onset([E2], has_onset=True)
+
+        detector.reset()
+        # After reset, no audio and no cache → all False.
+        assert detector.verify_chord([E2]) == [False]
+
+
+# ===================================================================
+# Chroma verification
+# ===================================================================
+
+class TestChromaVerification:
+    """The chroma pre-check rejects clearly unrelated audio."""
+
+    def test_unrelated_note_rejected_by_chroma(self, detector: ChordDetector) -> None:
+        """D3 (pitch class 2) should not match an E+B (4+11) chord template."""
+        d3 = midi_to_freq(D3)
+        signal = generate_sine(d3)
+        results = _push_and_verify(detector, signal, [E2, B2])
+        assert results == [False, False], (
+            f"D3 should not match E+B chord, got {results}"
+        )
+
+    def test_chorda_passes_matching_chord(self, detector: ChordDetector) -> None:
+        """A real E+B power chord passes the chroma pre-check."""
+        e2 = midi_to_freq(E2)
+        b2 = midi_to_freq(B2)
+        signal = generate_sine(e2) + generate_sine(b2)
+        signal = (signal / np.max(np.abs(signal)) * 0.5).astype(np.float32)
+        results = _push_and_verify(detector, signal, [E2, B2])
+        assert results == [True, True], f"E+B chord should pass, got {results}"
+
+    def test_octave_error_still_detected(self, detector: ChordDetector) -> None:
+        """E3 (one octave above E2) should still partially match E2 in chroma."""
+        e3_freq = midi_to_freq(E2 + 12)  # E3 = MIDI 52
+        signal = generate_sine(e3_freq)
+        results = _push_and_verify(detector, signal, [E2])
+        # E3's pitch class (4) matches E2's pitch class (4) in chroma,
+        # and the strong fundamental should be detected.
+        assert results[0] is True, f"E3 should match E2 (same pitch class), got {results}"
+
+
+# ===================================================================
+# Energy-ratio threshold
+# ===================================================================
+
+class TestEnergyRatio:
+    """Each note must contribute a minimum fraction of the chord's total energy."""
+
+    def test_balanced_voicing_passes(self, detector: ChordDetector) -> None:
+        """Equal-amplitude E2+B2 → both detected (each is 50% of total)."""
+        e2 = midi_to_freq(E2)
+        b2 = midi_to_freq(B2)
+        signal = generate_sine(e2, amplitude=0.5) + generate_sine(b2, amplitude=0.5)
+        signal = (signal / np.max(np.abs(signal)) * 0.5).astype(np.float32)
+        results = _push_and_verify(detector, signal, [E2, B2])
+        assert results == [True, True], f"Balanced chord should pass, got {results}"
+
+    def test_moderate_imbalance_passes(self, detector: ChordDetector) -> None:
+        """5× imbalance → both still pass (quieter note is ~17% of total)."""
+        e2 = midi_to_freq(E2)
+        b2 = midi_to_freq(B2)
+        signal = generate_sine(e2, amplitude=0.5) + generate_sine(b2, amplitude=0.1)
+        signal = (signal / np.max(np.abs(signal)) * 0.5).astype(np.float32)
+        results = _push_and_verify(detector, signal, [E2, B2])
+        assert results == [True, True], f"5× imbalance should pass, got {results}"
+
+
+# ===================================================================
+# Per-string calibration templates
+# ===================================================================
+
+class TestStringTemplates:
+    """Per-string harmonic templates from calibration improve discrimination."""
+
+    def test_set_string_templates_accepted(self, detector: ChordDetector) -> None:
+        """set_string_templates stores templates without error."""
+        import numpy as np
+        templates = {
+            40: np.array([1.0, 0.8, 0.6, 0.4, 0.2], dtype=np.float32),
+            47: np.array([1.0, 0.7, 0.5, 0.3, 0.1], dtype=np.float32),
+        }
+        detector.set_string_templates(templates)
+        # Verify detection still works with custom templates.
+        e2 = midi_to_freq(E2)
+        b2 = midi_to_freq(B2)
+        signal = generate_sine(e2) + generate_sine(b2)
+        signal = (signal / np.max(np.abs(signal)) * 0.5).astype(np.float32)
+        results = _push_and_verify(detector, signal, [E2, B2])
+        assert results == [True, True], f"Custom templates should work, got {results}"
+
+    def test_short_template_padded(self, detector: ChordDetector) -> None:
+        """A template shorter than _NUM_HARMONICS is padded with defaults."""
+        import numpy as np
+        templates = {40: np.array([1.0, 0.8], dtype=np.float32)}
+        detector.set_string_templates(templates)
+        # Should not crash — padding happens internally.
+        e2 = midi_to_freq(E2)
+        signal = generate_sine(e2)
+        results = _push_and_verify(detector, signal, [E2])
+        assert results == [True], f"Padded template should work, got {results}"
