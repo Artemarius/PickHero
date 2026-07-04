@@ -128,6 +128,23 @@ class TestPlayingScreenLayout:
         assert layout_large.lane_height > layout_small.lane_height
         assert layout_large.pixels_per_ms > layout_small.pixels_per_ms
 
+    def test_layout_uses_track_string_count(self):
+        meta = SongMetadata(title="Test", artist="Tester", tempo=120, num_strings=7)
+        timeline = Timeline([], meta)
+        screen = PlayingScreen(timeline)
+        layout = screen._layout(self._MockSurface(800, 600))
+        lane_area = 600 - 80 - 40
+        assert layout.lane_height == pytest.approx(lane_area / 7)
+        assert len(screen._active_strings) == 7
+
+    def test_layout_defaults_to_six_strings(self):
+        timeline = _make_timeline(tempo=120)
+        screen = PlayingScreen(timeline)
+        layout = screen._layout(self._MockSurface(800, 600))
+        lane_area = 600 - 80 - 40
+        assert layout.lane_height == pytest.approx(lane_area / 6)
+        assert len(screen._active_strings) == 6
+
 
 class TestPlaybackClock:
     """Test play/pause/seek logic."""

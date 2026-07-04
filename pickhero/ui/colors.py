@@ -163,7 +163,7 @@ def cycle_theme() -> str:
     return "dark"
 
 
-# String colors (Rocksmith palette, keyed 1-6: 1=high E, 6=low E)
+# String colors (Rocksmith palette, keyed 1-8: 1=highest string, 8=lowest).
 # These don't change with theme — they're gameplay identifiers.
 STRING_COLORS: dict[int, tuple[int, int, int]] = {
     1: (200, 50, 50),    # red
@@ -172,7 +172,14 @@ STRING_COLORS: dict[int, tuple[int, int, int]] = {
     4: (220, 140, 30),   # orange
     5: (50, 180, 70),    # green
     6: (140, 60, 200),   # purple
+    7: (40, 180, 180),   # cyan
+    8: (220, 60, 140),   # pink
 }
+
+
+def string_color(string_num: int) -> tuple[int, int, int]:
+    """Return the color for a string, falling back to gray for unknown strings."""
+    return STRING_COLORS.get(string_num, (180, 180, 180))
 
 
 def dimmed(color: tuple[int, int, int], factor: float = 0.4) -> tuple[int, int, int]:

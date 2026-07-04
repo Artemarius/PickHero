@@ -64,7 +64,7 @@ class Config:
     count_in_beats: int = 4
     theme: str = "dark"
     max_fret: int = 24
-    active_strings: list[bool] = field(default_factory=lambda: [True] * 6)
+    active_strings: list[bool] = field(default_factory=lambda: [True] * 8)
     chord_partial_credit: bool = True
     wait_mode: bool = False
     timing_judge_mode: bool = False
@@ -76,7 +76,7 @@ class Config:
     _default_chord_partial_credit: bool = field(default=True, repr=False)
 
     def get_string_calibration(self, string: int) -> StringCalibration | None:
-        """Return calibration for a string (1-6), or None if not calibrated."""
+        """Return calibration for a string (1-N), or None if not calibrated."""
         strings = self.calibration.get("strings", {})
         data = strings.get(str(string))
         if data is None:
@@ -84,7 +84,7 @@ class Config:
         return StringCalibration(**data)
 
     def set_string_calibration(self, string: int, cal: StringCalibration) -> None:
-        """Store calibration for a string (1-6)."""
+        """Store calibration for a string (1-N)."""
         if "strings" not in self.calibration:
             self.calibration["strings"] = {}
         self.calibration["strings"][str(string)] = asdict(cal)
@@ -104,19 +104,38 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config":
-        """Load settings from JSON file. Returns defaults if file doesn't exist."""
+        """Load settings from JSON file.
+
+        On a corrupt file (not JSON at all), returns defaults. On a file with
+        unknown or mistyped fields, preserves the valid fields and drops only
+        the bad ones — calibration data and audio device selection survive a
+        single malformed entry instead of being wiped to defaults.
+        """
         if not CONFIG_FILE.exists():
             return cls()
         try:
             with open(CONFIG_FILE) as f:
                 data = json.load(f)
-            data.pop("_default_chord_partial_credit", None)
-            audio_data = data.pop("audio", {})
-            display_data = data.pop("display", {})
-            return cls(
-                audio=AudioConfig(**audio_data),
-                display=DisplayConfig(**display_data),
-                **data,
-            )
-        except (json.JSONDecodeError, TypeError, KeyError):
+        except (json.JSONDecodeError, OSError):
+            # File is unreadable — nothing to preserve.
             return cls()
+
+        # Pull nested config objects field-by-field so a single bad value
+        # doesn't invalidate the whole file.
+        audio = cls._filter_known(AudioConfig, data.pop("audio", {}))
+        display = cls._filter_known(DisplayConfig, data.pop("display", {}))
+        top = cls._filter_known(cls, data)
+        return cls(audio=AudioConfig(**audio), display=DisplayConfig(**display), **top)
+
+    @staticmethod
+    def _filter_known(datacls: type, raw: dict) -> dict:
+        """Return only the keys from ``raw`` that match ``datacls`` field names.
+
+        Unknown keys (typos, fields from a newer PickHero version) are silently
+        dropped; known keys are passed through so dataclass conversion can
+        raise a clear TypeError if a value's type is wrong — caller decides.
+        """
+        if not isinstance(raw, dict) or not raw:
+            return {}
+        known = {f.name for f in datacls.__dataclass_fields__.values()}
+        return {k: v for k, v in raw.items() if k in known}

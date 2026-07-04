@@ -123,6 +123,32 @@ class TestTimestampAccuracy:
         assert hasattr(capture, "_adc_time_available")
 
 
+class TestXrunHandling:
+    """Verify the callback doesn't drop usable audio on input overflow."""
+
+    def test_input_overflow_still_processes_audio(self):
+        """Input overflow status should not cause the buffer to be skipped."""
+        sr = 44100
+        hop = 512
+        burst = (0.5 * np.sin(2 * np.pi * 440 * np.arange(int(sr * 0.2)) / sr)).astype(np.float32)
+
+        capture, call_cb = _make_capture_with_adc([0.0] * 100)
+        initial_xruns = capture.get_xrun_count()
+
+        for i in range(0, len(burst), hop):
+            chunk = burst[i:i + hop]
+            if len(chunk) < hop:
+                chunk = np.pad(chunk, (0, hop - len(chunk)))
+            indata = chunk.reshape(-1, 1).astype(np.float32)
+            # Simulate PortAudio input overflow status.
+            capture._audio_callback(
+                indata, len(chunk), _MockTimeInfo(0.0), "Input overflow"
+            )
+
+        notes = capture.get_notes()
+        assert len(notes) >= 1, "Expected detections despite overflow status"
+        assert capture.get_xrun_count() > initial_xruns
+
 def test_list_audio_devices_includes_hostapi():
     """list_audio_devices should include the hostapi field."""
     # This test verifies the function signature; actual device query requires hardware.

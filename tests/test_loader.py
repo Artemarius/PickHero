@@ -1,11 +1,20 @@
 """Tests for pickhero.tabs.loader module."""
 
+import io
+import tempfile
+import zipfile
 from pathlib import Path
 
 import pytest
 
 from pickhero.audio.note_utils import STANDARD_TUNING
-from pickhero.tabs.loader import TempoMap, is_guitar_track, list_tracks, load_gp_file, _extract_articulation
+from pickhero.tabs.loader import (
+    TempoMap,
+    _extract_articulation,
+    is_guitar_track,
+    list_tracks,
+    load_gp_file,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -89,15 +98,16 @@ class TestListTracks:
         tracks = list_tracks(FIXTURES / "Demo_v5.gp5")
         assert len(tracks) == 5
         guitar_tracks = [t for t in tracks if t["is_guitar"]]
-        assert len(guitar_tracks) == 2
+        assert len(guitar_tracks) == 3
         assert guitar_tracks[0]["name"] == "Rhythm Guitar"
         assert guitar_tracks[1]["name"] == "Solo Guitar"
+        assert guitar_tracks[2]["name"] == "Bass"
 
     def test_canon(self):
         tracks = list_tracks(FIXTURES / "canon.gp5")
         assert len(tracks) == 9
         guitar_tracks = [t for t in tracks if t["is_guitar"]]
-        assert len(guitar_tracks) == 4
+        assert len(guitar_tracks) == 5
         # String ensemble (inst=49) and synth strings (inst=51) excluded
         non_guitar_names = {t["name"] for t in tracks if not t["is_guitar"]}
         assert "Low Bassy Sound" in non_guitar_names
@@ -108,6 +118,42 @@ class TestListTracks:
         perc = [t for t in tracks if t["is_percussion"]]
         assert len(perc) == 1
         assert perc[0]["is_guitar"] is False
+
+
+class TestIsGuitarTrack:
+    """Unit tests for the is_guitar_track heuristic."""
+
+    def _make_track(self, strings: int, instrument: int, percussion: bool = False):
+        track = type("Track", (), {})()
+        track.strings = [type("String", (), {"value": 64 - i})() for i in range(strings)]
+        track.channel = type("Channel", (), {})()
+        track.channel.instrument = instrument
+        track.channel.isPercussionChannel = percussion
+        return track
+
+    def test_standard_six_string_guitar(self):
+        assert is_guitar_track(self._make_track(6, 29)) is True
+
+    def test_seven_string_guitar_accepted(self):
+        assert is_guitar_track(self._make_track(7, 30)) is True
+
+    def test_four_string_bass_accepted(self):
+        assert is_guitar_track(self._make_track(4, 34)) is True
+
+    def test_eight_string_guitar_accepted(self):
+        assert is_guitar_track(self._make_track(8, 31)) is True
+
+    def test_three_string_rejected(self):
+        assert is_guitar_track(self._make_track(3, 29)) is False
+
+    def test_nine_string_rejected(self):
+        assert is_guitar_track(self._make_track(9, 29)) is False
+
+    def test_percussion_rejected(self):
+        assert is_guitar_track(self._make_track(6, 30, percussion=True)) is False
+
+    def test_piano_rejected(self):
+        assert is_guitar_track(self._make_track(6, 1)) is False
 
 
 class TestLoadGPFile:
@@ -267,3 +313,106 @@ class TestExtractArticulation:
         """Palm mute takes priority over bend."""
         note = self._make_note(palmMute=True, bend=object())
         assert _extract_articulation(note) == "palm_mute"
+
+
+class TestGp7AndGp6:
+    """Tests for GP7/GP8 ZIP and GP6 BCFZ/BCFS loaders.
+
+    Fixtures are synthetic; they exercise the XML parsing path that is shared
+    by GP6, GP7, and GP8 formats. String numbering matches the GP5 parser:
+    string 1 = high E, string 6 = low E.
+    """
+
+    def test_gp7_simple_load(self):
+        path = FIXTURES / "simple.gp7"
+        timeline = load_gp_file(path)
+        assert timeline.metadata.title == "GP7 Test"
+        # Fixture has 2 measures of 4 beats each
+        assert len(timeline.notes) == 8
+        # Notes should be parsed with the correct strings and frets.
+        # The first note is fret 0 on gp7_string 5 (low E) -> our string 6.
+        notes = sorted(timeline.notes, key=lambda n: n.timestamp_ms)
+        assert notes[0].fret == 0
+        assert notes[0].string == 6  # low E
+        # The second note is fret 2 on gp7_string 4 (A) -> our string 5.
+        assert notes[1].fret == 2
+        assert notes[1].string == 5
+
+    def test_gp7_track_selection(self):
+        path = FIXTURES / "simple.gp7"
+        timeline = load_gp_file(path, track_index=0)
+        assert timeline.metadata.track_name == "Electric Guitar"
+        assert timeline.metadata.track_index == 0
+
+        timeline_bass = load_gp_file(path, track_index=1)
+        assert timeline_bass.metadata.track_name == "Bass"
+        assert timeline_bass.metadata.track_index == 1
+
+    def test_gp7_list_tracks(self):
+        tracks = list_tracks(FIXTURES / "simple.gp7")
+        assert len(tracks) == 2
+        assert tracks[0]["name"] == "Electric Guitar"
+        assert tracks[0]["is_guitar"] is True
+        assert tracks[1]["name"] == "Bass"
+
+    def test_gp6_simple_load(self):
+        path = FIXTURES / "simple.gpx"
+        timeline = load_gp_file(path)
+        assert timeline.metadata.title == "GP6 Test"
+        assert timeline.metadata.track_name == "Acoustic Guitar"
+        assert len(timeline.notes) == 1
+        note = timeline.notes[0]
+        assert note.fret == 3
+        # gp7_string 5 (low E) -> our string 6
+        assert note.string == 6
+
+    def test_gp7_tempo_change(self):
+        """A tempo automation in bar 1 must change the timing of later notes."""
+        import io, zipfile
+
+        gpif = '''<?xml version="1.0" encoding="UTF-8"?>
+<GPIF version="1.0">
+  <Score><Title>Tempo</Title><Artist>T</Artist><Album>A</Album></Score>
+  <Rhythms>
+    <Rhythm id="0"><NoteValue>Quarter</NoteValue></Rhythm>
+  </Rhythms>
+  <Notes>
+    <Note id="0"><Properties><Property name="Fret"><Fret>0</Fret></Property><Property name="String"><String>5</String></Property></Properties></Note>
+  </Notes>
+  <Beats><Beat id="0"><Rhythm ref="0"/><Notes>0</Notes></Beat></Beats>
+  <Voices><Voice id="0"><Beats>0</Beats></Voice></Voices>
+  <Bars><Bar id="0"><Voices>0</Voices></Bar><Bar id="1"><Voices>0</Voices></Bar></Bars>
+  <Tracks>
+    <Track id="0">
+      <Name>Guitar</Name>
+      <Properties><Property name="Tuning"><Pitches>64 59 55 50 45 40</Pitches></Property></Properties>
+      <MIDI><Program>27</Program></MIDI>
+    </Track>
+  </Tracks>
+  <MasterTrack>
+    <Automations>
+      <Automation><Type>Tempo</Type><Bar>1</Bar><Value>240 2</Value></Automation>
+    </Automations>
+  </MasterTrack>
+  <MasterBars>
+    <MasterBar><Time>4/4</Time><Bars>0</Bars></MasterBar>
+    <MasterBar><Time>4/4</Time><Bars>0</Bars></MasterBar>
+  </MasterBars>
+</GPIF>'''
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("Content/score.gpif", gpif)
+
+        with tempfile.NamedTemporaryFile(suffix=".gp7", delete=False) as f:
+            f.write(buf.getvalue())
+            tmp_path = Path(f.name)
+        try:
+            timeline = load_gp_file(tmp_path)
+            # Measure 0 at 120 BPM: 4 quarter notes * 500ms = 2000ms
+            # Measure 1 at 240 BPM: 4 quarter notes * 250ms = 1000ms
+            # The single note in measure 1 must start at 2000ms.
+            notes = sorted(timeline.notes, key=lambda n: n.timestamp_ms)
+            assert notes[0].timestamp_ms == pytest.approx(0.0)
+            assert notes[1].timestamp_ms == pytest.approx(2000.0)
+        finally:
+            tmp_path.unlink(missing_ok=True)

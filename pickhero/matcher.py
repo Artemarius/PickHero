@@ -83,6 +83,11 @@ class NoteMatcher:
         # Timing Judge observations
         self._timing_observations: list[TimingObservation] = []
 
+        # Miss-scan cursor: index into the timeline's note list marking how far
+        # _mark_missed_notes has already scanned. Each frame only inspects newly
+        # passed notes instead of re-scanning from 0 — O(new) not O(total).
+        self._miss_scan_cursor: int = 0
+
     @property
     def audio_offset_ms(self) -> float:
         return self._audio_offset_ms
@@ -175,8 +180,13 @@ class NoteMatcher:
         if cutoff <= 0:
             return results
 
-        # Check notes that should have been played by now
-        candidates = self._timeline.get_notes_in_range(0, cutoff)
+        # Scan only notes newly past the window since last frame — the
+        # _miss_scan_cursor advances monotonically, so each call is O(new)
+        # rather than re-scanning every note from the start of the song.
+        candidates, new_cursor = self._timeline.get_notes_before(
+            cutoff, self._miss_scan_cursor
+        )
+        self._miss_scan_cursor = new_cursor
         for note in candidates:
             if self._is_filtered(note):
                 continue
@@ -406,26 +416,28 @@ class NoteMatcher:
 
         results: list[MatchResult] = []
 
-        # Find pending notes at the current playback position
+        # Find all active notes at the current playback position. A chord in the
+        # tab is defined by ≥2 notes at the same timestamp, even if YIN already
+        # matched some of them. Verify the full chord so the FFT can pick up
+        # notes the monophonic YIN detector missed (e.g., the fifth of a power
+        # chord after the root was already hit).
         candidates = self._timeline.get_active_notes_at_time(
             playback_ms, self._timing_window_ms
         )
-        pending = [
-            n for n in candidates
-            if self._get_state(n) == MatchType.PENDING and not self._is_filtered(n)
-        ]
-        if len(pending) < 2:
-            return []  # Not a chord — single notes use YIN
-
-        # Group by timestamp (chord = same timestamp)
         chord_groups: dict[float, list[NoteEvent]] = {}
-        for note in pending:
+        for note in candidates:
+            if self._is_filtered(note):
+                continue
             ts = round(note.timestamp_ms, 0)
             chord_groups.setdefault(ts, []).append(note)
 
         for ts, group in chord_groups.items():
             if len(group) < 2:
                 continue  # Single note, not a chord
+
+            # Skip if every note in the chord is already resolved.
+            if not any(self._get_state(n) == MatchType.PENDING for n in group):
+                continue
 
             # Verify via FFT
             expected_midi = [n.midi_note for n in group]
@@ -551,3 +563,4 @@ class NoteMatcher:
         self.misses = 0
         self._measure_stats.clear()
         self._timing_observations.clear()
+        self._miss_scan_cursor = 0

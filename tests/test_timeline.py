@@ -53,17 +53,23 @@ class TestNoteEvent:
                 timestamp_ms=0.0, duration_ms=500.0, midi_note=128, string=1, fret=0
             )
 
-    def test_invalid_string(self):
+    def test_invalid_string_low(self):
         with pytest.raises(ValueError, match="string"):
             NoteEvent(
                 timestamp_ms=0.0, duration_ms=500.0, midi_note=64, string=0, fret=0
             )
 
-    def test_invalid_fret(self):
-        with pytest.raises(ValueError, match="fret"):
+    def test_invalid_string_high(self):
+        with pytest.raises(ValueError, match="string"):
             NoteEvent(
-                timestamp_ms=0.0, duration_ms=500.0, midi_note=64, string=1, fret=-1
+                timestamp_ms=0.0, duration_ms=500.0, midi_note=64, string=13, fret=0
             )
+
+    def test_extended_string_allowed(self):
+        note = NoteEvent(
+            timestamp_ms=0.0, duration_ms=500.0, midi_note=35, string=7, fret=0
+        )
+        assert note.string == 7
 
     def test_zero_duration_allowed(self):
         note = NoteEvent(
@@ -79,15 +85,18 @@ class TestSongMetadata:
         assert meta.artist == ""
         assert meta.tempo == 120
         assert meta.tuning == {}
+        assert meta.num_strings == 6
 
     def test_custom_values(self):
-        tuning = {1: 64, 2: 59, 3: 55, 4: 50, 5: 45, 6: 40}
+        tuning = {1: 64, 2: 59, 3: 55, 4: 50, 5: 45, 6: 40, 7: 35}
         meta = SongMetadata(
-            title="Test Song", artist="Artist", tempo=140, tuning=tuning
+            title="Test Song", artist="Artist", tempo=140, tuning=tuning,
+            num_strings=7,
         )
         assert meta.title == "Test Song"
         assert meta.tempo == 140
         assert meta.tuning[1] == 64
+        assert meta.num_strings == 7
 
 
 class TestTimeline:

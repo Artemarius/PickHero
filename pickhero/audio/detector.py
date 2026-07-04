@@ -169,13 +169,18 @@ class PitchDetector:
         if len(self._freq_history) >= 3:
             valid = [f for f in self._freq_history if f > 0]
             if valid and freq > 0:
-                median = sorted(valid)[len(valid) // 2]
+                valid_sorted = sorted(valid)
+                n = len(valid_sorted)
+                # True median: average of two middle values for even-length lists
+                if n % 2 == 1:
+                    median = valid_sorted[n // 2]
+                else:
+                    median = (valid_sorted[n // 2 - 1] + valid_sorted[n // 2]) / 2.0
                 ratio = freq / median
                 if ratio > 1.5:
                     freq = freq / 2.0
                 elif ratio < 0.6:
                     freq = freq * 2.0
-
         # Update history (keep last 5)
         self._freq_history.append(freq)
         if len(self._freq_history) > 5:
@@ -198,15 +203,22 @@ class PitchDetector:
                         self._prev_freq = corrected
                         return corrected
 
-        # Generic ratio-based correction
-        if self._prev_freq > 0 and confidence < 0.95:
-            ratio = freq / self._prev_freq
-            if 1.95 <= ratio <= 2.05:
-                # One octave up — prefer previous (fundamental)
-                corrected = self._prev_freq
-            elif 0.48 <= ratio <= 0.52:
-                # One octave down — prefer previous
-                corrected = self._prev_freq
+        # Generic ratio-based correction. Only snap when the previous frequency
+        # was stable (history agrees with it) AND confidence is not very high —
+        # a strong 2nd harmonic can report high confidence, but a single-frame
+        # _prev_freq from a transient sub-harmonic must not drag the next
+        # confident reading down an octave.
+        if self._prev_freq > 0 and len(self._freq_history) >= 3:
+            recent = [f for f in self._freq_history[-3:] if f > 0]
+            if recent and all(abs(f - self._prev_freq) / self._prev_freq < 0.05
+                               for f in recent):
+                ratio = freq / self._prev_freq
+                if 1.95 <= ratio <= 2.05 and confidence < 0.95:
+                    # One octave up — prefer the stable previous (fundamental)
+                    corrected = self._prev_freq
+                elif 0.48 <= ratio <= 0.52 and confidence < 0.95:
+                    # One octave down — prefer previous
+                    corrected = self._prev_freq
 
         self._prev_freq = corrected
         return corrected
@@ -215,12 +227,24 @@ class PitchDetector:
         """Update the noise gate threshold (dB). Takes effect on next process() call."""
         self.noise_gate_db = db
 
+    def get_onset_delay(self) -> int:
+        """Return the onset detector's algorithmic delay in samples.
+
+        Exposed so callers (AudioCapture) don't reach into ``_onset`` directly.
+        """
+        return int(self._onset.get_delay())
+
     def reset(self):
         """Reset detector state. Call when starting a new song/session."""
         self._prev_freq = 0.0
         self._freq_history = []
         self._articulation_frame = 0
         self._articulation.reset()
+        # Clear exposed tuner/signal state so stale readings don't persist
+        # after a reset until the next process() call overwrites them.
+        self.last_signal_db = -120.0
+        self.last_freq = 0.0
+        self.last_confidence = 0.0
 
         # Re-create detectors to clear internal state
         try:

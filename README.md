@@ -4,7 +4,7 @@ Free, open-source desktop guitar practice app with real-time pitch detection and
 
 ## Why?
 
-Yousician is great but expensive for continuous use, and there's no good free alternative that combines Guitar Pro tab playback with live pitch detection. PickHero fills that gap: load any Guitar Pro tab file (GP3/GP4/GP5/GP7/GP8), plug in your guitar via a cheap USB cable, and practice with real-time visual feedback — all without an internet connection or subscription.
+Yousician is great but expensive for continuous use, and there's no good free alternative that combines Guitar Pro tab playback with live pitch detection. PickHero fills that gap: load any Guitar Pro tab file (GP3/GP4/GP5/GP6/GP7/GP8), plug in your guitar via a cheap USB cable, and practice with real-time visual feedback — all without an internet connection or subscription.
 
 Designed to run on modest hardware (tested on an HP ProBook 650 G5 laptop). No ML models, no GPU required.
 
@@ -38,7 +38,7 @@ A regular microphone also works for acoustic guitar or as a quick test, though a
 
 ## Tab Sources
 
-PickHero reads Guitar Pro files (`.gp3`, `.gp4`, `.gp5`, `.gp7`, `.gp8`). You can get tabs from:
+PickHero reads Guitar Pro files (`.gp3`, `.gp4`, `.gp5`, `.gpx`, `.gp7`, `.gp8`). You can get tabs from:
 
 - **Songsterr** — 1M+ songs, GP5 download via built-in downloader
 - **GProTab.net** — 70K+ free Guitar Pro files
@@ -52,7 +52,7 @@ PickHero reads Guitar Pro files (`.gp3`, `.gp4`, `.gp5`, `.gp7`, `.gp8`). You ca
 | Audio capture | `sounddevice` | Works with any USB audio device, low latency |
 | Pitch detection | `aubio` (YIN) | Real-time, pure C, tiny footprint |
 | Onset detection | `aubio` | Detects note strikes for timing |
-| Tab parsing | `pyguitarpro` | Reads GP3/GP4/GP5 structured data |
+| Tab parsing | `pyguitarpro` + native XML/BCFZ | Reads GP3/GP4/GP5 via pyguitarpro; GP6/GP7/GP8 via native parser |
 | UI | `pygame` | Game-loop oriented, fast rendering |
 | Audio playback | `pygame.midi` | Real-time MIDI backing tracks via system synth |
 | Packaging | `PyInstaller` | Single .exe for Windows |

@@ -37,17 +37,17 @@ class App:
         self._song_path: Path | None = None
         self._track_index: int = 0
         self._track_count: int = 0
+        # Transient on-screen error message (replacing print-only errors)
+        self._error_message: str = ""
+        self._error_expiry_ms: float = 0.0
 
     def run(self) -> None:
         """Initialize PyGame, run main loop, clean up."""
-        # Apply saved theme
-        set_theme(self._config.theme)
-
         # Validate saved audio device — fall back to default if unavailable
         if not validate_device_index(self._config.audio.device_index):
-            print(
-                f"Saved audio device #{self._config.audio.device_index} not available, "
-                "falling back to system default."
+            self._show_error(
+                f"Audio device #{self._config.audio.device_index} not available, "
+                "using default."
             )
             self._config.audio.device_index = None
             self._config.save()
@@ -181,9 +181,9 @@ class App:
             timeline = load_gp_file(path, track_index if track_index >= 0 else None)
         except Exception as e:
             try:
-                print(f"Error loading {path}: {e}")
+                self._show_error(f"Error loading {path.name}: {e}")
             except UnicodeEncodeError:
-                print(f"Error loading {path}: {type(e).__name__}")
+                self._show_error(f"Error loading {path.name}: {type(e).__name__}")
             return
 
         self._song_path = path
@@ -192,7 +192,9 @@ class App:
         # Determine total track count from the file
         try:
             self._track_count = len(list_tracks(path))
-        except Exception:
+        except Exception as e:
+            # Parse failure: don't pretend there's only one track silently.
+            self._show_error(f"Could not enumerate tracks in {path.name}: {e}", duration_ms=3000.0)
             self._track_count = 1
 
         # Extract backing track (non-guitar tracks as MIDI)
@@ -202,7 +204,8 @@ class App:
                 path, exclude_track_indices={timeline.metadata.track_index},
             )
         except Exception as e:
-            print(f"Backing track extraction failed: {e}")
+            self._show_error(f"Backing track extraction failed: {e}", duration_ms=3000.0)
+            # backing_track stays None — playback continues without accompaniment
 
         dc = self._config.display
         self._playing_screen = PlayingScreen(
@@ -213,8 +216,8 @@ class App:
             backing_track=backing_track,
             progress_tracker=self._progress,
             song_key=path.stem,
+            on_error=self._show_error,
         )
-        self._state = "playing"
         pygame.display.set_caption(
             f"PickHero — {timeline.metadata.artist} — {timeline.metadata.title}"
             .replace(" —  — ", " — ")
@@ -227,7 +230,33 @@ class App:
             if seek_to > 0:
                 self._playing_screen.seek(seek_to)
 
+    def _show_error(self, message: str, duration_ms: float = 4000.0) -> None:
+        """Display a transient error banner and also log to stderr."""
+        import sys
+        print(message, file=sys.stderr)
+        self._error_message = message
+        self._error_expiry_ms = pygame.time.get_ticks() + duration_ms
+
+    def _update_error(self) -> None:
+        """Clear expired error banner."""
+        if self._error_message and pygame.time.get_ticks() > self._error_expiry_ms:
+            self._error_message = ""
+
+    def _draw_error(self, surface: pygame.Surface) -> None:
+        """Render the active error banner at the top of the screen."""
+        if not self._error_message:
+            return
+        font = pygame.font.SysFont("arial", 20)
+        text = font.render(self._error_message, True, (255, 80, 80))
+        pad = 8
+        bg = pygame.Surface((text.get_width() + pad * 2, text.get_height() + pad * 2), pygame.SRCALPHA)
+        bg.fill((30, 10, 10, 220))
+        bg.blit(text, (pad, pad))
+        x = (surface.get_width() - bg.get_width()) // 2
+        surface.blit(bg, (x, 10))
+
     def _update(self) -> None:
+        self._update_error()
         if self._state == "playing" and self._playing_screen is not None:
             self._playing_screen.update()
         elif self._state == "calibration" and self._calibration_menu is not None:
@@ -244,3 +273,4 @@ class App:
             self._download_menu.render(surface)
         elif self._state == "calibration" and self._calibration_menu is not None:
             self._calibration_menu.render(surface)
+        self._draw_error(surface)

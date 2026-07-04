@@ -18,9 +18,6 @@ from pickhero.config import Config, StringCalibration
 from pickhero.ui.colors import get_theme
 
 
-# String order for calibration: 6 (low E) → 1 (high E)
-STRING_ORDER = [6, 5, 4, 3, 2, 1]
-
 # Collection time per string (seconds)
 COLLECT_SECONDS = 3.0
 # Noise floor measurement time (seconds)
@@ -42,19 +39,19 @@ def _get_font(name: str, size: int) -> pygame.font.Font:
             return font
     return pygame.font.Font(None, size)
 
-
 class CalibrationMenuScreen:
-    """Step-by-step guitar calibration UI."""
+    """Step-by-step guitar/bass calibration UI."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, num_strings: int = 6,
+                 tuning: dict[int, int] | None = None):
         self._config = config
+        self._num_strings = max(1, min(12, num_strings))
+        self._tuning = tuning if tuning else dict(STANDARD_TUNING)
         self._capture: AudioCapture | None = None
         self._state = "intro"  # intro, noise, waiting, listen, confirm, done, latency_intro, latency_measure, latency_result
-        self._string_idx = 0  # index into STRING_ORDER
+        self._string_idx = 0  # index into _string_order
         self._start_time: float = 0.0
         self._waiting_start: float = 0.0
-
-        # Noise floor
         self._noise_samples: list[float] = []
         self._noise_floor_db: float = -80.0
 
@@ -72,14 +69,21 @@ class CalibrationMenuScreen:
         self._latency_waiting_for_note: bool = False
 
     @property
+    def _string_order(self) -> list[int]:
+        """String numbers to calibrate, lowest (thickest) to highest."""
+        return list(range(self._num_strings, 0, -1))
+
+    @property
     def _current_string(self) -> int:
         """String number currently being calibrated."""
-        return STRING_ORDER[self._string_idx]
+        return self._string_order[self._string_idx]
 
     @property
     def _current_note_name(self) -> str:
         """Expected open-string note name."""
-        midi = STANDARD_TUNING.get(self._current_string, 0)
+        midi = self._tuning.get(self._current_string, 0)
+        if midi <= 0:
+            return "?"
         return midi_to_name(midi)
 
     def handle_event(self, event: pygame.event.Event) -> str | None:
@@ -97,6 +101,10 @@ class CalibrationMenuScreen:
                 self._begin_noise()
             elif event.key == pygame.K_y:
                 self._state = "latency_intro"
+            elif event.key == pygame.K_LEFT and self._num_strings > 1:
+                self._num_strings = max(1, self._num_strings - 1)
+            elif event.key == pygame.K_RIGHT and self._num_strings < 12:
+                self._num_strings = min(12, self._num_strings + 1)
             return None
 
         if self._state == "latency_intro":
@@ -114,7 +122,7 @@ class CalibrationMenuScreen:
             if event.key == pygame.K_RETURN:
                 # Accept and move to next string or done
                 self._string_idx += 1
-                if self._string_idx >= len(STRING_ORDER):
+                if self._string_idx >= len(self._string_order):
                     self._stop_capture()
                     self._state = "done"
                 else:
@@ -190,7 +198,9 @@ class CalibrationMenuScreen:
             self._render_centered(surface, body_font,
                                   "Calibrate your guitar for more accurate detection.", t.hud_text, cy)
             self._render_centered(surface, body_font,
-                                  "Play each open string when prompted.", t.hud_text, cy + 32)
+                                  f"Strings: {self._num_strings}  (LEFT / RIGHT to change)", t.hud_text, cy + 32)
+            self._render_centered(surface, body_font,
+                                  "Play each open string when prompted.", t.hud_text, cy + 64)
             self._render_centered(surface, hint_font,
                                   "ENTER: begin  |  Y: latency calibration  |  ESC: cancel", t.hud_text, h - 36)
 
@@ -320,7 +330,7 @@ class CalibrationMenuScreen:
                                   "Calibration Complete!", t.hud_accent, cy - 40)
             # Summary
             summary_y = cy + 20
-            for s in STRING_ORDER:
+            for s in self._string_order:
                 cal = self._results.get(s)
                 if cal:
                     name = midi_to_name(cal.midi_note)

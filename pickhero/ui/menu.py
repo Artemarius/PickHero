@@ -71,7 +71,9 @@ class MenuScreen:
             for dev in list_audio_devices():
                 if dev["index"] == idx:
                     return dev["name"]
-        except Exception:
+        except (OSError, KeyError):
+            # PortAudioError is an OSError. Device enumeration failed
+            # (driver unloaded, device gone) — fall back to numeric index.
             pass
         return f"Device #{idx}"
 

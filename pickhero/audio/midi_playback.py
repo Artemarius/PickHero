@@ -94,7 +94,7 @@ class MidiPlayer:
             pygame.midi.init()
 
             # Scan devices for the best output: skip Midi Through (port 0/14),
-            # prefer something with "Synth", "Fluid", or "PipeWire" in the name.
+            # prefer real synthesizers like FluidSynth or PipeWire MIDI bridges.
             device_id = -1
             for i in range(pygame.midi.get_count()):
                 info = pygame.midi.get_device_info(i)
@@ -119,6 +119,9 @@ class MidiPlayer:
             self._opened = True
             return True
         except Exception as e:
+            # pygame.midi raises MidiException for device errors, but the import
+            # itself may fail before pygame.midi exists, so we can't reference
+            # MidiException here. Don't catch KeyboardInterrupt/SystemExit.
             print(f"MIDI init failed: {e}")
             return False
 

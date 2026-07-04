@@ -1,8 +1,10 @@
 """PickHero application entry point."""
 
+import argparse
 import sys
 from pathlib import Path
 
+from pickhero.audio.console import build_console_parser, options_from_args, run_console_test
 from pickhero.config import Config
 
 
@@ -19,28 +21,38 @@ def _resolve_songs_dir(config: Config) -> None:
 
 
 def main():
-    # Auto-detect Wayland for native rendering (avoids XWayland blur/tearing)
+    # Force X11 for stable rendering even on Wayland sessions. PyGame/SDL's
+    # Wayland backend is currently unreliable here (tearing, input issues).
     import os
     if os.environ.get('WAYLAND_DISPLAY') and not os.environ.get('SDL_VIDEODRIVER'):
-        os.environ['SDL_VIDEODRIVER'] = 'wayland'
+        os.environ['SDL_VIDEODRIVER'] = 'x11'
 
-    if "--version" in sys.argv:
+    parser = argparse.ArgumentParser(prog="pickhero", allow_abbrev=False)
+    parser.add_argument("--version", action="store_true", help="Show version and exit.")
+    parser.add_argument(
+        "--console",
+        action="store_true",
+        help="Run the audio input testing console instead of the GUI.",
+    )
+    build_console_parser(parser)
+    args = parser.parse_args()
+
+    if args.version:
         from pickhero import __version__
         print(f"PickHero {__version__}")
         sys.exit(0)
-    if "--console" in sys.argv:
-        # Phase 1 console demo for audio testing
-        from pickhero.audio.input import run_console_demo
+
+    if args.console:
         try:
-            run_console_demo()
+            run_console_test(options_from_args(args))
         except KeyboardInterrupt:
             print("\nStopped.")
-            sys.exit(0)
-    else:
-        config = Config.load()
-        _resolve_songs_dir(config)
-        from pickhero.ui.app import App
-        App(config=config).run()
+        sys.exit(0)
+
+    config = Config.load()
+    _resolve_songs_dir(config)
+    from pickhero.ui.app import App
+    App(config=config).run()
 
 
 if __name__ == "__main__":

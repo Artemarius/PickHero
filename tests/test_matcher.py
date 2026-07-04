@@ -1,5 +1,6 @@
 """Tests for pickhero.matcher module."""
 
+import numpy as np
 import pytest
 
 from pickhero.audio.detector import DetectedNote
@@ -170,6 +171,36 @@ class TestChordMatching:
         assert matcher.get_note_state(note_a) == MatchType.HIT
         assert matcher.get_note_state(note_b) == MatchType.PENDING
 
+    def test_fft_chord_verification_matches_missed_fifth(self):
+        """FFT chord verification can match the fifth even if YIN missed it."""
+        from pickhero.audio.chord_detector import ChordDetector
+
+        root = _note_event(1000.0, midi_note=40, string=6)  # E2
+        fifth = _note_event(1000.0, midi_note=47, string=5)  # B2
+        matcher = _make_matcher([root, fifth], chord_threshold_ms=50.0)
+
+        chord_detector = ChordDetector(sample_rate=48000)
+        # Feed a synthetic E5 power chord into the chord detector.
+        sr = 48000
+        samples = int(sr * 0.5)
+        t = np.arange(samples) / sr
+        signal = np.zeros(samples)
+        for midi in (40, 47):
+            freq = 440.0 * (2.0 ** ((midi - 69) / 12.0))
+            for h in range(1, 6):
+                signal += np.sin(2 * np.pi * freq * h * t) / h
+        signal = (signal / np.max(np.abs(signal)) * 0.5).astype(np.float32)
+        chord_detector.push_audio(signal)
+
+        # YIN misses both notes. Chord verification should still pick up the chord.
+        matcher.process_detected_notes([], 1050.0)
+        assert matcher.get_note_state(root) == MatchType.PENDING
+        assert matcher.get_note_state(fifth) == MatchType.PENDING
+
+        results = matcher.verify_chord_at(1050.0, chord_detector)
+        assert any(r.match_type in (MatchType.HIT, MatchType.CLOSE) for r in results)
+        assert matcher.get_note_state(root) == MatchType.HIT
+        assert matcher.get_note_state(fifth) == MatchType.HIT
 
 class TestOnsetOnly:
     def test_non_onset_detections_filtered(self):

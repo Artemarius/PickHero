@@ -29,6 +29,8 @@ class ChordDetector:
         self.fft_size = fft_size
         self._buffer = np.zeros(fft_size, dtype=np.float32)
         self._buffer_fill = 0
+        # Precompute Hann window — avoids reallocating on every verify_chord call.
+        self._window = np.hanning(fft_size).astype(np.float32)
 
     def set_sample_rate(self, sr: int) -> None:
         if sr != self.sample_rate:
@@ -36,21 +38,34 @@ class ChordDetector:
             self._buffer = np.zeros(self.fft_size, dtype=np.float32)
             self._buffer_fill = 0
 
+    def reset(self) -> None:
+        """Clear the audio ring buffer.
+
+        Call on seek/restart so a chord check immediately after seeking doesn't
+        verify against stale audio captured before the seek point.
+        """
+        self._buffer[:] = 0
+        self._buffer_fill = 0
+
     def push_audio(self, samples: np.ndarray) -> None:
-        """Add audio samples to the ring buffer."""
+        """Add audio samples to the ring buffer, keeping the most recent fft_size samples."""
         samples = samples.astype(np.float32, copy=False)
         n = len(samples)
         if n == 0:
             return
 
-        if self._buffer_fill + n <= self.fft_size:
+        if n >= self.fft_size:
+            # Input larger than buffer: keep only the most recent fft_size samples.
+            self._buffer[:] = samples[-self.fft_size:]
+            self._buffer_fill = self.fft_size
+        elif self._buffer_fill + n <= self.fft_size:
             self._buffer[self._buffer_fill:self._buffer_fill + n] = samples
             self._buffer_fill += n
         else:
-            # Shift buffer left and append new samples
+            # Shift buffer left and append new samples.
             keep = self.fft_size - n
-            self._buffer[:keep] = self._buffer[n:self.fft_size]
-            self._buffer[keep:] = samples[:self.fft_size - keep]
+            self._buffer[:keep] = self._buffer[self._buffer_fill - keep:self._buffer_fill]
+            self._buffer[keep:] = samples
             self._buffer_fill = self.fft_size
 
     def verify_chord(self, expected_midi_notes: list[int]) -> list[bool]:
@@ -67,15 +82,18 @@ class ChordDetector:
         if self._buffer_fill < self.fft_size // 2:
             return [False] * len(expected_midi_notes)
 
-        # FFT with Hann window
-        buf = self._buffer[:self.fft_size] * np.hanning(self.fft_size)
+        # FFT with precomputed Hann window
+        buf = self._buffer[:self.fft_size] * self._window
         spectrum = np.abs(np.fft.rfft(buf))
         freqs = np.fft.rfftfreq(self.fft_size, 1.0 / self.sample_rate)
 
-        # Find overall peak for relative threshold
-        peak_energy = np.max(spectrum)
-        if peak_energy < 1e-6:
+        # Global noise floor: a note counts as present only if it rises above
+        # the spectrum's 75th percentile, not just the median. This is more
+        # robust against random peaks in broadband noise.
+        global_peak = float(np.max(spectrum))
+        if global_peak < 1e-6:
             return [False] * len(expected_midi_notes)
+        noise_floor = float(np.percentile(spectrum, 75))
 
         # For each expected note, check energy at its fundamental and
         # first harmonic (2nd harmonic is strongest on guitar)
@@ -89,8 +107,11 @@ class ChordDetector:
             harm_energy = self._freq_energy(spectrum, freqs, freq * 2.0)
             total = max(energy, harm_energy * 0.7)
 
-            # Note is present if energy is at least 15% of peak
-            results.append(total >= peak_energy * 0.15)
+            # Note is present if it clears the noise floor by a healthy margin
+            # AND is at least 15% of the global peak. The floor check prevents
+            # a single loud fundamental from drowning out quieter chord tones
+            # (the old global-peak-only threshold failed on spread voicings).
+            results.append(total >= global_peak * 0.15 and total > noise_floor * 3.0)
 
         return results
 

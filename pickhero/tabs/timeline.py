@@ -17,7 +17,7 @@ class NoteEvent:
     timestamp_ms: float
     duration_ms: float
     midi_note: int
-    string: int  # 1-6 (1=high E)
+    string: int  # 1-N (1 = highest pitched string in the tab)
     fret: int    # 0=open
     measure: int = 0  # measure index (0-based)
     expected_articulation: str | None = None  # "hammer_on", "pull_off", "bend", "vibrato", "slide", "palm_mute", "harmonic"
@@ -29,8 +29,8 @@ class NoteEvent:
             raise ValueError(f"duration_ms must be >= 0, got {self.duration_ms}")
         if not 0 <= self.midi_note <= 127:
             raise ValueError(f"midi_note must be 0-127, got {self.midi_note}")
-        if not 1 <= self.string <= 6:
-            raise ValueError(f"string must be 1-6, got {self.string}")
+        if not 1 <= self.string <= 12:
+            raise ValueError(f"string must be 1-12, got {self.string}")
         if self.fret < 0:
             raise ValueError(f"fret must be >= 0, got {self.fret}")
 
@@ -46,7 +46,6 @@ class MeasureInfo:
     start_ms: float
     end_ms: float
 
-
 @dataclass
 class SongMetadata:
     """Metadata extracted from a GP file."""
@@ -57,9 +56,8 @@ class SongMetadata:
     track_name: str = ""
     tempo: int = 120
     tuning: dict[int, int] = field(default_factory=dict)
+    num_strings: int = 6
     track_index: int = 0
-
-
 class Timeline:
     """Sorted collection of NoteEvents with efficient range queries."""
 
@@ -100,6 +98,20 @@ class Timeline:
         left = bisect.bisect_left(self._timestamps, start_ms)
         right = bisect.bisect_left(self._timestamps, end_ms)
         return self._notes[left:right]
+
+    def get_notes_before(self, end_ms: float, from_index: int = 0) -> tuple[list[NoteEvent], int]:
+        """Return (notes with timestamp_ms < end_ms starting at from_index, new_index).
+
+        Callers tracking a monotonic scan cursor pass their last index as
+        ``from_index`` and receive the new index just past the returned notes,
+        so each call scans only newly-passed notes — O(new) per call, not O(total).
+        """
+        if from_index >= len(self._notes):
+            return [], from_index
+        right = bisect.bisect_left(self._timestamps, end_ms, lo=from_index)
+        if right <= from_index:
+            return [], from_index
+        return self._notes[from_index:right], right
 
     def get_active_notes_at_time(self, time_ms: float, window_ms: float = 100.0) -> list[NoteEvent]:
         """Return notes that overlap the window [time_ms - window_ms, time_ms + window_ms].

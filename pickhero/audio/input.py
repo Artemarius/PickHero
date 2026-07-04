@@ -62,9 +62,16 @@ class AudioCapture:
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
         """Sounddevice callback — runs in audio thread."""
         if status:
-            # Overflow or other issue — count and skip this buffer
-            self._xrun_count += 1
-            return
+            # Count xruns. Only hard-drop the buffer on input underflow or
+            # output errors; input overflow usually still delivers usable
+            # audio, so dropping it guarantees a miss. Keep processing.
+            if "input overflow" in str(status).lower():
+                self._xrun_count += 1
+            elif "input underflow" in str(status).lower() or "output" in str(status).lower():
+                self._xrun_count += 1
+                return
+            else:
+                self._xrun_count += 1
 
         # indata shape: (frames, channels) — take first channel
         mono = indata[:, 0].copy()
@@ -133,7 +140,7 @@ class AudioCapture:
             samples_into_stream = float(chunk_start_sample)
 
         # Algorithmic delay of the onset detector (samples)
-        delay_samples = float(self.detector._onset.get_delay())
+        delay_samples = float(self.detector.get_onset_delay())
 
         # Wall-clock time of the onset = buffer ADC time + onset offset in stream
         #   minus algorithmic delay. _start_time is the ADC time of the very first
@@ -196,6 +203,7 @@ class AudioCapture:
             calibration=calibration if calibration else None,
         )
         self.detector.reset()
+        self.chord_detector.reset()
         self.chord_detector.set_sample_rate(ac.sample_rate)
         # Drain any leftover notes
         while not self.note_queue.empty():
@@ -216,9 +224,9 @@ class AudioCapture:
         if sys.platform == 'win32':
             try:
                 extra = sd.WasapiSettings(exclusive=True)
-            except (AttributeError, Exception):
+            except AttributeError:
+                # Older sounddevice without WasapiSettings — shared mode only.
                 pass
-
         try:
             self._stream = sd.InputStream(
                 device=resolved,
@@ -311,62 +319,3 @@ def validate_device_index(index: int | None) -> bool:
     except (sd.PortAudioError, IndexError, ValueError):
         return False
 
-
-def run_console_demo():
-    """Interactive console demo for testing pitch detection.
-
-    Lists audio devices, lets user pick one, then prints detected notes in real-time.
-    """
-    print("Available audio input devices:")
-    print("-" * 50)
-    devices = list_audio_devices()
-    if not devices:
-        print("No audio input devices found!")
-        return
-
-    for dev in devices:
-        marker = " *" if dev["index"] == sd.default.device[0] else ""
-        print(f"  [{dev['index']}] {dev['name']} ({dev['channels']}ch, {dev['sample_rate']:.0f}Hz){marker}")
-    print()
-
-    choice = input("Select device index (Enter for default): ").strip()
-    config = Config()
-    if choice:
-        try:
-            idx = int(choice)
-            config.audio.device_index = idx
-            # Use the device's native sample rate so it works even for
-            # non-standard devices (headsets, USB mics at 48k, etc.)
-            info = sd.query_devices(idx)
-            if info["default_samplerate"]:
-                config.audio.sample_rate = int(info["default_samplerate"])
-        except ValueError:
-            print("Invalid input, using default device.")
-
-    print()
-    print("Listening... play some notes! (Ctrl+C to stop)")
-    print(f"  Config: buf={config.audio.buf_size}, hop={config.audio.hop_size}, "
-          f"confidence>={config.audio.confidence_threshold}, noise_gate={config.audio.noise_gate_db}dB")
-    print("-" * 60)
-    print(f"{'Time':>8}  {'Note':>5}  {'MIDI':>4}  {'Freq':>8}  {'Conf':>5}  {'Onset'}")
-    print("-" * 60)
-
-    capture = AudioCapture(config)
-    capture.start()
-
-    last_note = ""
-    try:
-        while True:
-            notes = capture.get_notes()
-            for tn in notes:
-                n = tn.note
-                # Only print on onset or note change to reduce spam
-                current = n.name
-                if n.is_onset or current != last_note:
-                    onset_marker = ">>>" if n.is_onset else "   "
-                    print(f"{tn.timestamp_ms:7.0f}ms  {n.name:>5}  {n.midi_note:>4}  "
-                          f"{n.frequency:7.1f}Hz  {n.confidence:.2f}  {onset_marker}")
-                    last_note = current
-            time.sleep(0.01)  # ~100Hz polling, avoid busy-wait
-    finally:
-        capture.stop()

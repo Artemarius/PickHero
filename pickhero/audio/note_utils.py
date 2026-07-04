@@ -22,10 +22,13 @@ STANDARD_TUNING = {
     5: 45,  # A2
     6: 40,  # E2
 }
+# Guitar/bass range: low B0 of a 5-string bass (23) to high E 24th fret on guitar (88).
+# Covers 4-8 string guitars and 4-6 string basses with generous headroom.
+GUITAR_MIDI_MIN = 23
+GUITAR_MIDI_MAX = 96
 
-# Guitar range: low E open (40) to high E 24th fret (88)
-GUITAR_MIDI_MIN = 40
-GUITAR_MIDI_MAX = 88
+# Maximum string count we will render / validate.
+MAX_STRINGS = 12
 
 # Number of frets on a standard guitar
 MAX_FRETS = 24
@@ -96,15 +99,22 @@ def fret_to_midi(string: int, fret: int, tuning: dict[int, int] | None = None) -
     """Convert guitar string + fret to MIDI note number.
 
     Args:
-        string: String number (1-6, where 1=high E).
+        string: String number (1-N, where 1 = highest pitched string).
         fret: Fret number (0=open).
-        tuning: Optional custom tuning dict {string_num: midi_note}.
-                Defaults to standard tuning.
+        tuning: Optional custom tuning dict {string_num: midi_note}. Missing
+                strings fall back to STANDARD_TUNING when available.
+
+    Returns:
+        MIDI note number, or -1 if the string is not defined.
     """
-    if tuning is None:
-        tuning = STANDARD_TUNING
-    open_note = tuning.get(string)
+    if string < 1 or string > MAX_STRINGS:
+        return -1
+    if fret < 0:
+        return -1
+    open_note = tuning.get(string) if tuning else None
     if open_note is None:
+        open_note = STANDARD_TUNING.get(string, -1)
+    if open_note < 0:
         return -1
     return open_note + fret
 
@@ -112,16 +122,18 @@ def fret_to_midi(string: int, fret: int, tuning: dict[int, int] | None = None) -
 def midi_to_fret_options(midi_note: int, tuning: dict[int, int] | None = None) -> list[tuple[int, int]]:
     """Find all (string, fret) combinations that produce a given MIDI note.
 
-    Returns list of (string, fret) tuples, sorted by string number (high to low).
-    Only returns positions within 0-MAX_FRETS range.
+    Accepts custom tunings for extended-range instruments.
     """
-    if tuning is None:
-        tuning = STANDARD_TUNING
-    options = []
-    for string_num, open_midi in tuning.items():
-        fret = midi_note - open_midi
+    if midi_note < 0 or midi_note > 127:
+        return []
+    options: list[tuple[int, int]] = []
+    source = tuning if tuning else STANDARD_TUNING
+    for string, open_note in source.items():
+        if not 1 <= string <= MAX_STRINGS:
+            continue
+        fret = midi_note - open_note
         if 0 <= fret <= MAX_FRETS:
-            options.append((string_num, fret))
+            options.append((string, fret))
     return sorted(options, key=lambda x: x[0])
 
 

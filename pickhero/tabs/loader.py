@@ -16,15 +16,15 @@ import guitarpro
 from pickhero.audio.midi_playback import (
     NOTE_ON, NOTE_OFF, PROGRAM_CHANGE, BackingTrack, MidiEvent,
 )
+from pickhero.tabs import gpx
 from pickhero.tabs.timeline import MeasureInfo, NoteEvent, SongMetadata, Timeline
 
 # GP tick resolution: 960 ticks = 1 quarter note
 TICKS_PER_QUARTER = 960
 
-# MIDI program numbers for guitar instruments (General MIDI)
+# MIDI program numbers for guitar/bass instruments (General MIDI)
 GUITAR_INSTRUMENT_MIN = 24  # Nylon String Guitar
-GUITAR_INSTRUMENT_MAX = 31  # Guitar Harmonics
-
+GUITAR_INSTRUMENT_MAX = 39  # Electric Bass (pick), also covers Synth Bass
 
 class TempoMap:
     """Maps absolute tick positions to milliseconds, handling tempo changes."""
@@ -74,12 +74,13 @@ class TempoMap:
 
 
 def is_guitar_track(track: guitarpro.Track) -> bool:
-    """Check if a track is a guitar track.
+    """Check if a track is a guitar or bass track.
 
-    Criteria: 6 strings, MIDI instrument 24-31, not percussion.
+    Accepts 4-8 stringed fretted instruments in the guitar/bass MIDI
+    program range (24-39), excluding percussion.
     """
     return (
-        len(track.strings) == 6
+        4 <= len(track.strings) <= 8
         and GUITAR_INSTRUMENT_MIN <= track.channel.instrument <= GUITAR_INSTRUMENT_MAX
         and not track.channel.isPercussionChannel
     )
@@ -186,9 +187,31 @@ def _extract_measures(track: guitarpro.Track, tempo_map: TempoMap) -> list[Measu
 def list_tracks(path: str | Path) -> list[dict]:
     """List all tracks in a GP file with metadata.
 
-    Returns a list of dicts with keys: index, name, strings, instrument,
-    is_percussion, is_guitar.
+    Supports GP3/GP4/GP5 via pyguitarpro and GP6/GP7/GP8 via score.gpif XML.
     """
+    if _is_gp7_file(path) or _is_gpx_file(path):
+        # Load the GPIF XML and list tracks without building a full timeline.
+        if _is_gp7_file(path):
+            with zipfile.ZipFile(str(path)) as zf:
+                gpif = zf.read("Content/score.gpif").decode("utf-8")
+        else:
+            gpif_bytes = gpx.extract_score_gpif(path)
+            if gpif_bytes is None:
+                return []
+            gpif = gpif_bytes.decode("utf-8", errors="replace")
+        root = ET.fromstring(gpif)
+        track_list = _parse_gpif_track_list(root)
+        return [
+            {
+                "index": i,
+                "name": ti["name"],
+                "strings": ti["num_strings"],
+                "instrument": ti["midi_program"],
+                "is_percussion": ti["is_percussion"],
+                "is_guitar": ti["is_guitar"],
+            }
+            for i, ti in enumerate(track_list)
+        ]
     song = guitarpro.parse(str(path))
     tracks = []
     for i, track in enumerate(song.tracks):
@@ -213,6 +236,63 @@ def _is_gp7_file(path: str | Path) -> bool:
         return False
 
 
+def _is_gpx_file(path: str | Path) -> bool:
+    """Check if a file is GP6 format (BCFZ/BCFS container)."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(4)
+        return header in (b"BCFZ", b"BCFS")
+    except OSError:
+        return False
+
+
+def _parse_gpif_track_list(root: ET.Element) -> list[dict]:
+    """Parse the <Tracks> element of a score.gpif XML tree.
+
+    Returns a list of track info dicts used by both _parse_gpif_xml and
+    list_tracks. The dict layout matches the one returned by list_tracks.
+    """
+    track_list: list[dict] = []
+    tracks_el = root.find("Tracks")
+    if tracks_el is None:
+        return track_list
+    for t in tracks_el.findall("Track"):
+        tuning_pitches: list[int] = []
+        for prop in t.findall(".//Property"):
+            if prop.get("name") == "Tuning":
+                raw = prop.findtext("Pitches", "")
+                tuning_pitches = [int(x) for x in raw.split() if x]
+        midi_prog = -1
+        try:
+            midi_prog = int(t.findtext(".//MIDI/Program", "-1"))
+        except ValueError:
+            pass
+        is_drum = (midi_prog == 1024 or
+                   t.findtext(".//InstrumentSet", "") == "drums")
+        track_list.append({
+            "id": t.get("id", ""),
+            "name": t.findtext("Name", "").strip(),
+            "tuning": tuning_pitches,
+            "midi_program": midi_prog,
+            "num_strings": len(tuning_pitches),
+            "is_guitar": (
+                4 <= len(tuning_pitches) <= 8
+                and GUITAR_INSTRUMENT_MIN <= midi_prog <= GUITAR_INSTRUMENT_MAX
+            ),
+            "is_percussion": is_drum,
+        })
+    return track_list
+
+
+def _load_gpx_file(path: str | Path, track_index: int | None = None) -> Timeline:
+    """Load a GP6 file (BCFZ/BCFS compressed container with score.gpif XML)."""
+    gpif_bytes = gpx.extract_score_gpif(path)
+    if gpif_bytes is None:
+        raise ValueError(f"Could not find score.gpif in GP6 file: {path}")
+    gpif = gpif_bytes.decode("utf-8", errors="replace")
+    return _parse_gpif_xml(gpif, track_index)
+
+
 # ── GP7/GP8 loader ──────────────────────────────────────────────────────────
 
 # Rhythm note value → duration in quarter notes
@@ -226,7 +306,15 @@ def _load_gp7_file(path: str | Path, track_index: int | None = None) -> Timeline
     """Load a GP7/GP8 file (ZIP containing Content/score.gpif XML)."""
     with zipfile.ZipFile(str(path)) as zf:
         gpif = zf.read("Content/score.gpif").decode("utf-8")
+    return _parse_gpif_xml(gpif, track_index)
 
+
+def _parse_gpif_xml(gpif: str, track_index: int | None = None) -> Timeline:
+    """Parse a ``score.gpif`` XML string into a Timeline.
+
+    Shared by the GP7/GP8 (ZIP container) and GP6 (BCFZ/BCFS container)
+    loaders — both formats use the same GPIF XML schema.
+    """
     root = ET.fromstring(gpif)
 
     # ── Parse lookup tables ──────────────────────────────────────────────
@@ -320,36 +408,7 @@ def _load_gp7_file(path: str | Path, track_index: int | None = None) -> Timeline
 
     # ── Parse tracks ─────────────────────────────────────────────────────
 
-    track_list: list[dict] = []
-    tracks_el = root.find("Tracks")
-    if tracks_el is not None:
-        for t in tracks_el.findall("Track"):
-            tuning_pitches: list[int] = []
-            for prop in t.findall(".//Property"):
-                if prop.get("name") == "Tuning":
-                    raw = prop.findtext("Pitches", "")
-                    tuning_pitches = [int(x) for x in raw.split() if x]
-            midi_prog = -1
-            try:
-                midi_prog = int(t.findtext(".//MIDI/Program", "-1"))
-            except ValueError:
-                pass
-            is_drum = (midi_prog == 1024 or
-                       t.findtext(".//InstrumentSet", "") == "drums")
-            # Heuristic: drums have instrumentId=1024 in the search API;
-            # in GPIF the program is the GM number. Drum kits use channel 10.
-            track_list.append({
-                "id": t.get("id", ""),
-                "name": t.findtext("Name", "").strip(),
-                "tuning": tuning_pitches,
-                "midi_program": midi_prog,
-                "num_strings": len(tuning_pitches),
-                "is_guitar": (
-                    len(tuning_pitches) == 6
-                    and GUITAR_INSTRUMENT_MIN <= midi_prog <= GUITAR_INSTRUMENT_MAX
-                ),
-                "is_percussion": is_drum,
-            })
+    track_list = _parse_gpif_track_list(root)
 
     # ── Select track ─────────────────────────────────────────────────────
 
@@ -363,13 +422,14 @@ def _load_gp7_file(path: str | Path, track_index: int | None = None) -> Timeline
                 break
 
     sel = track_list[selected_index]
-    tuning = sel["tuning"]  # [low_E, A, D, G, B, high_E] (0-indexed)
+    tuning = sel["tuning"]  # [high_E, B, G, D, A, low_E] (0-indexed)
     num_strings = sel["num_strings"] or 6
 
-    # Build our tuning dict: {1: high_E_midi, ..., 6: low_E_midi}
+    # Build our tuning dict using the same convention as GP3/GP4/GP5:
+    # string 1 = high E (top lane), string 6 = low E (bottom lane).
     tuning_dict: dict[int, int] = {}
     for gp7_idx, midi_val in enumerate(tuning):
-        our_string = num_strings - gp7_idx  # 0→6, 1→5, ..., 5→1
+        our_string = gp7_idx + 1  # 0→1, 1→2, ..., 5→6
         tuning_dict[our_string] = midi_val
 
     # ── Parse tempos ─────────────────────────────────────────────────────
@@ -428,7 +488,7 @@ def _load_gp7_file(path: str | Path, track_index: int | None = None) -> Timeline
                         if nid not in notes_map:
                             continue
                         fret, gp7_string = notes_map[nid]
-                        our_string = num_strings - gp7_string
+                        our_string = gp7_string + 1  # match GP5 convention: 1=high E
                         if not 1 <= our_string <= 6:
                             continue
                         if gp7_string < len(tuning):
@@ -470,6 +530,7 @@ def _load_gp7_file(path: str | Path, track_index: int | None = None) -> Timeline
         track_name=sel["name"],
         tempo=int(initial_bpm),
         tuning=tuning_dict,
+        num_strings=num_strings,
         track_index=selected_index,
     )
 
@@ -703,12 +764,14 @@ def load_gp_file(path: str | Path, track_index: int | None = None) -> Timeline:
     """Load a GP file and return a Timeline.
 
     Args:
-        path: Path to GP3/GP4/GP5/GP7/GP8 file.
+        path: Path to GP3/GP4/GP5/GP6/GP7/GP8 file.
         track_index: Explicit track index to load. If None, auto-selects
                      the first guitar track (or track 0 as fallback).
     """
     if _is_gp7_file(path):
         return _load_gp7_file(path, track_index)
+    if _is_gpx_file(path):
+        return _load_gpx_file(path, track_index)
 
     song = guitarpro.parse(str(path))
     tempo_map = _build_tempo_map(song)
@@ -728,7 +791,6 @@ def load_gp_file(path: str | Path, track_index: int | None = None) -> Timeline:
 
     notes = _extract_notes(track, tempo_map)
     measures = _extract_measures(track, tempo_map)
-
     metadata = SongMetadata(
         title=song.title or "",
         artist=song.artist or "",
@@ -736,6 +798,7 @@ def load_gp_file(path: str | Path, track_index: int | None = None) -> Timeline:
         track_name=track.name or "",
         tempo=song.tempo,
         tuning=_extract_tuning(track),
+        num_strings=len(track.strings),
         track_index=selected_index,
     )
 
@@ -758,6 +821,10 @@ def extract_backing_track(
     """
     if _is_gp7_file(path):
         return _extract_gp7_backing_track(path, exclude_track_indices)
+    if _is_gpx_file(path):
+        # GP6 backing tracks are not implemented yet; the GPIF schema stores
+        # them differently than GP7 and a dedicated parser is not in scope.
+        return BackingTrack([])
 
     song = guitarpro.parse(str(path))
     tempo_map = _build_tempo_map(song)
