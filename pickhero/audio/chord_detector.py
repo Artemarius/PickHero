@@ -90,9 +90,10 @@ class ChordDetector:
         self._window = np.hanning(fft_size).astype(np.float32)
         # Precompute FFT frequency axis (only positive frequencies).
         self._freqs = np.fft.rfftfreq(fft_size, 1.0 / sample_rate)
-        # Onset-gating cache: (result, wall_time_when_cached)
+        # Onset-gating cache: (result, wall_time, notes_verified)
         self._cached_result: list[bool] | None = None
         self._cache_time: float = 0.0
+        self._cached_notes: tuple[int, ...] | None = None
         # Per-string harmonic templates (from calibration). Optional.
         # {midi_note: np.array of length _NUM_HARMONICS}
         self._string_templates: dict[int, np.ndarray] = {}
@@ -114,6 +115,7 @@ class ChordDetector:
         self._buffer[:] = 0
         self._buffer_fill = 0
         self._cached_result = None
+        self._cached_notes = None
 
     def set_string_templates(self, templates: dict[int, np.ndarray]) -> None:
         """Set per-string harmonic templates from calibration.
@@ -184,15 +186,12 @@ class ChordDetector:
         n = len(expected_midi_notes)
         if n == 0:
             return []
-
-        # Onset-gating: if no onset, return cached result (if still fresh).
+        # Onset-gating: if no onset, return cached result (if still fresh
+        # AND for the same chord notes — different chords must re-analyze).
         if not has_onset and self._cached_result is not None:
             age = time.monotonic() - self._cache_time
-            if age < _ONSET_CACHE_TTL_S:
-                # Pad/truncate cache to match current request length.
-                cached = self._cached_result
-                if len(cached) == n:
-                    return cached
+            if age < _ONSET_CACHE_TTL_S and self._cached_notes == tuple(expected_midi_notes):
+                return list(self._cached_result)
                 # Different chord shape — fall through to fresh analysis.
 
         if self._buffer_fill < self.fft_size // 2:
@@ -205,6 +204,7 @@ class ChordDetector:
         global_peak = float(np.max(spectrum))
         if global_peak < 1e-6:
             self._cached_result = [False] * n
+            self._cached_notes = tuple(expected_midi_notes)
             self._cache_time = time.monotonic()
             return self._cached_result
 
@@ -213,6 +213,7 @@ class ChordDetector:
         # --- Chroma pre-check: reject if the whole chord doesn't match ---
         if n >= 2 and not self._chroma_matches(spectrum, expected_midi_notes):
             self._cached_result = [False] * n
+            self._cached_notes = tuple(expected_midi_notes)
             self._cache_time = time.monotonic()
             return self._cached_result
 
@@ -231,6 +232,7 @@ class ChordDetector:
             results.append(present)
 
         self._cached_result = results
+        self._cached_notes = tuple(expected_midi_notes)
         self._cache_time = time.monotonic()
         return results
 
