@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from pickhero.audio.detector import DetectedNote
+from pickhero.audio.event_types import EventKindSnapshot
 from pickhero.audio.note_utils import freq_to_midi, midi_to_name, is_in_guitar_range
 
 if TYPE_CHECKING:
@@ -106,7 +107,7 @@ class StableNoteEvent:
     timestamp_ms: float      # onset timestamp (or first stable frame)
     performance: "PerformanceEvent | None"
     consensus_frames: int    # how many frames agreed
-
+    event_snapshot: EventKindSnapshot | None = None
 
 class TrackStabilizer:
     """Accumulates raw frames into stable note events.
@@ -383,6 +384,20 @@ class TrackStabilizer:
             onset_frame = track.frames[track.onset_frame_idx]
             onset_ts = onset_frame.timestamp_ms
 
+        # Snapshot the PerformanceEvent's state at emission time.
+        # This prevents race conditions where the mutable PerformanceEvent's
+        # event_kind changes between detection, stabilization, and matching.
+        event_snapshot = None
+        if recent[-1].performance is not None:
+            perf = recent[-1].performance
+            event_snapshot = EventKindSnapshot(
+                event_kind=perf.event_kind,
+                technique_candidates=tuple(perf.technique_candidates),
+                onset_ms=perf.onset_ms,
+                midi_note=perf.midi_note,
+                confidence=perf.confidence,
+            )
+
         event = StableNoteEvent(
             midi_note=midi_note,
             frequency=median_freq,
@@ -393,6 +408,7 @@ class TrackStabilizer:
             timestamp_ms=onset_ts,
             performance=recent[-1].performance,
             consensus_frames=len(recent),
+            event_snapshot=event_snapshot,
         )
         events.append(event)
         track.emitted = True
