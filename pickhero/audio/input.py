@@ -101,7 +101,11 @@ class AudioCapture:
         self._stabilizer = TrackStabilizer(
             sample_rate=ac.sample_rate, hop_size=ac.hop_size,
         )
-        # Unified worker thread: runs in background, processes audio from
+        # Tab context: expected MIDI notes near the current playback position.
+        # Fed to the stabilizer for octave resolution. Set by the playback
+        # loop (scrolling.py:update) via set_tab_context().
+        self._tab_expected_midi: list[int] = []
+        self._tab_context_ms: float = 0.0
         # _worker_in_queue.  Replaces the per-hop DSP that used to live in
         # _audio_callback for both portable and high_accuracy profiles.
         self._worker_in_queue: queue.Queue = queue.Queue(maxsize=256)
@@ -245,14 +249,27 @@ class AudioCapture:
 
         return max(0.0, onset_sample) / sample_rate * 1000.0
 
+    def set_tab_context(self, expected_midi: list[int], current_ms: float) -> None:
+        """Set the expected tab notes near the current playback position.
+
+        Called by the playback loop (scrolling.py:update) every frame.
+        The stabilizer uses this as a prior for octave resolution.
+        """
+        self._tab_expected_midi = expected_midi
+        self._tab_context_ms = current_ms
+
     def _emit_through_stabilizer(self, result: DetectedNote, ts_ms: float) -> None:
         """Feed a raw detection through the track stabilizer.
 
         Only stable note events (multi-frame consensus) reach the note queue.
-        This prevents octave glitches, noise transients, and sustain-frame spam
-        from reaching the matcher.
         """
-        events = self._stabilizer.process(result, ts_ms)
+        tab_prior = None
+        if self._tab_expected_midi:
+            tab_prior = min(
+                self._tab_expected_midi,
+                key=lambda m: abs(m - result.midi_note) if result.midi_note > 0 else abs(m - 60),
+            )
+        events = self._stabilizer.process(result, ts_ms, tab_prior_midi=tab_prior)
         for event in events:
             stable_note = DetectedNote(
                 midi_note=event.midi_note,

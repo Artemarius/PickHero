@@ -383,6 +383,16 @@ class PlayingScreen:
                 and self._audio_enabled
                 and self._audio_capture is not None
                 and self._matcher is not None):
+            # Feed tab context to the stabilizer for octave resolution.
+            # The tab prior helps the stabilizer resolve octave confusion
+            # during the attack transient (e.g., E2 vs E3).
+            window = self._config.timing_window_ms * 2
+            nearby = self._timeline.get_notes_in_range(
+                self._playback_ms - window,
+                self._playback_ms + window,
+            )
+            expected_midi = [n.midi_note for n in nearby]
+            self._audio_capture.set_tab_context(expected_midi, self._playback_ms)
             detected = self._audio_capture.get_notes()
             for d in detected:
                 d.timestamp_ms *= self._tempo_factor
