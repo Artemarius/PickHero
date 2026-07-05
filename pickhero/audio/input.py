@@ -262,6 +262,7 @@ class AudioCapture:
                 is_onset=event.is_onset,
                 onset_sample=event.onset_sample,
                 performance=event.performance,
+                event_snapshot=event.event_snapshot,
             )
             self.note_queue.put(
                 TimestampedNote(note=stable_note, timestamp_ms=event.timestamp_ms)
@@ -413,6 +414,7 @@ class AudioCapture:
                 is_onset=event.is_onset,
                 onset_sample=event.onset_sample,
                 performance=event.performance,
+                event_snapshot=event.event_snapshot,
             )
             self.note_queue.put(
                 TimestampedNote(note=stable_note, timestamp_ms=event.timestamp_ms)

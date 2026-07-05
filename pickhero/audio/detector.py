@@ -13,6 +13,7 @@ from pickhero.audio.note_utils import freq_to_midi, midi_to_name, is_in_guitar_r
 from pickhero.audio.articulation import ArticulationDetector
 
 if TYPE_CHECKING:
+    from pickhero.audio.event_types import EventKindSnapshot
     from pickhero.audio.performance import PerformanceEvent
 
 
@@ -26,6 +27,7 @@ class DetectedNote:
     is_onset: bool  # True if a new note strike was detected
     onset_sample: int | None = None  # absolute sample position of onset (from aubio get_last)
     performance: "PerformanceEvent | None" = None  # real-time per-note performance record (f0 curve, candidates)
+    event_snapshot: "EventKindSnapshot | None" = None  # immutable snapshot from stabilizer
 
 
 class PitchDetector:

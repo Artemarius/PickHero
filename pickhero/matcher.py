@@ -324,7 +324,12 @@ class NoteMatcher:
         # match without a pick onset.
         for ts_note in detected:
             event_kind = "pick_onset"
-            if ts_note.note.performance is not None:
+            # Prefer the immutable snapshot over the mutable PerformanceEvent.
+            # The snapshot captures event_kind at emission time, preventing
+            # race conditions where performance.event_kind changes after.
+            if ts_note.note.event_snapshot is not None:
+                event_kind = ts_note.note.event_snapshot.event_kind
+            elif ts_note.note.performance is not None:
                 event_kind = ts_note.note.performance.event_kind
 
             midi = ts_note.note.midi_note
