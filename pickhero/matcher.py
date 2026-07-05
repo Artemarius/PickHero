@@ -439,13 +439,19 @@ class NoteMatcher:
                 continue  # Single note, not a chord
 
             # Skip if every note in the chord is already resolved.
-            if not any(self._get_state(n) == MatchType.PENDING for n in group):
+            pending = [n for n in group if self._get_state(n) == MatchType.PENDING]
+            if not pending:
                 continue
 
             # Verify via FFT (onset-gated: fresh analysis on new strikes,
             # cached result during sustain to avoid flutter).
             expected_midi = [n.midi_note for n in group]
             present = chord_detector.verify_chord_with_onset(expected_midi, has_onset)
+
+            # Guard: if chord_detector returns a mismatched number of results
+            # (shouldn't happen, but defensive), skip this group entirely.
+            if len(present) != len(group):
+                continue
 
             matched_events = []
             all_present = True
@@ -463,6 +469,7 @@ class NoteMatcher:
                     matched_events=matched_events,
                     semitone_distance=0,
                 ))
+
 
         return results
 

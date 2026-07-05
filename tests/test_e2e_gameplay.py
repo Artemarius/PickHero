@@ -450,3 +450,139 @@ class TestChordDetectorCache:
         # Buffer is empty after reset → all False
         result = detector.verify_chord_with_onset([40, 47], has_onset=False)
         assert result == [False, False], f"After reset, should be [False, False], got {result}"
+
+
+# ===================================================================
+# Resilience: edge cases and adverse conditions
+# ===================================================================
+
+class TestChordDetectorResilience:
+    """ChordDetector must handle edge cases without crashing."""
+
+    def test_empty_expected_notes(self):
+        """verify_chord([]) returns [] without error."""
+        d = ChordDetector(sample_rate=48000)
+        assert d.verify_chord([]) == []
+        assert d.verify_chord_with_onset([], has_onset=True) == []
+
+    def test_duplicate_expected_notes(self):
+        """Duplicate MIDI notes in the chord list are handled gracefully."""
+        d = ChordDetector(sample_rate=48000)
+        _push_chord_signal(d, [40, 47])
+        results = d.verify_chord([40, 40, 47])
+        assert len(results) == 3, f"Should return 3 results, got {len(results)}"
+
+    def test_single_note_chord(self):
+        """A single-note 'chord' is handled (not treated as a chord by matcher,
+        but ChordDetector should still verify it correctly)."""
+        d = ChordDetector(sample_rate=48000)
+        _push_chord_signal(d, [40])
+        result = d.verify_chord([40])
+        assert result == [True], f"Single E2 should be detected, got {result}"
+
+    def test_sample_rate_change_clears_cache(self):
+        """Changing sample rate invalidates the cache and rebuilds bin tables."""
+        d = ChordDetector(sample_rate=48000)
+        _push_chord_signal(d, [40, 47])
+        d.verify_chord_with_onset([40, 47], has_onset=True)
+
+        d.set_sample_rate(44100)
+        # After SR change, buffer is empty → all False
+        result = d.verify_chord_with_onset([40, 47], has_onset=False)
+        assert result == [False, False], (
+            f"After SR change, should be [False, False], got {result}"
+        )
+
+    def test_seek_does_not_use_stale_audio(self):
+        """After reset (simulating a seek), chord verification starts fresh."""
+        d = ChordDetector(sample_rate=48000)
+        _push_chord_signal(d, [40, 47])
+        assert d.verify_chord([40, 47]) == [True, True]
+
+        d.reset()
+        # Push silence after reset
+        silence = np.zeros(int(48000 * 0.3), dtype=np.float32)
+        hop = 512
+        for i in range(0, len(silence), hop):
+            d.push_audio(silence[i:i + hop])
+
+        result = d.verify_chord([40, 47])
+        assert result == [False, False], (
+            f"After reset+silence, should be [False, False], got {result}"
+        )
+
+    def test_silence_not_detected(self):
+        """A silent buffer (all zeros) should not produce any detections."""
+        d = ChordDetector(sample_rate=48000)
+        silence = np.zeros(int(48000 * 0.5), dtype=np.float32)
+        d.push_audio(silence)
+        result = d.verify_chord([40])
+        assert result == [False], f"Silence should not be detected, got {result}"
+
+    def test_high_note_still_detected(self):
+        """Notes near the top of the guitar range (E4, MIDI 64) still work."""
+        d = ChordDetector(sample_rate=48000)
+        _push_chord_signal(d, [64])
+        result = d.verify_chord([64])
+        assert result == [True], f"E4 should be detected, got {result}"
+
+    def test_no_crash_on_rapid_push_small_chunks(self):
+        """Pushing tiny chunks (1 sample) doesn't crash or corrupt the buffer."""
+        d = ChordDetector(sample_rate=48000, fft_size=4096)
+        signal = np.random.uniform(-0.5, 0.5, 48000).astype(np.float32)
+        for s in signal:
+            d.push_audio(np.array([s], dtype=np.float32))
+        # Should not crash; result is unpredictable (noise) but must be valid
+        result = d.verify_chord([40, 47])
+        assert len(result) == 2
+        assert all(isinstance(r, bool) for r in result)
+
+    def test_verify_chord_performance(self):
+        """verify_chord completes in < 5ms on a 16384-point FFT.
+
+        The gameplay loop calls verify_chord every frame (~60fps = 16.7ms budget).
+        With onset-gating, most frames return the cache in <0.01ms; the fresh
+        analysis path (FFT + chroma + harmonic scoring) must stay under 5ms.
+        """
+        import time as perf_time
+
+        d = ChordDetector(sample_rate=48000, fft_size=16384)
+        _push_chord_signal(d, [40, 47, 52])
+
+        # Warm up (first call does FFT + cache population)
+        d.verify_chord_with_onset([40, 47, 52], has_onset=True)
+
+        # Measure 20 fresh-analysis calls (force onset=True to bypass cache)
+        times = []
+        for _ in range(20):
+            start = perf_time.perf_counter()
+            d.verify_chord_with_onset([40, 47, 52], has_onset=True)
+            elapsed = (perf_time.perf_counter() - start) * 1000
+            times.append(elapsed)
+
+        median_ms = sorted(times)[len(times) // 2]
+        assert median_ms < 5.0, (
+            f"verify_chord median {median_ms:.2f}ms exceeds 5ms budget. "
+            f"All times: {[f'{t:.2f}' for t in sorted(times)]}"
+        )
+
+    def test_cached_call_is_fast(self):
+        """Cached calls (has_onset=False) return in < 0.1ms."""
+        import time as perf_time
+
+        d = ChordDetector(sample_rate=48000)
+        _push_chord_signal(d, [40, 47])
+        d.verify_chord_with_onset([40, 47], has_onset=True)
+
+        times = []
+        for _ in range(100):
+            start = perf_time.perf_counter()
+            d.verify_chord_with_onset([40, 47], has_onset=False)
+            elapsed = (perf_time.perf_counter() - start) * 1000
+            times.append(elapsed)
+
+        median_ms = sorted(times)[len(times) // 2]
+        assert median_ms < 0.1, (
+            f"Cached call median {median_ms:.3f}ms exceeds 0.1ms. "
+            f"All times: {[f'{t:.3f}' for t in sorted(times)]}"
+        )
