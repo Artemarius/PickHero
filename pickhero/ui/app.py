@@ -6,6 +6,7 @@ Two states: MENU (song selection) and PLAYING (scrolling display).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pygame
 
@@ -19,6 +20,9 @@ from pickhero.ui.device_menu import DeviceMenuScreen
 from pickhero.ui.download_menu import DownloadMenuScreen
 from pickhero.ui.menu import MenuScreen
 from pickhero.ui.scrolling import PlayingScreen
+
+if TYPE_CHECKING:
+    from pickhero.timing import TimingStats
 
 
 class App:
@@ -40,6 +44,9 @@ class App:
         # Transient on-screen error message (replacing print-only errors)
         self._error_message: str = ""
         self._error_expiry_ms: float = 0.0
+        # Cached TimingStats from the last playing session, for the calibration
+        # nudge UI's early/late histogram. Refreshed when the playing screen tears down.
+        self._last_timing_stats: "TimingStats | None" = None
 
     def run(self) -> None:
         """Initialize PyGame, run main loop, clean up."""
@@ -114,7 +121,10 @@ class App:
                 self._state = "download"
                 return
             if event.key == pygame.K_g:
-                self._calibration_menu = CalibrationMenuScreen(self._config)
+                self._calibration_menu = CalibrationMenuScreen(
+                    self._config,
+                    timing_stats_provider=lambda: self._last_timing_stats,
+                )
                 self._state = "calibration"
                 return
 
@@ -128,6 +138,7 @@ class App:
         result = self._playing_screen.handle_event(event)
         if result == "menu":
             pygame.display.set_caption("PickHero")
+            self._cache_timing_stats()
             self._playing_screen.stop_audio()
             self._playing_screen = None
             self._state = "menu"
@@ -136,9 +147,22 @@ class App:
             # Cycle to next track
             if self._song_path is not None and self._track_count > 1:
                 next_idx = (self._track_index + 1) % self._track_count
+                self._cache_timing_stats()
                 self._playing_screen.stop_audio()
                 self._playing_screen = None
                 self._load_song(self._song_path, next_idx)
+
+    def _cache_timing_stats(self) -> None:
+        """Snapshot the playing screen's TimingStats before tearing it down.
+
+        Lets the calibration nudge UI show the early/late histogram from the
+        most recent run even after returning to the menu.
+        """
+        if self._playing_screen is not None:
+            try:
+                self._last_timing_stats = self._playing_screen.get_timing_stats()
+            except Exception:
+                self._last_timing_stats = None
 
     def _handle_device_event(self, event: pygame.event.Event) -> None:
         result = self._device_menu.handle_event(event)
@@ -218,6 +242,7 @@ class App:
             song_key=path.stem,
             on_error=self._show_error,
         )
+        self._state = "playing"
         pygame.display.set_caption(
             f"PickHero — {timeline.metadata.artist} — {timeline.metadata.title}"
             .replace(" —  — ", " — ")

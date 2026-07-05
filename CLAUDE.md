@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Desktop guitar practice app. Scrolling Guitar Pro tabs (GP3/GP4/GP5/GP6/GP7/GP8) with real-time pitch detection and visual hit/miss feedback. Python, PyGame, aubio, pyguitarpro. Must run on low-end hardware (no ML, no GPU).
+Desktop guitar practice app. Scrolling Guitar Pro tabs (GP3/GP4/GP5/GP6/GP7/GP8) with real-time pitch detection and visual hit/miss feedback. Python, PyGame, aubio, pyguitarpro. See Accuracy Profiles below for hardware-quality scaling.
 
 ## Language & Stack
 
@@ -12,7 +12,7 @@ Desktop guitar practice app. Scrolling Guitar Pro tabs (GP3/GP4/GP5/GP6/GP7/GP8)
 - **pyguitarpro** for reading GP3/GP4/GP5 tab files; native XML/BCFZ parser for GP6/GP7/GP8
 - **pygame** for UI rendering (scrolling display, game loop)
 - **pygame.mixer** for backing track / metronome playback
-- No ML frameworks. No TensorFlow, no CREPE, no PyTorch. Detection is signal-processing only.
+- ML is optional (ExperimentalML profile only). The base app is signal-processing only and runs without any ML dependency.
 
 ## Architecture
 
@@ -135,10 +135,24 @@ pip install pyinstaller
 pyinstaller pickhero.spec --noconfirm
 # Or use build.bat on Windows
 
+## Accuracy Profiles
+
+Three profiles, selectable at runtime. The audio callback must only copy audio
+and run the lightweight aubio detectors; heavy analysis runs in worker threads
+or on the main thread.
+
+- **Portable**: aubio yinfast, 2048/512, 44.1 kHz, forgiving matching (ARCADE mode).
+  Runs on any hardware. This is the default and the baseline for CI.
+- **HighAccuracy**: multi-resolution YIN + spectral checks, strict chords
+  (JUDGE mode), 48 kHz, hop 128-256, parallel 2048+4096 windows. For capable CPUs.
+- **ExperimentalML**: optional neural pitch/onset assist. Never required for the
+  base app. Never runs inside the audio callback. Gated behind an optional
+  dependency; the app runs identically without it.
+
+Do not add ML as a hard dependency. Do not run FFT/ML in the PortAudio callback.
+
 ## What NOT To Do
 
-- Don't add ML-based pitch detection. aubio YIN is sufficient and runs everywhere.
 - Don't create a web UI or Electron wrapper. This is a desktop app.
 - Don't add online features, accounts, or cloud sync. Offline-first, local files only.
 - Don't over-abstract. Simple classes, no deep inheritance hierarchies. This is a ~3K LOC app, not a framework.
-- Don't add polyphonic pitch detection. aubio YIN is monophonic. Chord scoring uses a majority-match model instead.

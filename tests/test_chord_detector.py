@@ -491,3 +491,52 @@ class TestStringTemplates:
         signal = generate_sine(e2)
         results = _push_and_verify(detector, signal, [E2])
         assert results == [True], f"Padded template should work, got {results}"
+
+
+class TestOnsetAnchoredWindow:
+    """Onset-anchored window freezes the transient on has_onset=True."""
+
+    def test_onset_anchored_window_freezes_transient(self, detector: ChordDetector) -> None:
+        """When has_onset=True, the ring buffer is frozen for the FFT.
+
+        Push audio, call verify_chord_with_onset(has_onset=True), then push
+        DIFFERENT audio (a new note), and call verify_chord_with_onset(has_onset=False).
+        The second result should use the FROZEN window (the original chord),
+        not the new audio — because the frozen window captures the strike transient.
+        """
+        # Push a power chord (E2 + B2)
+        e2 = midi_to_freq(E2)
+        b2 = midi_to_freq(B2)
+        chord_signal = generate_sine(e2) + generate_sine(b2)
+        chord_signal = (chord_signal / np.max(np.abs(chord_signal)) * 0.5).astype(np.float32)
+        detector.push_audio(chord_signal)
+
+        # Verify with onset — should freeze the window and detect both notes
+        results1 = detector.verify_chord_with_onset([E2, B2], has_onset=True)
+        assert results1 == [True, True], f"Both notes should be present, got {results1}"
+
+        # Push DIFFERENT audio — an unrelated note (D3)
+        d3 = midi_to_freq(D3)
+        unrelated_signal = generate_sine(d3)
+        unrelated_signal = (unrelated_signal / np.max(np.abs(unrelated_signal)) * 0.5).astype(np.float32)
+        detector.push_audio(unrelated_signal)
+
+        # Verify WITHOUT onset — should use the frozen window (E2+B2), not D3
+        results2 = detector.verify_chord_with_onset([E2, B2], has_onset=False)
+        # The frozen window still has the chord, so both should still be present.
+        # If the detector used the live buffer (D3), it would NOT find E2+B2.
+        assert results2 == [True, True], (
+            f"Frozen window should still show E2+B2, got {results2}. "
+            f"If this fails, the onset-anchored window is not being used."
+        )
+
+    def test_frozen_window_cleared_on_reset(self, detector: ChordDetector) -> None:
+        """reset() clears the frozen window so the next call uses the live buffer."""
+        e2 = midi_to_freq(E2)
+        signal = generate_sine(e2)
+        detector.push_audio(signal)
+        detector.verify_chord_with_onset([E2], has_onset=True)
+        assert detector._frozen_buffer is not None
+
+        detector.reset()
+        assert detector._frozen_buffer is None

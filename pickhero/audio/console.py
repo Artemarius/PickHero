@@ -46,6 +46,7 @@ class ConsoleOptions:
     target_notes: list[int]
     synth_duration_ms: float
     noise_gate_db: float
+    profile: str = "portable"  # "portable", "high_accuracy", "jose"
 
 
 def _parse_notes(tokens: list[str]) -> list[int]:
@@ -143,8 +144,12 @@ def _run_list_mode(_opts: ConsoleOptions) -> None:
 
 
 def _run_pitch_mode(opts: ConsoleOptions) -> None:
-    """Run the classic real-time pitch/onset/articulation console."""
     config = Config()
+    if opts.profile == "high_accuracy":
+        config.audio.profile = "high_accuracy"
+    elif opts.profile == "jose":
+        from pickhero.config import apply_preset
+        apply_preset(config, "jose_high_accuracy")
     config.audio.noise_gate_db = opts.noise_gate_db
     config.audio.sample_rate = _resolve_sample_rate(opts.device_index, opts.sample_rate)
     if opts.device_index is not None:
@@ -165,30 +170,50 @@ def _run_pitch_mode(opts: ConsoleOptions) -> None:
         f"noise_gate={config.audio.noise_gate_db}dB"
     )
     print("-" * 70)
-    print(f"{'Time':>8}  {'Note':>5}  {'MIDI':>4}  {'Freq':>8}  {'Conf':>5}  {'Onset'}")
-    print("-" * 70)
+    print(f"{'Time':>8}  {'Note':>5}  {'MIDI':>4}  {'Freq':>8}  {'Conf':>5}  {'Onset'}  {'EventKind':>16}  {'Techniques'}")
+    print("-" * 90)
 
     capture = AudioCapture(config)
     capture.start()
 
     last_note_name = ""
     last_xrun_print = 0
+    last_event_kind = ""
+    kind_first_seen_at = 0.0
     try:
         while True:
             notes = capture.get_notes()
             for tn in notes:
                 n = tn.note
-                note_id = f"{n.name}:{n.articulation or ''}"
-                if n.is_onset or note_id != last_note_name:
-                    art = f" [{n.articulation}]" if n.articulation else ""
+                # Pull event_kind + technique candidates.
+                event_kind = "pick_onset"
+                art_kind = ""
+                if n.performance is not None:
+                    event_kind = n.performance.event_kind
+                    if n.performance.technique_candidates:
+                        art_kind = n.performance.technique_candidates[0].kind
+                note_id = f"{n.name}:{art_kind}:{event_kind}"
+                # Always print non-onset frames when event_kind != pick_onset
+                # (these are the flooding frames), plus onset/changed notes.
+                is_non_onset_routed = (event_kind != "pick_onset" and not n.is_onset)
+                if n.is_onset or note_id != last_note_name or is_non_onset_routed:
+                    art = f" [{art_kind}]" if art_kind else ""
                     onset_marker = ">>>" if n.is_onset else "   "
+                    # Track how long this event_kind has persisted.
+                    if event_kind != last_event_kind:
+                        kind_first_seen_at = tn.timestamp_ms
+                    flag = ""
+                    if is_non_onset_routed and event_kind == last_event_kind:
+                        elapsed = tn.timestamp_ms - kind_first_seen_at
+                        if elapsed > 1000.0:
+                            flag = f" <<STUCK {elapsed/1000:.1f}s"
+                    last_event_kind = event_kind
                     print(
                         f"{tn.timestamp_ms:7.0f}ms  {n.name:>5}{art}  "
                         f"{n.midi_note:>4}  {n.frequency:7.1f}Hz  "
-                        f"{n.confidence:.2f}  {onset_marker}"
+                        f"{n.confidence:.2f}  {onset_marker}  {event_kind:>16}{flag}"
                     )
                     last_note_name = note_id
-
             xruns = capture.get_xrun_count()
             if xruns != last_xrun_print:
                 print(f"[audio glitches: {xruns}]")
@@ -348,12 +373,18 @@ def build_console_parser(parent: argparse.ArgumentParser) -> None:
         help="Noise gate in dB (default: -60).",
     )
     parent.add_argument(
+        "--profile",
+        choices=["portable", "high_accuracy", "jose"],
+        default="portable",
+        help="Detection profile (default: portable). 'jose' applies the full "
+             "JOSE_HIGH_ACCURACY_PRESET (hop=256, buf=4096, high_accuracy engine).",
+    )
+    parent.add_argument(
         "--duration",
         type=float,
         default=2000.0,
         help="Synthetic signal duration in ms (default: 2000).",
     )
-
 
 def options_from_args(args: argparse.Namespace) -> ConsoleOptions:
     return ConsoleOptions(
@@ -361,8 +392,9 @@ def options_from_args(args: argparse.Namespace) -> ConsoleOptions:
         device_index=args.device,
         sample_rate=args.sr,
         target_notes=_parse_notes(args.notes),
-        synth_duration_ms=args.duration,
         noise_gate_db=args.gate,
+        synth_duration_ms=args.duration,
+        profile=args.profile,
     )
 
 

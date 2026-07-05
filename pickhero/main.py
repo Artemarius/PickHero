@@ -30,9 +30,18 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Audio input testing console for pitch, chord, and synth modes.",
         allow_abbrev=False,
     )
-    from pickhero.audio.console import build_console_parser
-
-    build_console_parser(console)
+    try:
+        from pickhero.audio.console import build_console_parser
+        build_console_parser(console)
+    except ModuleNotFoundError as e:
+        # sounddevice / aubio may be absent in a minimal install — the
+        # console subcommand is optional; the main app still works.
+        console.add_argument(
+            "--unavailable",
+            action="store_true",
+            default=True,
+            help=f"audio console unavailable: {e}",
+        )
 
     return parser
 

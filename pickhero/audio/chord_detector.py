@@ -78,6 +78,10 @@ class ChordDetector:
         self._cached_notes: tuple[int, ...] | None = None
         # Per-string harmonic templates (from calibration). Optional.
         self._string_templates: dict[int, np.ndarray] = {}
+        # Onset-anchored frozen window: when has_onset=True, snapshot the ring
+        # buffer to capture the strike transient, not the sustain tail.
+        self._frozen_buffer: np.ndarray | None = None
+        self._frozen_at_sample: int = 0
 
     def _rebuild_bin_tables(self) -> None:
         """Precompute per-bin MIDI note and pitch-class arrays for vectorized chroma."""
@@ -98,6 +102,7 @@ class ChordDetector:
             self._rebuild_bin_tables()
             self._cached_result = None
             self._cached_notes = None
+            self._frozen_buffer = None
 
     def reset(self) -> None:
         """Clear the audio ring buffer and onset cache."""
@@ -105,6 +110,8 @@ class ChordDetector:
         self._buffer_fill = 0
         self._cached_result = None
         self._cached_notes = None
+        self._frozen_buffer = None
+        self._frozen_at_sample = 0
 
     def set_string_templates(self, templates: dict[int, np.ndarray]) -> None:
         """Set per-string harmonic templates from calibration."""
@@ -131,22 +138,29 @@ class ChordDetector:
             self._buffer[keep:] = samples
             self._buffer_fill = self.fft_size
 
-    def verify_chord(self, expected_midi_notes: list[int]) -> list[bool]:
+    def verify_chord(self, expected_midi_notes: list[int], min_energy_ratio: float = _MIN_ENERGY_RATIO) -> list[bool]:
         """Check which expected notes are present in the current spectrum."""
-        return self._verify(expected_midi_notes, has_onset=False)
+        return self._verify(expected_midi_notes, has_onset=False, min_energy_ratio=min_energy_ratio)
 
     def verify_chord_with_onset(
-        self, expected_midi_notes: list[int], has_onset: bool
+        self, expected_midi_notes: list[int], has_onset: bool,
+        min_energy_ratio: float = _MIN_ENERGY_RATIO,
     ) -> list[bool]:
-        """Onset-gated chord verification."""
-        return self._verify(expected_midi_notes, has_onset=has_onset)
+        """Onset-gated chord verification.
+
+        When has_onset=True, snapshots the ring buffer into a frozen window
+        to capture the strike transient. min_energy_ratio controls how strict
+        the per-note energy contribution check is (0.08 default, 0.12 for JUDGE).
+        """
+        return self._verify(expected_midi_notes, has_onset=has_onset, min_energy_ratio=min_energy_ratio)
 
     # ------------------------------------------------------------------
     # Core verification
     # ------------------------------------------------------------------
 
     def _verify(
-        self, expected_midi_notes: list[int], has_onset: bool
+        self, expected_midi_notes: list[int], has_onset: bool,
+        min_energy_ratio: float = _MIN_ENERGY_RATIO,
     ) -> list[bool]:
         n = len(expected_midi_notes)
         if n == 0:
@@ -163,7 +177,22 @@ class ChordDetector:
         if self._buffer_fill < self.fft_size // 2:
             return [False] * n
 
-        buf = self._buffer[:self.fft_size] * self._window
+        # Clear the frozen window if the chord notes changed since it was frozen.
+        # This prevents a stale frozen window from a previous chord leaking
+        # into a different chord's verification.
+        if self._frozen_buffer is not None and self._cached_notes != notes_key:
+            self._frozen_buffer = None
+
+        # Onset-anchored window: when has_onset=True, snapshot the current
+        # ring buffer into a frozen window. This captures the strike transient,
+        # not the sustain tail. When has_onset=False, use the frozen window if
+        # available (to stay consistent within a chord), else the live buffer.
+        if has_onset:
+            self._frozen_buffer = self._buffer[:self.fft_size].copy()
+            self._frozen_at_sample = self._buffer_fill
+
+        source_buf = self._frozen_buffer if self._frozen_buffer is not None else self._buffer[:self.fft_size]
+        buf = source_buf * self._window
         spectrum = np.abs(np.fft.rfft(buf))
 
         global_peak = float(np.max(spectrum))
@@ -230,6 +259,7 @@ class ChordDetector:
                 total_energy,
                 noise_floor,
                 global_peak,
+                min_energy_ratio=min_energy_ratio,
             )
             results.append(present)
 
@@ -249,6 +279,7 @@ class ChordDetector:
         total_energy: float,
         noise_floor: float,
         global_peak: float,
+        min_energy_ratio: float = _MIN_ENERGY_RATIO,
     ) -> bool:
         """Decide if a note is present given its harmonic-bank salience.
 
@@ -265,7 +296,7 @@ class ChordDetector:
         if not (harmonic_path or strong_fundamental):
             return False
         if total_energy > 0:
-            if energy / total_energy < _MIN_ENERGY_RATIO:
+            if energy / total_energy < min_energy_ratio:
                 return False
         return True
 

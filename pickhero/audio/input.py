@@ -11,11 +11,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import sounddevice as sd
-
 from pickhero.audio.chord_detector import ChordDetector
 from pickhero.audio.detector import PitchDetector, DetectedNote
+from pickhero.audio.performance import PerformanceEvent
 from pickhero.config import Config
-
 
 @dataclass
 class TimestampedNote:
@@ -38,16 +37,47 @@ class AudioCapture:
         ac = config.audio
 
         calibration = getattr(config, 'calibration', None) or None
-        self.detector = PitchDetector(
-            buf_size=ac.buf_size,
-            hop_size=ac.hop_size,
-            sample_rate=ac.sample_rate,
-            confidence_threshold=ac.confidence_threshold,
-            onset_threshold=ac.onset_threshold,
-            noise_gate_db=ac.noise_gate_db,
-            calibration=calibration if calibration else None,
-        )
+
+        # Select pitch engine based on accuracy profile.
+        # "portable" uses PitchDetector directly (existing behavior).
+        # "high_accuracy"/"experimental_ml" uses PitchEngine with a worker thread.
+        # CRITICAL: the stream, detector, chord_detector, and engine must ALL
+        # use the same sample rate. We update ac.sample_rate in-place so the
+        # stream opened in start() uses the same rate as the detector.
+        self._profile = ac.profile
+        if ac.profile in ("high_accuracy", "experimental_ml"):
+            from pickhero.audio.pitch_engine import PitchEngine
+            if ac.profile == "high_accuracy":
+                # Request 48 kHz, hop 256, buf 4096. Update ac so the stream
+                # and chord_detector use the same rate — no split-brain.
+                ac.sample_rate = max(ac.sample_rate, 48000)
+                ac.hop_size = min(ac.hop_size, 256)
+                ac.buf_size = max(ac.buf_size, 4096)
+            self._engine = PitchEngine(
+                sample_rate=ac.sample_rate,
+                hop_size=ac.hop_size,
+                buf_size=ac.buf_size,
+                confidence_threshold=ac.confidence_threshold,
+                onset_threshold=ac.onset_threshold,
+                noise_gate_db=ac.noise_gate_db,
+                calibration=calibration if calibration else None,
+                profile=ac.profile,
+                ml_model_path=ac.ml_model_path,
+            )
+            self.detector = self._engine.detector
+        else:
+            self._engine = None
+            self.detector = PitchDetector(
+                buf_size=ac.buf_size,
+                hop_size=ac.hop_size,
+                sample_rate=ac.sample_rate,
+                confidence_threshold=ac.confidence_threshold,
+                onset_threshold=ac.onset_threshold,
+                noise_gate_db=ac.noise_gate_db,
+                calibration=calibration if calibration else None,
+            )
         self.note_queue: queue.Queue[TimestampedNote] = queue.Queue()
+        self.event_queue: queue.Queue[PerformanceEvent] = queue.Queue()
         self._stream: sd.InputStream | None = None
         self._start_time: float = 0.0
         self._signal_db: float = -120.0
@@ -58,7 +88,18 @@ class AudioCapture:
         self._detector_sample_offset: int = 0
         self._adc_time_available: bool | None = None
         self._xrun_count: int = 0
+        # Patch 6b: opt-in raw take-audio ring buffer for offline polyphonic
+        # analysis. None unless start_take_recording() is called.
+        self._take_audio: list[np.ndarray] | None = None
 
+        # Track stabilizer: multi-frame consensus before notes reach the
+        # matcher. Raw per-frame detections go through here; only stable
+        # note events emerge. Prevents octave glitches, noise transients,
+        # and sustain-frame spam from reaching the matcher.
+        from pickhero.audio.track_stabilizer import TrackStabilizer
+        self._stabilizer = TrackStabilizer(
+            sample_rate=ac.sample_rate, hop_size=ac.hop_size,
+        )
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
         """Sounddevice callback — runs in audio thread."""
         if status:
@@ -76,6 +117,9 @@ class AudioCapture:
         # indata shape: (frames, channels) — take first channel
         mono = indata[:, 0].copy()
 
+        # Patch 6b: record raw mono audio for offline analysis when armed.
+        if self._take_audio is not None:
+            self._take_audio.append(mono.copy())
         # Feed chord detector (FFT-based, runs on full buffer)
         self.chord_detector.push_audio(mono)
 
@@ -98,18 +142,64 @@ class AudioCapture:
         hop = self.detector.hop_size
         for i in range(0, len(mono) - hop + 1, hop):
             chunk = mono[i:i + hop]
-            result = self.detector.process(chunk)
-            self._signal_db = self.detector.last_signal_db
-            self._tuner_freq = self.detector.last_freq
-            self._tuner_confidence = self.detector.last_confidence
-            if result is not None:
-                elapsed_ms = self._compute_timestamp_ms(
-                    result, i, adc_time, sample_rate, hop
-                )
-                self.note_queue.put(TimestampedNote(note=result, timestamp_ms=elapsed_ms))
+            if self._engine is not None:
+                # HighAccuracy/ExperimentalML: submit to the worker thread.
+                # Pass the absolute stream sample index so worker results carry
+                # their own stable timestamp — never infer from drain time.
+                self._engine.submit(chunk, chunk_start_sample=self._detector_sample_offset)
+                self._signal_db = self.detector.last_signal_db
+                self._tuner_freq = self.detector.last_freq
+                self._tuner_confidence = self.detector.last_confidence
+            else:
+                # Portable: process synchronously in the callback.
+                result = self.detector.process(chunk)
+                self._signal_db = self.detector.last_signal_db
+                self._tuner_freq = self.detector.last_freq
+                self._tuner_confidence = self.detector.last_confidence
+                if result is not None:
+                    # The stabilizer needs the frame's real-time position
+                    # (stream sample offset), NOT the onset sample. Using
+                    # onset_sample causes all frames in a burst to share
+                    # the onset's timestamp, breaking the refractory period
+                    # and consensus logic. The onset_sample is preserved on
+                    # the DetectedNote for the matcher's timing; the
+                    # stabilizer operates on frame time.
+                    frame_ms = self._detector_sample_offset / sample_rate * 1000.0
+                    self._emit_through_stabilizer(result, frame_ms)
+                else:
+                    # Feed silence to the stabilizer so stale tracks age out.
+                    frame_ms = self._detector_sample_offset / sample_rate * 1000.0
+                    self._stabilizer.process(None, frame_ms)
             # Advance the absolute sample counter by one hop
             self._detector_sample_offset += hop
 
+        # Drain completed PerformanceEvents from the articulation detector.
+        # A note is completed when the next onset fires (its release_ms is set).
+        for event in self.detector.drain_events():
+            self.event_queue.put(event)
+        # Drain the engine's output queue (if active) into the note queue.
+        # Each result carries its own chunk_start_sample from submit time,
+        # so timestamps are stable regardless of when the callback drains.
+        if self._engine is not None:
+            had_candidates = False
+            for r in self._engine.get_candidates():
+                had_candidates = True
+                result = r.candidate.to_detected_note(
+                    is_onset=r.is_onset, onset_sample=r.onset_sample,
+                    performance=r.performance,
+                )
+                if result is not None:
+                    # Use chunk_start_sample (absolute stream position) for
+                    # the stabilizer, NOT onset_sample. onset_sample gives
+                    # identical timestamps to all frames in a burst, breaking
+                    # the stabilizer's refractory and consensus logic.
+                    ts_ms = r.chunk_start_sample / sample_rate * 1000.0
+                    self._emit_through_stabilizer(result, ts_ms)
+            if not had_candidates:
+                # No results from the engine this drain — feed silence to
+                # the stabilizer so stale tracks age out.
+                frame_ms = self._detector_sample_offset / sample_rate * 1000.0
+                self._stabilizer.process(None, frame_ms)
     def _compute_timestamp_ms(
         self,
         result: DetectedNote,
@@ -118,39 +208,53 @@ class AudioCapture:
         sample_rate: int,
         hop: int,
     ) -> float:
-        """Compute a low-jitter timestamp (ms from session start) for a detected note.
+        """Compute timestamp (ms from session start) from the onset's absolute sample position.
 
-        Uses the audio callback's ADC time as the anchor, plus the onset's sample
-        position within the stream, minus the onset detector's algorithmic delay.
-        Falls back to wall-clock time if the backend doesn't provide ADC timestamps.
+        The absolute sample index is the canonical timestamp. The ADC time is used
+        only to anchor the sample clock to wall-clock for the first buffer; after
+        that, samples are the source of truth.
+
+        aubio_onset_get_last() already subtracts the algorithmic delay internally
+        (verified in aubio/src/onset/onset.c: aubio_onset_get_last returns
+        o->last_onset - o->delay), so onset_sample is the delay-compensated sample
+        position of the onset. We must NOT subtract the delay again.
         """
         if not self._adc_time_available:
             # Backend without ADC time — use wall clock (legacy behavior)
             return (time.perf_counter() - self._start_time) * 1000.0
 
-        # onset_sample is the absolute sample position since detector creation.
-        # The chunk being processed started at self._detector_sample_offset - hop
-        # samples into the stream. The onset's offset within this chunk is:
         onset_sample = result.onset_sample
-        chunk_start_sample = self._detector_sample_offset - hop
-        if onset_sample is not None and onset_sample >= chunk_start_sample:
-            samples_into_stream = float(onset_sample)
-        else:
-            # Onset sample not available or stale — use chunk start
-            samples_into_stream = float(chunk_start_sample)
+        # onset_sample is absolute (delay-compensated) since detector creation.
+        # If unavailable (non-onset path), fall back to the current chunk's stream position.
+        if onset_sample is None:
+            onset_sample = self._detector_sample_offset
+        elif onset_sample < 0:
+            # Start-of-file edge in aubio: clamp to 0 (the stream beginning).
+            onset_sample = 0
 
-        # Algorithmic delay of the onset detector (samples)
-        delay_samples = float(self.detector.get_onset_delay())
+        return max(0.0, onset_sample) / sample_rate * 1000.0
 
-        # Wall-clock time of the onset = buffer ADC time + onset offset in stream
-        #   minus algorithmic delay. _start_time is the ADC time of the very first
-        #   buffer, so subtracting it gives ms-from-session-start.
-        onset_wall_s = (
-            adc_time
-            + (samples_into_stream / sample_rate)
-            + (0.0 - (delay_samples / sample_rate))
-        )
-        return (onset_wall_s - self._start_time) * 1000.0
+    def _emit_through_stabilizer(self, result: DetectedNote, ts_ms: float) -> None:
+        """Feed a raw detection through the track stabilizer.
+
+        Only stable note events (multi-frame consensus) reach the note queue.
+        This prevents octave glitches, noise transients, and sustain-frame spam
+        from reaching the matcher.
+        """
+        events = self._stabilizer.process(result, ts_ms)
+        for event in events:
+            stable_note = DetectedNote(
+                midi_note=event.midi_note,
+                frequency=event.frequency,
+                confidence=event.confidence,
+                name=event.name,
+                is_onset=event.is_onset,
+                onset_sample=event.onset_sample,
+                performance=event.performance,
+            )
+            self.note_queue.put(
+                TimestampedNote(note=stable_note, timestamp_ms=event.timestamp_ms)
+            )
 
     def _resolve_device(self) -> int | None:
         """Resolve device_name to a current index, preferring mono inputs.
@@ -187,21 +291,40 @@ class AudioCapture:
         """
         ac = self.config.audio
 
-        # Resolve device name → index, updating sample_rate to match
+        # Resolve device name → index, updating sample_rate to match device default
         resolved = self._resolve_device()
 
         # Recreate detector with the resolved sample rate (may have changed)
-        from pickhero.audio.detector import PitchDetector
         calibration = getattr(self.config, 'calibration', None) or None
-        self.detector = PitchDetector(
-            buf_size=ac.buf_size,
-            hop_size=ac.hop_size,
-            sample_rate=ac.sample_rate,
-            confidence_threshold=ac.confidence_threshold,
-            onset_threshold=ac.onset_threshold,
-            noise_gate_db=ac.noise_gate_db,
-            calibration=calibration if calibration else None,
-        )
+        if self._profile in ("high_accuracy", "experimental_ml"):
+            from pickhero.audio.pitch_engine import PitchEngine
+            # CRITICAL: use the SAME sample rate as the stream (ac.sample_rate).
+            # The init already updated ac.sample_rate for high_accuracy; we must
+            # not override it here. No split-brain: stream == detector == engine.
+            self._engine = PitchEngine(
+                sample_rate=ac.sample_rate,
+                hop_size=ac.hop_size,
+                buf_size=ac.buf_size,
+                confidence_threshold=ac.confidence_threshold,
+                onset_threshold=ac.onset_threshold,
+                noise_gate_db=ac.noise_gate_db,
+                calibration=calibration if calibration else None,
+                profile=self._profile,
+                ml_model_path=ac.ml_model_path,
+            )
+            self.detector = self._engine.detector
+        else:
+            self._engine = None
+            from pickhero.audio.detector import PitchDetector
+            self.detector = PitchDetector(
+                buf_size=ac.buf_size,
+                hop_size=ac.hop_size,
+                sample_rate=ac.sample_rate,
+                confidence_threshold=ac.confidence_threshold,
+                onset_threshold=ac.onset_threshold,
+                noise_gate_db=ac.noise_gate_db,
+                calibration=calibration if calibration else None,
+            )
         self.detector.reset()
         self.chord_detector.reset()
         self.chord_detector.set_sample_rate(ac.sample_rate)
@@ -250,13 +373,32 @@ class AudioCapture:
                 callback=self._audio_callback,
             )
         self._stream.start()
+        if self._engine is not None:
+            self._engine.start()
 
     def stop(self):
         """Stop audio capture."""
+        if self._engine is not None:
+            self._engine.stop()
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        # Flush any pending track that reached consensus but wasn't emitted
+        # during the last callback (e.g., a note still ringing at stop time).
+        for event in self._stabilizer.flush():
+            stable_note = DetectedNote(
+                midi_note=event.midi_note,
+                frequency=event.frequency,
+                confidence=event.confidence,
+                name=event.name,
+                is_onset=event.is_onset,
+                onset_sample=event.onset_sample,
+                performance=event.performance,
+            )
+            self.note_queue.put(
+                TimestampedNote(note=stable_note, timestamp_ms=event.timestamp_ms)
+            )
 
     def set_noise_gate_db(self, db: float) -> None:
         """Update the noise gate threshold on the detector.
@@ -287,6 +429,42 @@ class AudioCapture:
                 break
         return notes
 
+    def get_events(self) -> list[PerformanceEvent]:
+        """Drain all pending PerformanceEvents from the queue (non-blocking).
+
+        A PerformanceEvent is pushed when a note is closed (next onset fires).
+        The matcher pairs these with NoteEvents for the after-take analyzer.
+        """
+        events = []
+        while True:
+            try:
+                events.append(self.event_queue.get_nowait())
+            except queue.Empty:
+                break
+        return events
+
+    def start_take_recording(self) -> None:
+        """Arm the raw-audio ring buffer for offline polyphonic analysis.
+
+        Subsequent audio callbacks append mono chunks until
+        :meth:`stop_take_recording` is called. No-op if already recording.
+        """
+        if self._take_audio is None:
+            self._take_audio = []
+
+    def stop_take_recording(self) -> np.ndarray | None:
+        """Stop recording and return the concatenated raw mono audio.
+
+        Returns None if recording was never armed. The buffer is cleared after
+        reading so the memory is released.
+        """
+        if self._take_audio is None:
+            return None
+        chunks = self._take_audio
+        self._take_audio = None
+        if not chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(chunks)
 
 def list_audio_devices() -> list[dict]:
     """List available audio input devices."""

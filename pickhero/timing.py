@@ -15,7 +15,10 @@ import math
 import statistics
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from pickhero.audio.performance import TechniqueSpec, TechniqueVerdict
 
 # Timing verdict thresholds (ms). Inside ±EARLY/LATE = ON_TIME.
 EARLY_THRESHOLD_MS = -25.0
@@ -68,8 +71,8 @@ class TimingObservation:
     measure: int
     confidence: float
     pitch_verdict: PitchVerdict = PitchVerdict.UNKNOWN
-    articulation: str | None = None  # detected articulation
-    articulation_match: bool | None = None  # True if detected matches expected from tab
+    techniques: tuple["TechniqueSpec", ...] | None = None  # expected techniques from tab
+    verdicts: list["TechniqueVerdict"] | None = None  # filled by the analyzer after-take
 
 
 @dataclass

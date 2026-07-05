@@ -10,7 +10,7 @@ import pytest
 from pickhero.audio.note_utils import STANDARD_TUNING
 from pickhero.tabs.loader import (
     TempoMap,
-    _extract_articulation,
+    _extract_techniques,
     is_guitar_track,
     list_tracks,
     load_gp_file,
@@ -235,25 +235,25 @@ class TestLoadGPFile:
                 assert note.duration_ms > 0, f"{fname}: note with 0 duration"
 
     def test_slides_gp5_has_articulation(self):
-        """Slides.gp5 should load notes with expected_articulation='slide'."""
+        """Slides.gp5 should load notes with a slide technique."""
         tl = load_gp_file(FIXTURES / "Slides.gp5")
-        art_notes = [n for n in tl.notes if n.expected_articulation is not None]
-        assert len(art_notes) > 0, "Slides.gp5 should have notes with articulations"
-        # All articulation notes in Slides.gp5 are slides
-        for note in art_notes:
-            assert note.expected_articulation == "slide", (
-                f"Expected 'slide', got '{note.expected_articulation}'"
+        tech_notes = [n for n in tl.notes if n.techniques]
+        assert len(tech_notes) > 0, "Slides.gp5 should have notes with techniques"
+        # All technique notes in Slides.gp5 are slides
+        for note in tech_notes:
+            kinds = [t.kind for t in note.techniques]
+            assert "slide" in kinds, (
+                f"Expected 'slide' in techniques, got {note.techniques}"
             )
 
     def test_notes_gp5_no_articulation(self):
-        """notes.gp5 should have no articulation effects (basic notes)."""
+        """notes.gp5 should have no technique effects (basic notes)."""
         tl = load_gp_file(FIXTURES / "notes.gp5")
-        art_notes = [n for n in tl.notes if n.expected_articulation is not None]
-        assert len(art_notes) == 0, f"notes.gp5 should have no articulations, got {len(art_notes)}"
+        tech_notes = [n for n in tl.notes if n.techniques]
+        assert len(tech_notes) == 0, f"notes.gp5 should have no techniques, got {len(tech_notes)}"
 
-
-class TestExtractArticulation:
-    """Test the _extract_articulation helper function."""
+class TestExtractTechniques:
+    """Test the _extract_techniques helper function."""
 
     def _make_note(self, **effect_kwargs):
         """Create a mock note with effect attributes."""
@@ -271,48 +271,90 @@ class TestExtractArticulation:
         note.effect.slides = []
         note.effect.bend = None
         note.effect.harmonic = None
+        # note.type.value defaults to 1 (normal)
+        note.type = MagicMock()
+        note.type.value = 1
         # Apply overrides
         for k, v in effect_kwargs.items():
             setattr(note.effect, k, v)
         return note
 
-    def test_normal_note_returns_none(self):
+    def test_normal_note_returns_empty(self):
         note = self._make_note()
-        assert _extract_articulation(note) is None
+        assert _extract_techniques(note) == ()
 
     def test_hammer_on(self):
         note = self._make_note(hammer=True)
-        assert _extract_articulation(note) == "hammer_on"
+        specs = _extract_techniques(note)
+        assert len(specs) == 1
+        assert specs[0].kind == "hammer_on"
+        assert specs[0].tied_to_previous is True
 
     def test_palm_mute(self):
         note = self._make_note(palmMute=True)
-        assert _extract_articulation(note) == "palm_mute"
+        assert _extract_techniques(note)[0].kind == "palm_mute"
 
     def test_vibrato(self):
         note = self._make_note(vibrato=True)
-        assert _extract_articulation(note) == "vibrato"
+        assert _extract_techniques(note)[0].kind == "vibrato"
 
-    def test_bend(self):
-        note = self._make_note(bend=object())  # non-None = bend present
-        assert _extract_articulation(note) == "bend"
+    def test_bend_whole_step(self):
+        """A bend with dest value=4 (1 semitone) → whole-step bend, 100 cents."""
+        from unittest.mock import MagicMock
+        bend = MagicMock()
+        point0 = MagicMock(position=0, value=0)
+        point1 = MagicMock(position=6, value=4)
+        point2 = MagicMock(position=12, value=4)
+        bend.points = [point0, point1, point2]
+        bend.semitoneLength = 1
+        note = self._make_note(bend=bend)
+        specs = _extract_techniques(note)
+        assert len(specs) == 1
+        assert specs[0].kind == "bend"
+        assert specs[0].target_cents == 100.0
+        assert specs[0].subtype == "whole"
 
     def test_slide(self):
-        note = self._make_note(slides=[object()])  # non-empty list
-        assert _extract_articulation(note) == "slide"
+        from unittest.mock import MagicMock
+        slide_type = MagicMock()
+        slide_type.value = 1  # shiftSlideTo
+        note = self._make_note(slides=[slide_type])
+        specs = _extract_techniques(note)
+        assert len(specs) == 1
+        assert specs[0].kind == "slide"
+        assert specs[0].subtype == "shift"
 
-    def test_harmonic(self):
-        note = self._make_note(harmonic=object())  # non-None
-        assert _extract_articulation(note) == "harmonic"
+    def test_harmonic_natural(self):
+        from unittest.mock import MagicMock
+        harmonic = MagicMock()
+        harmonic.type = MagicMock()
+        harmonic.type.value = 1  # natural
+        note = self._make_note(harmonic=harmonic)
+        specs = _extract_techniques(note)
+        assert len(specs) == 1
+        assert specs[0].kind == "harmonic"
+        assert specs[0].subtype == "natural"
 
-    def test_priority_harmonic_over_palm_mute(self):
-        """Harmonic takes priority over palm mute."""
-        note = self._make_note(harmonic=object(), palmMute=True)
-        assert _extract_articulation(note) == "harmonic"
+    def test_multiple_techniques_palm_mute_and_bend(self):
+        """A note can carry multiple techniques (palm_mute + bend)."""
+        from unittest.mock import MagicMock
+        bend = MagicMock()
+        point0 = MagicMock(position=0, value=0)
+        point1 = MagicMock(position=6, value=4)
+        bend.points = [point0, point1]
+        bend.semitoneLength = 1
+        note = self._make_note(palmMute=True, bend=bend)
+        specs = _extract_techniques(note)
+        kinds = [s.kind for s in specs]
+        assert "palm_mute" in kinds
+        assert "bend" in kinds
 
-    def test_priority_palm_mute_over_bend(self):
-        """Palm mute takes priority over bend."""
-        note = self._make_note(palmMute=True, bend=object())
-        assert _extract_articulation(note) == "palm_mute"
+    def test_dead_note(self):
+        """A dead note (note.type.value == 3) → dead_note spec."""
+        note = self._make_note()
+        note.type.value = 3
+        specs = _extract_techniques(note)
+        assert any(s.kind == "dead_note" for s in specs)
 
 
 class TestGp7AndGp6:

@@ -14,7 +14,7 @@ import pygame
 
 from pickhero.audio.midi_playback import BackingTrack, MidiPlayer
 from pickhero.config import Config
-from pickhero.matcher import NoteMatcher
+from pickhero.matcher import NoteMatcher, MatchMode, _coerce_match_mode
 from pickhero.progress import ProgressTracker
 from pickhero.tabs.timeline import NoteEvent, Timeline
 from pickhero.audio.note_utils import freq_to_cents_deviation, midi_to_name
@@ -29,7 +29,9 @@ from pickhero.ui.overlays import (
     CompletionState,
     draw_completion_overlay,
     draw_help_overlay,
+    draw_technique_heatmap,
     draw_timing_summary,
+    draw_why_missed,
 )
 from pickhero.timing import TimingVerdict
 
@@ -167,8 +169,16 @@ class PlayingScreen:
         self._tuner_displayed_note: int = -1
         self._tuner_note_stable_frames: int = 0
 
-        # Chord partial credit mode
-        self._chord_partial_credit: bool = self._config.chord_partial_credit
+        # Match mode (replaces chord_partial_credit, timing_judge, pitch_strict).
+        # HighAccuracy profile implies JUDGE mode — strict matching for strict audio.
+        if self._config.audio.profile == "high_accuracy" and self._config.match_mode != "judge":
+            self._config.match_mode = "judge"
+            self._config.save()
+        self._match_mode: MatchMode = _coerce_match_mode(self._config.match_mode)
+        # Derived booleans for read sites that still check them.
+        self._chord_partial_credit: bool = self._match_mode != MatchMode.ARCADE
+        self._timing_judge: bool = self._match_mode == MatchMode.JUDGE
+        self._pitch_strict: bool = self._match_mode == MatchMode.JUDGE
 
         # Help overlay
         self._show_help: bool = False
@@ -177,9 +187,6 @@ class PlayingScreen:
         self._wait_mode: bool = self._config.wait_mode
         self._wait_mode_frozen: bool = False
 
-        # Timing Judge mode
-        self._timing_judge: bool = self._config.timing_judge_mode
-        self._pitch_strict: bool = self._config.pitch_strict_mode
         self._last_obs_count: int = 0
         self._timing_overlay: TimingOverlay | None = None
         self._timing_summary = None
@@ -192,8 +199,9 @@ class PlayingScreen:
         self._guided_consecutive_successes: int = 0
         self._guided_start_tempo: float = 0.0
 
-        # Last detected articulation (for HUD display)
-        self._last_articulation: str | None = None
+        # Last detected technique (for HUD display) + recent verdict explanations
+        self._last_technique: str | None = None
+        self._recent_verdicts: list = []
 
     def _note_passes_filter(self, note: NoteEvent) -> bool:
         """Check if a note passes the difficulty filter."""
@@ -220,7 +228,8 @@ class PlayingScreen:
             self._timing_summary = None
             self._timing_worst_measures = []
             self._last_obs_count = 0
-            self._last_articulation = None
+            self._last_technique = None
+            self._recent_verdicts = []
             if self._matcher:
                 self._matcher.reset()
             self._feedback.reset()
@@ -236,8 +245,7 @@ class PlayingScreen:
             self._recommendations = []
             self._timing_summary = None
             self._timing_worst_measures = []
-            self._last_obs_count = 0
-            self._last_articulation = None
+            self._last_technique = None
 
         self._playing = not self._playing
         if self._playing:
@@ -400,17 +408,17 @@ class PlayingScreen:
                 ))
             self._feedback.add_results(results, self._playback_ms)
 
-            # Track last detected articulation for HUD display.
-            # Clear if an onset fires without articulation detected.
-            new_articulation = None
+            # Track last detected technique for HUD display.
+            # Clear if an onset fires without a technique detected.
+            new_technique = None
             for d in detected:
-                if d.note.articulation:
-                    new_articulation = d.note.articulation
+                if d.note.performance is not None and d.note.performance.technique_candidates:
+                    new_technique = d.note.performance.technique_candidates[0].kind
                     break
-            if new_articulation:
-                self._last_articulation = new_articulation
+            if new_technique:
+                self._last_technique = new_technique
             elif has_onset:
-                self._last_articulation = None
+                self._last_technique = None
 
             self._feedback.cleanup(self._playback_ms)
 
@@ -497,6 +505,8 @@ class PlayingScreen:
                         )
                         self._weakest_sections = weakest
                         self._song_completed = True
+                        # Run the after-take analyzer to grade techniques
+                        self._analyze_and_build_heatmap()
                         # Compute timing summary if Timing Judge is active
                         if self._timing_judge:
                             self._compute_timing_summary()
@@ -555,18 +565,14 @@ class PlayingScreen:
             self._toggle_string(5)
         elif event.key == pygame.K_F6:
             self._toggle_string(6)
-        elif event.key == pygame.K_v:
-            self._toggle_chord_mode()
+        elif event.key == pygame.K_j:
+            self._cycle_match_mode()
         elif event.key == pygame.K_l:
             self._loop_weakest_section()
-        elif event.key == pygame.K_k:
-            self._toggle_pitch_strict()
         elif event.key == pygame.K_g:
             self._toggle_guided_practice()
         elif event.key == pygame.K_w:
             self._toggle_wait_mode()
-        elif event.key == pygame.K_j:
-            self._toggle_timing_judge()
         elif event.key == pygame.K_TAB:
             return "next_track"
         return None
@@ -581,6 +587,7 @@ class PlayingScreen:
         self._draw_loop_region(surface, layout)
         self._draw_hit_zone(surface, layout)
         self._draw_notes(surface, layout)
+        self._draw_pitch_curve_overlay(surface, layout)
         self._draw_hud(surface, layout)
 
         if self._show_help:
@@ -675,6 +682,7 @@ class PlayingScreen:
             y = lane_y + layout.lane_height / 2 - layout.note_h / 2
 
             # Color: feedback color if matched, dimmed if past the hit zone
+            past_hit_zone = note.timestamp_ms < self._playback_ms
             base_color = string_color(note.string)
             if self._audio_enabled:
                 color = self._feedback.get_note_color(
@@ -684,7 +692,9 @@ class PlayingScreen:
                 color = dimmed(base_color) if past_hit_zone else base_color
 
             # Palm mute: dim the note color to indicate muted technique
-            if note.expected_articulation == "palm_mute":
+            techniques = note.techniques
+            tech_kinds = {t.kind for t in techniques}
+            if "palm_mute" in tech_kinds:
                 color = dimmed(color)
 
             rect = pygame.Rect(int(x), int(y), int(w), int(layout.note_h))
@@ -703,18 +713,25 @@ class PlayingScreen:
                     surface.blit(outline, (tx + dx, ty + dy))
                 surface.blit(fret_text, (tx, ty))
 
-            # Articulation icon: small letter on the right side of the note
-            if note.expected_articulation:
+            # Technique icon: small letter on the right side of the note.
+            # Reads the resolved techniques tuple (direction already set by matcher).
+            if techniques:
                 art_icons = {
                     "hammer_on": "H",
                     "pull_off": "P",
-                    "bend": "B",
-                    "vibrato": "V",
-                    "slide": "S",
+                    "bend": "b",
+                    "vibrato": "~",
+                    "slide": "/",
                     "palm_mute": "M",
-                    "harmonic": "*",
+                    "harmonic": "o",
+                    "dead_note": "x",
                 }
-                icon_char = art_icons.get(note.expected_articulation, "")
+                # Pick the first technique with an icon (priority order)
+                icon_char = ""
+                for kind in ("harmonic", "bend", "slide", "hammer_on", "pull_off", "vibrato", "palm_mute", "dead_note"):
+                    if kind in tech_kinds:
+                        icon_char = art_icons.get(kind, "")
+                        break
                 if icon_char and rect.width > 24:
                     icon_font = _get_font("consolas", max(10, fret_font_size - 2))
                     icon_text = _font_cache.render(icon_font, icon_char, True, t.hud_accent)
@@ -746,6 +763,45 @@ class PlayingScreen:
                         # On time: green dot
                         col = t.timing_on_time
                         pygame.draw.circle(surface, col, (cx, indicator_y), 3)
+
+    def _draw_pitch_curve_overlay(self, surface: pygame.Surface, layout: _Layout) -> None:
+        """Overlay the detected f0 curve (cents) against the target for the
+        just-played note. Drawn in the note's lane, fading over ~500ms.
+
+        Active when a bend/vibrato/slide verdict exists for the most recent
+        matched note. This is the visual flagship for lead guitar feedback.
+        """
+        if not self._recent_verdicts:
+            return
+        # Find the most recent bend/vibrato/slide verdict
+        curve_verdict = None
+        for v in reversed(self._recent_verdicts):
+            if v.kind in ("bend", "vibrato", "slide"):
+                curve_verdict = v
+                break
+        if curve_verdict is None:
+            return
+        # We don't have the event's f0_curve directly here without the event;
+        # the verdict's metrics carry detected_cents / depth_cents. Render a
+        # simple target-vs-detected bar as the Phase-1 visual proxy.
+        t = get_theme()
+        # Use the hit-zone x as the anchor
+        hit_zone_x = layout.hit_zone_x
+        y_center = layout.screen_h // 2
+        bar_w = 120
+        bar_h = 6
+        bx = hit_zone_x - bar_w // 2
+        by = y_center - bar_h // 2
+        # Target line
+        target = curve_verdict.metrics.get("target_cents") or curve_verdict.metrics.get("depth_cents") or 0.0
+        detected = curve_verdict.metrics.get("detected_cents") or curve_verdict.metrics.get("depth_cents") or 0.0
+        scale = max(1.0, abs(target), abs(detected))
+        # Draw target (faint) and detected (bright) bars
+        tx = bx + bar_w // 2 + int((target / scale) * (bar_w // 2))
+        dx = bx + bar_w // 2 + int((detected / scale) * (bar_w // 2))
+        pygame.draw.line(surface, (120, 120, 120), (bx, by), (bx + bar_w, by), 1)
+        pygame.draw.line(surface, t.hud_accent, (bx + bar_w // 2, by - 4), (dx, by + 4), 3)
+
     def _draw_hud(self, surface: pygame.Surface, layout: _Layout) -> None:
         t = get_theme()
         title_font = _get_font("arial", 20)
@@ -823,11 +879,13 @@ class PlayingScreen:
             gp_surf = _font_cache.render(hint_font, gp_text, True, t.hud_accent)
             surface.blit(gp_surf, (w // 2 - gp_surf.get_width() // 2, 56))
 
-        # Articulation indicator (top-left, below title)
-        if self._last_articulation:
-            art_text = self._last_articulation.replace("_", " ").upper()
-            art_surf = _font_cache.render(hint_font, art_text, True, t.hud_accent)
-            surface.blit(art_surf, (12, 36))
+        # Technique indicator (top-left, below title) + why-missed verdicts
+        if self._last_technique:
+            tech_text = self._last_technique.replace("_", " ").upper()
+            tech_surf = _font_cache.render(hint_font, tech_text, True, t.hud_accent)
+            surface.blit(tech_surf, (12, 36))
+        if self._recent_verdicts:
+            draw_why_missed(surface, self._recent_verdicts, hint_font, 12, 56)
 
         # Cents deviation bar: shows live pitch deviation from nearest semitone.
         # Visible whenever audio capture has a confident pitch — the bar oscillates
@@ -923,9 +981,7 @@ class PlayingScreen:
             wait_state = f"|  W: wait {'WAIT' if self._wait_mode_frozen else 'ON'}  "
         elif self._audio_enabled:
             wait_state = "|  W: wait off  "
-        timing_state = f"|  J: timing {'ON' if self._timing_judge else 'off'}  "
-        if self._pitch_strict:
-            timing_state += "|  K: strict ON  "
+        timing_state = f"|  J: {self._match_mode.value}  "
         hint = (
             f"{state}  |  SPACE: play/pause  |  LEFT/RIGHT: seek  "
             f"|  HOME: restart  |  PgDn/PgUp: tempo  |  X/C: gate"
@@ -953,11 +1009,11 @@ class PlayingScreen:
             surface.blit(filter_surf, (12, info_y))
             info_y += 16
 
-        # Chord mode HUD
-        if self._chord_partial_credit != self._config._default_chord_partial_credit:
-            chord_text = "Chords: strict" if self._chord_partial_credit else "Chords: easy"
-            chord_surf = _font_cache.render(hint_font, chord_text, True, t.hud_accent)
-            surface.blit(chord_surf, (12, info_y))
+        # Match mode HUD (shown when not the default ARCADE)
+        if self._match_mode != MatchMode.ARCADE:
+            mode_text = f"Mode: {self._match_mode.value}"
+            mode_surf = _font_cache.render(hint_font, mode_text, True, t.hud_accent)
+            surface.blit(mode_surf, (12, info_y))
 
     def _draw_signal_meter(self, surface: pygame.Surface, font: pygame.font.Font,
                            screen_w: int, y: int) -> None:
@@ -1088,8 +1144,73 @@ class PlayingScreen:
             timing_judge=self._timing_judge,
             timing_summary=self._timing_summary,
             timing_worst_measures=self._timing_worst_measures,
+            technique_heatmap=getattr(self, "_technique_heatmap", {}),
+            drill_recommendation=getattr(self, "_drill_recommendation", None),
         )
         draw_completion_overlay(surface, layout, state)
+
+    def _analyze_and_build_heatmap(self) -> None:
+        """Run the after-take analyzer and build the technique heatmap + drill."""
+        if self._matcher is None:
+            self._technique_heatmap = {}
+            self._drill_recommendation = None
+            return
+        # Drain any pending PerformanceEvents from the audio capture
+        if self._audio_capture is not None:
+            self._audio_capture.get_events()
+        # Run the analyzer over collected matched pairs
+        tone_profile = None
+        if self._config is not None:
+            tone_profile = self._config.get_active_tone_profile()
+        graded = self._matcher.analyze_performance(tone_profile)
+        # Collect recent failed verdicts for the "why did I miss" HUD display
+        all_verdicts: list = []
+        for ev in graded:
+            all_verdicts.extend(ev.verdicts)
+        # Patch 6d: offline polyphonic pass (unison bends, pinch verification).
+        # Runs only when the preset armed it AND a take was recorded.
+        if (
+            self._config is not None
+            and getattr(self._config, "offline_deep_analysis", False)
+            and self._audio_capture is not None
+        ):
+            raw = self._audio_capture.stop_take_recording()
+            if raw is not None and len(raw) > 0:
+                sr = self._audio_capture.detector.sample_rate
+                offline_verdicts = self._matcher.analyze_performance_offline(
+                    raw, sr, tone_profile,
+                )
+                all_verdicts.extend(offline_verdicts)
+        self._recent_verdicts = [v for v in all_verdicts if v.grade in ("missed", "weak")][-3:]
+        # Build the heatmap: kind -> {accuracy, count}
+        heatmap: dict[str, dict[str, float]] = {}
+        for v in all_verdicts:
+            entry = heatmap.setdefault(v.kind, {"accuracy": 0.0, "count": 0, "_correct": 0})
+            entry["count"] += 1
+            if v.grade in ("good", "ok"):
+                entry["_correct"] += 1
+        for kind, entry in heatmap.items():
+            cnt = entry["count"]
+            entry["accuracy"] = (entry["_correct"] / cnt * 100.0) if cnt > 0 else 0.0
+            del entry["_correct"]
+        self._technique_heatmap = heatmap
+        # Build the drill recommendation
+        from pickhero.recommendations import recommend_drill
+        self._drill_recommendation = recommend_drill(heatmap, self._weakest_sections)
+
+        # Dump the debug match log to stderr when PICKHERO_DEBUG_MATCH=1.
+        if self._matcher is not None and getattr(self._matcher, "_match_log", None):
+            import sys
+            print("=== MATCH LOG ===", file=sys.stderr)
+            for line in self._matcher.get_match_log():
+                print(line, file=sys.stderr)
+            print("=== END MATCH LOG ===", file=sys.stderr)
+
+    def get_timing_stats(self):
+        """Return the matcher's current TimingStats, or None if no matcher."""
+        if self._matcher is None:
+            return None
+        return self._matcher.get_timing_stats()
 
     def _compute_timing_summary(self) -> None:
         """Compute timing stats and worst measures for the summary screen."""
@@ -1202,49 +1323,30 @@ class PlayingScreen:
         self._config.theme = name
         self._config.save()
 
-    # -- Chord mode --
+    # -- Match mode (replaces chord/timing/pitch toggles) --
 
-    def _toggle_chord_mode(self) -> None:
-        """Toggle chord partial credit on/off."""
-        self._chord_partial_credit = not self._chord_partial_credit
-        self._config.chord_partial_credit = self._chord_partial_credit
+    _MODE_CYCLE = [MatchMode.ARCADE, MatchMode.PRACTICE, MatchMode.JUDGE]
+
+    def _cycle_match_mode(self) -> None:
+        """Cycle ARCADE → PRACTICE → JUDGE → ARCADE.
+
+        Replaces the separate chord_partial_credit, timing_judge, and
+        pitch_strict toggles with a single strictness profile.
+        """
+        idx = self._MODE_CYCLE.index(self._match_mode)
+        self._match_mode = self._MODE_CYCLE[(idx + 1) % len(self._MODE_CYCLE)]
+        # Sync derived booleans and persist
+        self._chord_partial_credit = self._match_mode != MatchMode.ARCADE
+        self._timing_judge = self._match_mode == MatchMode.JUDGE
+        self._pitch_strict = self._match_mode == MatchMode.JUDGE
+        self._config.match_mode = self._match_mode.value
         self._config.save()
-        if self._matcher:
-            self._matcher.chord_partial_credit = self._chord_partial_credit
-
-    # -- Wait mode --
-
-    def _toggle_wait_mode(self) -> None:
-        """Toggle wait mode on/off."""
-        self._wait_mode = not self._wait_mode
-        self._config.wait_mode = self._wait_mode
-        self._config.save()
-        if not self._wait_mode:
-            self._wait_mode_frozen = False
-
-    # -- Timing Judge mode --
-
-    def _toggle_timing_judge(self) -> None:
-        """Toggle Timing Judge mode on/off."""
-        self._timing_judge = not self._timing_judge
-        self._config.timing_judge_mode = self._timing_judge
-        self._config.save()
-        if self._timing_judge and self._timing_overlay is None:
+        if self._match_mode == MatchMode.JUDGE and self._timing_overlay is None:
             self._timing_overlay = TimingOverlay()
-        if self._matcher:
-            self._matcher.timing_judge_enabled = self._timing_judge
-        if not self._timing_judge:
+        if self._match_mode != MatchMode.JUDGE:
             self._last_obs_count = 0
-
-    # -- Pitch strict mode --
-
-    def _toggle_pitch_strict(self) -> None:
-        """Toggle pitch strict mode on/off."""
-        self._pitch_strict = not self._pitch_strict
-        self._config.pitch_strict_mode = self._pitch_strict
-        self._config.save()
         if self._matcher:
-            self._matcher.pitch_strict = self._pitch_strict
+            self._matcher.match_mode = self._match_mode
 
     def _toggle_guided_practice(self) -> None:
         """Toggle guided practice mode on/off."""
@@ -1457,15 +1559,17 @@ class PlayingScreen:
             if self._audio_capture is None:
                 self._audio_capture = AudioCapture(self._config)
             self._audio_capture.start()
+            # Patch 6b/d: arm raw-take recording for offline polyphonic analysis
+            # when the preset requests it.
+            if getattr(self._config, "offline_deep_analysis", False):
+                self._audio_capture.start_take_recording()
             self._matcher = NoteMatcher(
                 self._timeline,
                 timing_window_ms=self._config.timing_window_ms,
                 audio_offset_ms=self._playback_ms + self._config.audio_latency_offset_ms,
                 chord_threshold_ms=self._config.chord_threshold_ms,
                 note_filter=self._note_passes_filter if self._is_filter_active() else None,
-                chord_partial_credit=self._chord_partial_credit,
-                timing_judge_enabled=self._timing_judge,
-                pitch_strict=self._pitch_strict,
+                mode=self._match_mode,
             )
             if self._timing_judge and self._timing_overlay is None:
                 self._timing_overlay = TimingOverlay()

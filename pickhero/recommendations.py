@@ -224,6 +224,39 @@ def _section_recommendation(
     return None
 
 
+def recommend_drill(
+    heatmap: dict[str, dict[str, float]],
+    weak_sections: list[tuple[int, int, float]],
+) -> str | None:
+    """Recommend a drill based on the technique heatmap + weak sections.
+
+    If any technique accuracy < 60%, recommend looping the weakest section at
+    70% tempo with a focus on the weakest technique's target, not speed.
+    Returns None if no technique is below threshold or no weak section exists.
+    """
+    if not heatmap:
+        return None
+    # Find the weakest technique (lowest accuracy, with at least 1 note).
+    weakest_technique = None
+    weakest_acc = 100.0
+    for kind, data in heatmap.items():
+        acc = data.get("accuracy", 100.0)
+        count = data.get("count", 0)
+        if count > 0 and acc < weakest_acc:
+            weakest_acc = acc
+            weakest_technique = kind
+    if weakest_technique is None or weakest_acc >= 60.0:
+        return None
+    if not weak_sections:
+        return None
+    section = weak_sections[0]
+    start, end = section[0], section[1]
+    return (
+        f"Loop bars {start+1}-{end+1} at 70%. "
+        f"Focus: {weakest_technique} target, not speed."
+    )
+
+
 def _is_persistent_weakness(
     record: SongRecord, start_measure: int, end_measure: int,
 ) -> bool:

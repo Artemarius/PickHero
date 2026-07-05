@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pickhero.audio.performance import TechniqueSpec
 
 
 @dataclass(frozen=True)
@@ -20,7 +24,7 @@ class NoteEvent:
     string: int  # 1-N (1 = highest pitched string in the tab)
     fret: int    # 0=open
     measure: int = 0  # measure index (0-based)
-    expected_articulation: str | None = None  # "hammer_on", "pull_off", "bend", "vibrato", "slide", "palm_mute", "harmonic"
+    techniques: tuple["TechniqueSpec", ...] = ()  # expected techniques from the tab (bend, vibrato, slide, hammer_on, pull_off, palm_mute, harmonic, dead_note). Empty = normal note.
 
     def __post_init__(self):
         if self.timestamp_ms < 0:

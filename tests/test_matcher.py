@@ -5,6 +5,7 @@ import pytest
 
 from pickhero.audio.detector import DetectedNote
 from pickhero.audio.input import TimestampedNote
+from pickhero.audio.performance import PerformanceEvent, TechniqueSpec, TechniqueCandidate
 from pickhero.matcher import MatchType, MatchResult, NoteMatcher
 from pickhero.tabs.timeline import NoteEvent, SongMetadata, Timeline
 from pickhero.timing import PitchVerdict, TimingVerdict
@@ -12,20 +13,20 @@ from pickhero.timing import PitchVerdict, TimingVerdict
 
 def _note_event(timestamp_ms: float, midi_note: int = 64, string: int = 1,
                 fret: int = 0, duration_ms: float = 500.0,
-                expected_articulation: str | None = None) -> NoteEvent:
+                techniques: tuple = ()) -> NoteEvent:
     return NoteEvent(
         timestamp_ms=timestamp_ms,
         duration_ms=duration_ms,
         midi_note=midi_note,
         string=string,
         fret=fret,
-        expected_articulation=expected_articulation,
+        techniques=techniques,
     )
 
 
 def _detected(midi_note: int, timestamp_ms: float, is_onset: bool = True,
               confidence: float = 0.95,
-              articulation: str | None = None) -> TimestampedNote:
+              performance: "PerformanceEvent | None" = None) -> TimestampedNote:
     return TimestampedNote(
         note=DetectedNote(
             midi_note=midi_note,
@@ -33,7 +34,7 @@ def _detected(midi_note: int, timestamp_ms: float, is_onset: bool = True,
             confidence=confidence,
             name="A4",  # placeholder
             is_onset=is_onset,
-            articulation=articulation,
+            performance=performance,
         ),
         timestamp_ms=timestamp_ms,
     )
@@ -144,10 +145,12 @@ class TestMissedNote:
 
 class TestChordMatching:
     def test_match_one_note_of_chord_marks_all(self):
-        """Match one note of a simultaneous pair -> both marked HIT."""
+        """ARCADE mode: match one note of a simultaneous pair -> both marked HIT."""
         note_a = _note_event(1000.0, midi_note=64, string=1)
         note_b = _note_event(1000.0, midi_note=59, string=2)
         matcher = _make_matcher([note_a, note_b], chord_threshold_ms=50.0)
+        # Explicit ARCADE mode (forgiving: chord auto-complete)
+        matcher.match_mode = "arcade"
 
         # Detect just one note of the chord
         detected = [_detected(64, 1000.0)]
@@ -155,9 +158,34 @@ class TestChordMatching:
 
         hits = [r for r in results if r.match_type == MatchType.HIT]
         assert len(hits) == 1
-        # Both notes should be marked
+        # Both notes should be marked (ARCADE auto-complete)
         assert matcher.get_note_state(note_a) == MatchType.HIT
         assert matcher.get_note_state(note_b) == MatchType.HIT
+
+    def test_judge_mode_no_chord_autocomplete(self):
+        """JUDGE mode: matching the root of a 2-note chord must NOT auto-complete the fifth.
+
+        Regression test for the auto-complete bug where needed = ceil(2/2) = 1
+        let a single matched root auto-complete the fifth. In JUDGE mode only
+        the matched note is marked; the fifth stays PENDING then MISS after window.
+        """
+        from pickhero.matcher import MatchMode
+        note_a = _note_event(1000.0, midi_note=40, string=6)  # E2 (root)
+        note_b = _note_event(1000.0, midi_note=47, string=5)  # B2 (fifth)
+        matcher = _make_matcher([note_a, note_b], chord_threshold_ms=50.0)
+        matcher.match_mode = MatchMode.JUDGE
+
+        # Detect just the root
+        detected = [_detected(40, 1000.0)]
+        matcher.process_detected_notes(detected, 1050.0)
+
+        # Root is HIT, fifth stays PENDING (no auto-complete)
+        assert matcher.get_note_state(note_a) == MatchType.HIT
+        assert matcher.get_note_state(note_b) == MatchType.PENDING
+
+        # Advance past the window — fifth becomes MISS
+        matcher.process_detected_notes([], 1200.0)
+        assert matcher.get_note_state(note_b) == MatchType.MISS
 
     def test_non_simultaneous_notes_not_grouped(self):
         """Notes far apart in time should not be grouped as chord."""
@@ -419,73 +447,108 @@ class TestTimingObservations:
         assert stats.on_time_count == 1
 
     def test_pitch_strict_octave_snapped(self):
-        """In pitch_strict mode, exact octave (12 semitones) is snapped to correct."""
+        """In JUDGE mode, an exact octave (12 semitones) is NOT snapped to correct.
+
+        The old tab-guided octave correction silently snapped a 12-semitone
+        match to a HIT. In JUDGE mode this is removed: a 12-semitone match is
+        recorded as EXTRA with PitchVerdict.WRONG, so octave errors surface
+        instead of being forgiven silently.
+        """
         tab = _note_event(1000.0, midi_note=64)  # E4
         matcher = self._make_timing_matcher([tab], pitch_strict=True)
         # Detect MIDI 76 (E5, exactly 12 semitones up)
         matcher.process_detected_notes([_detected(76, 1000.0)], 1050.0)
         obs = matcher.get_timing_observations()
-        assert obs[0].pitch_verdict == PitchVerdict.CORRECT
-
-    def test_articulation_match_correct(self):
-        """Detected articulation matches expected → articulation_match=True."""
-        tab = _note_event(1000.0, midi_note=64, expected_articulation="hammer_on")
-        matcher = self._make_timing_matcher([tab])
-        matcher.process_detected_notes([_detected(64, 1000.0, articulation="hammer_on")], 1050.0)
-        obs = matcher.get_timing_observations()
-        assert len(obs) == 1
-        assert obs[0].articulation == "hammer_on"
-        assert obs[0].articulation_match is True
-
-    def test_articulation_match_wrong(self):
-        """Detected articulation doesn't match expected → articulation_match=False."""
-        tab = _note_event(1000.0, midi_note=64, expected_articulation="hammer_on")
-        matcher = self._make_timing_matcher([tab])
-        matcher.process_detected_notes([_detected(64, 1000.0, articulation="bend")], 1050.0)
-        obs = matcher.get_timing_observations()
-        assert len(obs) == 1
-        assert obs[0].articulation_match is False
-
-    def test_articulation_match_no_expected(self):
-        """No expected articulation, none detected → match=True (both normal)."""
-        tab = _note_event(1000.0, midi_note=64)  # no expected_articulation
+        assert obs[0].pitch_verdict == PitchVerdict.WRONG
+        assert obs[0].verdict == TimingVerdict.EXTRA
+    def test_techniques_recorded_on_match(self):
+        """Matched note records the tab's expected techniques on the observation."""
+        tab = _note_event(1000.0, midi_note=64, techniques=(TechniqueSpec(kind="hammer_on", tied_to_previous=True),))
         matcher = self._make_timing_matcher([tab])
         matcher.process_detected_notes([_detected(64, 1000.0)], 1050.0)
         obs = matcher.get_timing_observations()
         assert len(obs) == 1
-        assert obs[0].articulation_match is True
+        assert obs[0].techniques is not None
+        assert obs[0].techniques[0].kind == "hammer_on"
 
-    def test_articulation_match_expected_none_detected(self):
-        """Expected articulation but none detected → match=False."""
-        tab = _note_event(1000.0, midi_note=64, expected_articulation="bend")
+    def test_no_techniques_recorded_for_normal_note(self):
+        """A normal note (no techniques) records techniques=() on the observation."""
+        tab = _note_event(1000.0, midi_note=64)
         matcher = self._make_timing_matcher([tab])
         matcher.process_detected_notes([_detected(64, 1000.0)], 1050.0)
         obs = matcher.get_timing_observations()
         assert len(obs) == 1
-        assert obs[0].articulation_match is False
+        # techniques defaults to () on the NoteEvent, recorded as () on obs
+        assert obs[0].techniques == ()
 
-    def test_technique_accuracy_stats(self):
-        """get_statistics includes technique accuracy."""
+    def test_legato_direction_resolved_to_pull_off(self):
+        """A hammer_on spec on a descending note resolves to pull_off."""
+        prev = _note_event(500.0, midi_note=64, string=1, fret=0)
+        cur = _note_event(1000.0, midi_note=62, string=1, fret=0,
+                          techniques=(TechniqueSpec(kind="hammer_on", tied_to_previous=True),))
+        matcher = self._make_timing_matcher([prev, cur])
+        # Match the prev note first so it isn't marked missed
+        matcher.process_detected_notes([_detected(64, 500.0)], 550.0)
+        matcher.process_detected_notes([_detected(62, 1000.0)], 1050.0)
+        # The matched note's techniques should now show pull_off
+        # (resolution happens in process_detected_notes before recording)
+        obs = matcher.get_timing_observations()
+        # Second observation is the cur note (first was prev)
+        assert len(obs) >= 2
+        assert obs[-1].techniques[0].kind == "pull_off"
+
+    def test_analyze_performance_populates_verdicts(self):
+        """analyze_performance runs the analyzer and fills event.verdicts."""
+        # Build a synthetic bend performance event
+        times = np.linspace(0, 0.2, 18)
+        cents = np.minimum(times / 0.2 * 100, 100)
+        event = PerformanceEvent(
+            onset_ms=0,
+            f0_curve=[(t * 1000, 82.41 * 2 ** (c / 1200), c) for t, c in zip(times, cents)],
+            energy_envelope=[(t * 1000, 0.5) for t in times],
+            midi_note=40,
+        )
+        note = _note_event(0.0, midi_note=40, string=6, fret=0,
+                           techniques=(TechniqueSpec(kind="bend", target_cents=100.0),))
+        matcher = self._make_timing_matcher([note])
+        # Simulate the matched pair being collected
+        matcher._matched_pairs.append((event, note))
+        events = matcher.analyze_performance()
+        assert len(events) == 1
+        assert len(events[0].verdicts) >= 1
+        assert events[0].verdicts[0].kind == "bend"
+
+    def test_technique_accuracy_from_verdicts(self):
+        """get_statistics reports technique accuracy from analyzer verdicts."""
+        # good bend
+        times = np.linspace(0, 0.2, 18)
+        cents = np.minimum(times / 0.2 * 100, 100)
+        good_event = PerformanceEvent(
+            onset_ms=0,
+            f0_curve=[(t * 1000, 82.41 * 2 ** (c / 1200), c) for t, c in zip(times, cents)],
+            energy_envelope=[(t * 1000, 0.5) for t in times],
+            midi_note=40,
+        )
+        # weak bend (only reaches 30 cents of a 100-cent target)
+        weak_cents = np.minimum(times / 0.2 * 30, 30)
+        weak_event = PerformanceEvent(
+            onset_ms=0,
+            f0_curve=[(t * 1000, 82.41 * 2 ** (c / 1200), c) for t, c in zip(times, weak_cents)],
+            energy_envelope=[(t * 1000, 0.5) for t in times],
+            midi_note=40,
+        )
         notes = [
-            _note_event(1000.0, midi_note=64, expected_articulation="hammer_on"),
-            _note_event(2000.0, midi_note=64, expected_articulation="bend"),
+            _note_event(0.0, midi_note=40, string=6, fret=0,
+                        techniques=(TechniqueSpec(kind="bend", target_cents=100.0),)),
+            _note_event(500.0, midi_note=40, string=6, fret=0,
+                        techniques=(TechniqueSpec(kind="bend", target_cents=100.0),)),
         ]
         matcher = self._make_timing_matcher(notes)
-        # Match first with correct articulation
-        matcher.process_detected_notes([_detected(64, 1000.0, articulation="hammer_on")], 1050.0)
-        # Match second with wrong articulation
-        matcher.process_detected_notes([_detected(64, 2000.0, articulation="vibrato")], 2050.0)
+        matcher._matched_pairs.append((good_event, notes[0]))
+        matcher._matched_pairs.append((weak_event, notes[1]))
+        matcher.analyze_performance()
         stats = matcher.get_statistics()
         assert stats["technique_total"] == 2
+        # good bend counts as correct; weak bend (grade 'weak' or 'missed') does not
+        assert stats["technique_correct"] == 1
         assert stats["technique_accuracy_percent"] == 50.0
-
-    def test_pull_off_matches_hammer_on(self):
-        """Detected pull_off should match expected hammer_on (pyguitarpro doesn't distinguish)."""
-        tab = _note_event(1000.0, midi_note=64, expected_articulation="hammer_on")
-        matcher = self._make_timing_matcher([tab])
-        # Detect a pull_off (descending legato) — should match hammer_on
-        matcher.process_detected_notes([_detected(64, 1000.0, articulation="pull_off")], 1050.0)
-        obs = matcher.get_timing_observations()
-        assert len(obs) == 1
-        assert obs[0].articulation == "pull_off"
-        assert obs[0].articulation_match is True

@@ -7,7 +7,7 @@ isolation. They are stateless: callers pass all required values explicitly.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pygame
@@ -180,7 +180,9 @@ class CompletionState:
     timing_judge: bool
     timing_summary: "TimingStats | None"
     timing_worst_measures: list[tuple[int, float, float]]
-
+    technique_heatmap: dict[str, dict[str, float]] = field(default_factory=dict)
+    """kind -> {"accuracy": float, "count": int}. Empty when no verdicts."""
+    drill_recommendation: str | None = None
 
 def draw_completion_overlay(
     surface: pygame.Surface,
@@ -252,6 +254,11 @@ def draw_completion_overlay(
             state.timing_worst_measures,
             state.matcher.get_timing_observations() if state.matcher else [],
         )
+
+    # Technique Heatmap panel (Phase 1)
+    if state.technique_heatmap:
+        draw_technique_heatmap(surface, layout, state.technique_heatmap,
+                                state.drill_recommendation)
 
 
 def draw_timing_summary(
@@ -401,10 +408,88 @@ def draw_timing_summary(
             surface.blit(art_surf, (panel_x, panel_y))
             panel_y += 16
 
+def draw_technique_heatmap(
+    surface: pygame.Surface,
+    layout,
+    heatmap: dict[str, dict[str, float]],
+    drill_recommendation: str | None,
+) -> None:
+    """Draw the Technique Heatmap panel within the completion overlay.
+
+    One row per technique kind present in the run, sorted by accuracy ascending
+    (weakest first). Below the table, render the drill recommendation line.
+    """
+    t = get_theme()
+    w, h = layout.screen_w, layout.screen_h
+    panel_font = _get_font("consolas", 16)
+    label_font = _get_font("arial", 14)
+
+    # Sort by accuracy ascending (weakest first)
+    rows = sorted(
+        heatmap.items(),
+        key=lambda kv: kv[1].get("accuracy", 100.0),
+    )
+    panel_h = 40 + len(rows) * 20 + (30 if drill_recommendation else 0)
+    panel_w = 360
+    panel_x = w // 2 - panel_w // 2
+    panel_y = h - panel_h - 40
+
+    # Background panel
+    panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    panel.fill((0, 0, 0, 180))
+    surface.blit(panel, (panel_x, panel_y))
+
+    title_surf = _font_cache.render(panel_font, "Technique Heatmap", True, t.hud_accent)
+    surface.blit(title_surf, (panel_x + 12, panel_y + 8))
+
+    row_y = panel_y + 32
+    for kind, data in rows:
+        acc = data.get("accuracy", 0.0)
+        count = int(data.get("count", 0))
+        display = kind.replace("_", " ").title()
+        line = f"{display:<10} {acc:>3.0f}%  ({count} notes)"
+        color = t.hud_text if acc >= 70 else (t.feedback_close if acc < 50 else t.hud_accent)
+        line_surf = _font_cache.render(label_font, line, True, color)
+        surface.blit(line_surf, (panel_x + 12, row_y))
+        # Bar
+        bar_x = panel_x + 200
+        bar_w = int((panel_w - 220) * (acc / 100.0))
+        if bar_w > 0:
+            pygame.draw.rect(surface, color, (bar_x, row_y + 6, bar_w, 6))
+        row_y += 20
+
+    if drill_recommendation:
+        drill_surf = _font_cache.render(label_font, drill_recommendation, True, t.hud_accent)
+        surface.blit(drill_surf, (panel_x + 12, row_y + 4))
+
+
+def draw_why_missed(
+    surface: pygame.Surface,
+    verdicts: list,
+    font,
+    x: int,
+    y: int,
+) -> None:
+    """Render the last 3 failed-technique verdict explanations on the HUD.
+
+    Called from the HUD region in scrolling.py — replaces the old single
+    articulation label with a rolling display of verdict explanations.
+    """
+    t = get_theme()
+    # Show up to 3 most recent failed/weak/missed verdicts
+    failed = [v for v in verdicts if v.grade in ("missed", "weak")]
+    for i, v in enumerate(failed[-3:]):
+        text = v.explanation
+        color = t.feedback_close if v.grade == "missed" else t.hud_accent
+        surf = _font_cache.render(font, text, True, color)
+        surface.blit(surf, (x, y + i * 18))
+
 
 __all__ = [
     "CompletionState",
     "draw_completion_overlay",
     "draw_help_overlay",
     "draw_timing_summary",
+    "draw_technique_heatmap",
+    "draw_why_missed",
 ]

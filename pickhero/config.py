@@ -2,6 +2,7 @@
 
 Settings stored as JSON in the user's home directory.
 """
+from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, asdict
@@ -31,6 +32,31 @@ class AudioConfig:
     onset_threshold: float = 0.3
     noise_gate_db: float = -60.0  # ignore signals below this dB level
     latency_mode: str = "medium"  # "low", "medium", "high"
+    profile: str = "portable"  # "portable", "high_accuracy", "experimental_ml"
+    ml_model_path: str = ""  # path to ONNX model for ExperimentalML profile (empty = default)
+
+
+@dataclass
+class ToneProfile:
+    """Per-setup tone calibration templates used by the Judge.
+
+    A tone profile records DSP templates (decay halflife, spectral centroid,
+    harmonic strength) for representative techniques on a specific
+    guitar+pickup+gain combination. The Judge applies these as threshold
+    multipliers so grading is distortion-aware. When ``active_tone_profile``
+    is empty, judges fall back to hardcoded thresholds.
+    """
+    guitar: str = ""
+    pickup: str = ""
+    gain: str = "clean"  # "clean", "crunch", "high_gain"
+    templates: dict[str, dict] = field(default_factory=dict)
+    """Keys: ``normal``, ``palm_mute``, ``dead_note``, ``harmonic``, ``bend``,
+    ``vibrato``. Values: ``{"decay_halflife_ms": float, "centroid_hz": float,
+    "harmonic_strength": float}``."""
+
+    @property
+    def name(self) -> str:
+        return f"{self.guitar}_{self.pickup}_{self.gain}".strip("_")
 
 
 # Latency presets: (buf_size, hop_size, description)
@@ -40,6 +66,61 @@ LATENCY_PRESETS = {
     "high": (4096, 1024, "~46ms (best detection)"),
 }
 
+
+# Jose High Accuracy Coach preset — maximal detection + judge fidelity.
+# Applies to the Config in place via apply_preset(). Fields that don't exist on
+# Config yet (multi_label_techniques, after_take_analyzer, tone_profile_required)
+# are informational flags; the behavior is already enabled by the Patch 1-5 code.
+JOSE_HIGH_ACCURACY_PRESET = {
+    "profile": "high_accuracy",
+    "match_mode": "judge",
+    "sample_rate": 48000,
+    "hop_size": 256,
+    "buf_size": 4096,
+    "chord_fft_size": 16384,
+    "strict_chord_verification": True,
+    "multi_label_techniques": True,
+    "after_take_analyzer": True,
+    "tone_profile_required": True,
+    "offline_deep_analysis": True,
+}
+
+
+def apply_preset(config: Config, preset_name: str) -> None:
+    """Mutate a Config in place to apply a named preset.
+
+    Currently supports ``"jose_high_accuracy"``. Maps preset keys to the
+    existing Config/AudioConfig fields. Unknown keys are stored on the Config
+    as attributes for downstream feature-flagging.
+    """
+    presets = {
+        "jose_high_accuracy": JOSE_HIGH_ACCURACY_PRESET,
+    }
+    preset = presets.get(preset_name)
+    if preset is None:
+        raise ValueError(f"unknown preset: {preset_name!r}")
+    # Audio fields
+    config.audio.profile = preset["profile"]
+    config.audio.sample_rate = preset["sample_rate"]
+    config.audio.hop_size = preset["hop_size"]
+    config.audio.buf_size = preset["buf_size"]
+    # Match / judge fields
+    config.match_mode = preset["match_mode"]
+    config.timing_judge_mode = True
+    config.pitch_strict_mode = True
+    # Offline deep-analysis flag (consumed by scrolling.py, Patch 6d)
+    config.offline_deep_analysis = bool(preset.get("offline_deep_analysis", False))
+    # Store the rest as informational attrs for downstream feature-flagging.
+    config.preset_flags = {
+        k: v for k, v in preset.items()
+        if k not in ("profile", "match_mode", "sample_rate", "hop_size",
+                     "buf_size", "offline_deep_analysis")
+    }
+    # Persist the preset so it survives app restart (Judge A finding #2).
+    try:
+        config.save()
+    except Exception:
+        pass  # save may fail in headless/test environments without a config dir
 
 @dataclass
 class DisplayConfig:
@@ -69,10 +150,18 @@ class Config:
     wait_mode: bool = False
     timing_judge_mode: bool = False
     pitch_strict_mode: bool = False
+    match_mode: str = "arcade"
     sort_mode: str = "name_asc"
+    # Tone calibration: list of ToneProfile records + name of the active one.
+    # Empty active_tone_profile => Judge uses hardcoded fallback thresholds.
+    tone_profiles: list[dict] = field(default_factory=list)
+    active_tone_profile: str = ""
     calibration: dict = field(default_factory=dict)
-
-    # Store default for HUD comparison (not serialized)
+    # Patch 6: offline polyphonic analysis flag (set by apply_preset).
+    offline_deep_analysis: bool = False
+    # Patch 6: informational flags from the active preset (chord_fft_size,
+    # multi_label_techniques, etc.) for downstream feature-flagging.
+    preset_flags: dict = field(default_factory=dict)
     _default_chord_partial_credit: bool = field(default=True, repr=False)
 
     def get_string_calibration(self, string: int) -> StringCalibration | None:
@@ -93,6 +182,30 @@ class Config:
         """True if at least one string has been calibrated."""
         strings = self.calibration.get("strings", {})
         return len(strings) > 0
+
+    def get_active_tone_profile(self) -> ToneProfile | None:
+        """Return the active ToneProfile, or None if none is set / found."""
+        if not self.active_tone_profile:
+            return None
+        for tp_dict in self.tone_profiles:
+            tp = ToneProfile(**tp_dict) if isinstance(tp_dict, dict) else tp_dict
+            if getattr(tp, "name", "") == self.active_tone_profile:
+                return tp
+        return None
+
+    def add_tone_profile(self, profile: ToneProfile) -> None:
+        """Add or replace a ToneProfile by name."""
+        as_dict = asdict(profile)
+        # Replace existing entry with the same name, else append.
+        replaced = False
+        for i, tp in enumerate(self.tone_profiles):
+            existing = ToneProfile(**tp) if isinstance(tp, dict) else tp
+            if getattr(existing, "name", "") == profile.name:
+                self.tone_profiles[i] = as_dict
+                replaced = True
+                break
+        if not replaced:
+            self.tone_profiles.append(as_dict)
 
     def save(self):
         """Save settings to JSON file."""
@@ -125,7 +238,24 @@ class Config:
         audio = cls._filter_known(AudioConfig, data.pop("audio", {}))
         display = cls._filter_known(DisplayConfig, data.pop("display", {}))
         top = cls._filter_known(cls, data)
-        return cls(audio=AudioConfig(**audio), display=DisplayConfig(**display), **top)
+        cfg = cls(audio=AudioConfig(**audio), display=DisplayConfig(**display), **top)
+        cfg._migrate_match_mode()
+        return cfg
+
+    def _migrate_match_mode(self) -> None:
+        """One-way migration: derive match_mode from legacy booleans if unset.
+
+        timing_judge_mode=True maps to "judge"; chord_partial_credit=False
+        maps to "practice"; otherwise the default "arcade" is kept. Only runs
+        when match_mode is still the default and a legacy boolean differs.
+        The old fields are kept through one release, then removed.
+        """
+        if self.match_mode != "arcade":
+            return  # already migrated or explicitly set
+        if self.timing_judge_mode:
+            self.match_mode = "judge"
+        elif self.chord_partial_credit is False:
+            self.match_mode = "practice"
 
     @staticmethod
     def _filter_known(datacls: type, raw: dict) -> dict:

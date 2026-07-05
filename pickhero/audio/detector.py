@@ -3,14 +3,17 @@
 Wraps aubio's YIN pitch detector and onset detector.
 Processes audio buffers and returns detected notes.
 """
-
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import aubio
 import numpy as np
 
 from pickhero.audio.note_utils import freq_to_midi, midi_to_name, is_in_guitar_range
 from pickhero.audio.articulation import ArticulationDetector
+
+if TYPE_CHECKING:
+    from pickhero.audio.performance import PerformanceEvent
 
 
 @dataclass
@@ -22,7 +25,7 @@ class DetectedNote:
     name: str
     is_onset: bool  # True if a new note strike was detected
     onset_sample: int | None = None  # absolute sample position of onset (from aubio get_last)
-    articulation: str | None = None  # "hammer_on", "pull_off", "bend", "vibrato", "slide", "palm_mute", "harmonic"
+    performance: "PerformanceEvent | None" = None  # real-time per-note performance record (f0 curve, candidates)
 
 
 class PitchDetector:
@@ -74,6 +77,9 @@ class PitchDetector:
         self._articulation = ArticulationDetector(sample_rate, hop_size, buf_size)
         self._articulation_frame: int = 0
 
+        # Pre-gate: noise transient rejection (spectral flatness + refractory)
+        self._noise_rejected_at_ms: float | None = None
+
     def process(self, audio_buffer: np.ndarray) -> DetectedNote | None:
         """Process a single audio buffer (hop_size float32 samples).
 
@@ -99,6 +105,38 @@ class PitchDetector:
         if db < self.noise_gate_db:
             return None
 
+        # Detect onset FIRST — pick attacks are broadband (plectrum hit
+        # produces a wideband burst) but are real musical events. The
+        # spectral-flatness pre-gate must only reject non-onset noise, never
+        # a pick attack.
+        is_onset = bool(self._onset(audio_buffer))
+
+        # Spectral-flatness pre-gate: reject broadband noise transients
+        # (jack touch, cable bump, RF buzz) on NON-ONSET frames only.
+        # Onset frames always pass — the stabilizer handles false-positive
+        # onsets via confidence gating and consensus.
+        #
+        # Only apply to LOUD frames — silence has high flatness but isn't
+        # a noise transient. Without this floor, silence starts a refractory
+        # that blocks the next legitimate note's sustain frames.
+        _SF_NOISE = 0.45
+        _SF_RMS_FLOOR_DB = -40.0
+        _REFRACTORY_MS = 60.0
+
+        frame_ms = self._articulation_frame * self.hop_size / self.sample_rate * 1000.0
+
+        if not is_onset:
+            if self._noise_rejected_at_ms is not None:
+                if frame_ms - self._noise_rejected_at_ms < _REFRACTORY_MS:
+                    return None  # still in refractory after a noise transient
+                self._noise_rejected_at_ms = None
+
+            if db > _SF_RMS_FLOOR_DB:
+                flatness = self._spectral_flatness(audio_buffer)
+                if flatness > _SF_NOISE:
+                    self._noise_rejected_at_ms = frame_ms
+                    return None
+
         # Detect pitch
         freq = float(self._pitch(audio_buffer)[0])
         confidence = float(self._pitch.get_confidence())
@@ -111,41 +149,50 @@ class PitchDetector:
         self.last_freq = freq
         self.last_confidence = confidence
 
-        # Detect onset
-        is_onset = bool(self._onset(audio_buffer))
-
         # Detect articulation (runs on every frame, using pitch + onset + audio)
         # Use a frame-relative timestamp (ms from detector start)
-        articulation = self._articulation.process(
-            freq, confidence, is_onset, audio_buffer,
-            self._articulation_frame * self.hop_size / self.sample_rate * 1000.0,
+        timestamp_ms = self._articulation_frame * self.hop_size / self.sample_rate * 1000.0
+        self._articulation.process(
+            freq, confidence, is_onset, audio_buffer, timestamp_ms,
         )
         self._articulation_frame += 1
 
+        # The active PerformanceEvent is held by the articulation detector while
+        # a note is sounding; it is closed and drained on the next onset. Attach
+        # the in-progress event to the DetectedNote so the matcher can later
+        # resolve which NoteEvent it corresponds to.
+        active_event = self._articulation.active_event
+
         # Filter: need minimum confidence and valid frequency.
-        # BUT: an onset is a timing event independent of pitch confidence.
-        # If onset fires, return the note (with whatever pitch was detected) so
-        # the Timing Judge can record the timing even if pitch is uncertain.
+        # Onsets are timing events independent of pitch confidence — YIN often
+        # hasn't locked during the attack transient, so confidence can be low.
+        # But a pitchless onset (freq=0, midi=0) or one outside guitar range is
+        # noise, not a real pick. Reject those; forward everything else.
         if confidence < self.confidence_threshold or freq <= 0:
             if is_onset:
-                # Low-confidence onset — return with best-effort pitch (may be 0)
                 midi_note = freq_to_midi(freq) if freq > 0 else 0
                 if midi_note == 0 or not is_in_guitar_range(midi_note):
-                    midi_note = 0  # unknown pitch, but timing is still valid
+                    return None
                 return DetectedNote(
                     midi_note=midi_note,
                     frequency=freq,
                     confidence=confidence,
-                    name=midi_to_name(midi_note) if midi_note > 0 else "?",
+                    name=midi_to_name(midi_note),
                     is_onset=True,
                     onset_sample=self._onset.get_last(),
-                    articulation=articulation,
+                    performance=active_event,
                 )
             return None
 
         midi_note = freq_to_midi(freq)
         if not is_in_guitar_range(midi_note):
             return None
+
+        # Keep the active event's midi_note / confidence in sync so the
+        # matcher and analyzer see the final pitch decision.
+        if active_event is not None:
+            active_event.midi_note = midi_note
+            active_event.confidence = confidence
 
         return DetectedNote(
             midi_note=midi_note,
@@ -154,8 +201,35 @@ class PitchDetector:
             name=midi_to_name(midi_note),
             is_onset=is_onset,
             onset_sample=self._onset.get_last() if is_onset else None,
-            articulation=articulation,
+            performance=active_event,
         )
+
+    def _spectral_flatness(self, audio: np.ndarray) -> float:
+        """Wiener entropy — geometric/arithmetic mean of spectrum.
+
+        Tonal (guitar note): < 0.25. Broadband noise (jack touch): > 0.45.
+        Used by the pre-gate to reject noise transients before onset/pitch
+        detection, preventing phantom notes from electrical interference.
+        """
+        n = len(audio)
+        windowed = audio * np.hanning(n)
+        spec = np.abs(np.fft.rfft(windowed))
+        spec = spec[1:]  # skip DC
+        if len(spec) == 0 or np.all(spec < 1e-12):
+            return 1.0
+        eps = 1e-12
+        geo = np.exp(np.mean(np.log(np.maximum(spec, eps))))
+        ari = np.mean(spec)
+        return float(geo / ari) if ari > eps else 1.0
+
+    def drain_events(self) -> list["PerformanceEvent"]:
+        """Drain PerformanceEvents completed since the last call.
+
+        A PerformanceEvent is *completed* when the next onset fires (the
+        previous note's release). The articulation detector owns the list;
+        this is the thread-safe drain point for the worker / audio callback.
+        """
+        return self._articulation.drain_completed()
 
     def _correct_octave_jump(self, freq: float, confidence: float) -> float:
         """Suppress octave jumps caused by harmonic detection.
@@ -177,9 +251,9 @@ class PitchDetector:
                 else:
                     median = (valid_sorted[n // 2 - 1] + valid_sorted[n // 2]) / 2.0
                 ratio = freq / median
-                if ratio > 1.5:
+                if ratio > 3.0:
                     freq = freq / 2.0
-                elif ratio < 0.6:
+                elif ratio < 0.25:
                     freq = freq * 2.0
         # Update history (keep last 5)
         self._freq_history.append(freq)
