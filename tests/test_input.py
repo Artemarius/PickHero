@@ -29,7 +29,10 @@ def _make_capture_with_adc(adc_times: list[float]):
     adc_times: list of ADC timestamps to feed successive callbacks.
     Returns (capture, call_callback) where call_callback(signal) invokes
     _audio_callback with the next adc_time.
+
+    The unified worker is started so chunks get processed.
     """
+    import time as _time
     config = Config()
     config.audio.confidence_threshold = 0.3
     config.audio.noise_gate_db = -80.0
@@ -37,6 +40,11 @@ def _make_capture_with_adc(adc_times: list[float]):
     config.audio.hop_size = 512
 
     capture = AudioCapture(config)
+    # Start only the unified worker thread — NOT the real audio stream.
+    # Opening sd.InputStream would flood the worker with silence frames
+    # from the actual hardware, aging out tracks before test bursts
+    # can reach consensus.
+    capture._start_unified_worker()
     time_idx = [0]
 
     def call_callback(signal: np.ndarray):
@@ -45,6 +53,8 @@ def _make_capture_with_adc(adc_times: list[float]):
         # Reshape to (frames, 1) as sounddevice provides
         indata = signal.reshape(-1, 1).astype(np.float32)
         capture._audio_callback(indata, len(signal), _MockTimeInfo(adc), 0)
+        # Worker thread needs time to process the chunk
+        _time.sleep(0.15)
 
     return capture, call_callback
 
@@ -67,20 +77,22 @@ class TestTimestampAccuracy:
         # ADC times advance by buffer_size/sr per callback
         adc_times = [i * (hop / sr) for i in range(100)]
         capture, call_cb = _make_capture_with_adc(adc_times)
+        try:
+            timestamps = []
+            for i in range(0, len(signal), hop):
+                chunk = signal[i:i + hop]
+                if len(chunk) < hop:
+                    chunk = np.pad(chunk, (0, hop - len(chunk)))
+                call_cb(chunk)
+                for ts_note in capture.get_notes():
+                    timestamps.append(ts_note.timestamp_ms)
 
-        timestamps = []
-        for i in range(0, len(signal), hop):
-            chunk = signal[i:i + hop]
-            if len(chunk) < hop:
-                chunk = np.pad(chunk, (0, hop - len(chunk)))
-            call_cb(chunk)
-            for ts_note in capture.get_notes():
-                timestamps.append(ts_note.timestamp_ms)
-
-        assert len(timestamps) >= 2, "Expected at least 2 detections"
-        for j in range(1, len(timestamps)):
-            assert timestamps[j] >= timestamps[j - 1], \
-                f"Timestamp decreased: {timestamps[j]} < {timestamps[j - 1]}"
+            assert len(timestamps) >= 2, "Expected at least 2 detections"
+            for j in range(1, len(timestamps)):
+                assert timestamps[j] >= timestamps[j - 1], \
+                    f"Timestamp decreased: {timestamps[j]} < {timestamps[j - 1]}"
+        finally:
+            capture.stop()
 
     def test_fallback_to_wall_clock_without_adc_time(self):
         """When ADC time is 0, should fall back to wall-clock timestamps."""
@@ -90,21 +102,22 @@ class TestTimestampAccuracy:
 
         # All ADC times are 0 → should use wall clock fallback
         capture, call_cb = _make_capture_with_adc([0.0] * 100)
+        try:
+            timestamps = []
+            for i in range(0, len(burst), hop):
+                chunk = burst[i:i + hop]
+                if len(chunk) < hop:
+                    chunk = np.pad(chunk, (0, hop - len(chunk)))
+                call_cb(chunk)
+                for ts_note in capture.get_notes():
+                    timestamps.append(ts_note.timestamp_ms)
 
-        timestamps = []
-        for i in range(0, len(burst), hop):
-            chunk = burst[i:i + hop]
-            if len(chunk) < hop:
-                chunk = np.pad(chunk, (0, hop - len(chunk)))
-            call_cb(chunk)
-            for ts_note in capture.get_notes():
-                timestamps.append(ts_note.timestamp_ms)
-
-        # Should still get detections with positive timestamps
-        assert len(timestamps) >= 1
-        for ts in timestamps:
-            assert ts >= 0.0
-
+            # Should still get detections with positive timestamps
+            assert len(timestamps) >= 1
+            for ts in timestamps:
+                assert ts >= 0.0
+        finally:
+            capture.stop()
     def test_timestamp_matches_sample_position(self):
         """Regression test for the timestamping bug.
 
@@ -204,19 +217,25 @@ class TestXrunHandling:
         capture, call_cb = _make_capture_with_adc([0.0] * 100)
         initial_xruns = capture.get_xrun_count()
 
-        for i in range(0, len(burst), hop):
-            chunk = burst[i:i + hop]
-            if len(chunk) < hop:
-                chunk = np.pad(chunk, (0, hop - len(chunk)))
-            indata = chunk.reshape(-1, 1).astype(np.float32)
-            # Simulate PortAudio input overflow status.
-            capture._audio_callback(
-                indata, len(chunk), _MockTimeInfo(0.0), "Input overflow"
-            )
+        try:
+            for i in range(0, len(burst), hop):
+                chunk = burst[i:i + hop]
+                if len(chunk) < hop:
+                    chunk = np.pad(chunk, (0, hop - len(chunk)))
+                indata = chunk.reshape(-1, 1).astype(np.float32)
+                # Simulate PortAudio input overflow status.
+                capture._audio_callback(
+                    indata, len(chunk), _MockTimeInfo(0.0), "Input overflow"
+                )
 
-        notes = capture.get_notes()
-        assert len(notes) >= 1, "Expected detections despite overflow status"
-        assert capture.get_xrun_count() > initial_xruns
+            import time as _time
+            _time.sleep(0.3)  # let worker finish processing queued chunks
+
+            notes = capture.get_notes()
+            assert len(notes) >= 1, "Expected detections despite overflow status"
+            assert capture.get_xrun_count() > initial_xruns
+        finally:
+            capture.stop()
 
 class TestHighAccuracyProfile:
     """Verify the HighAccuracy profile uses a PitchEngine worker."""
@@ -443,11 +462,17 @@ class TestHighAccuracyCallbackDrain:
         pitch confidence is ~0, so the articulation detector (gated on
         ``confidence > 0.3``) does not create an active event for a synthetic
         sine. We seed one directly, simulating the steady-state aftermath of a
-        confident onset, then verify the worker thread captures it."""
+        confident onset, then verify the worker thread captures it.
+
+        In the unified-worker architecture, the worker loop drains engine
+        results and emits through the stabilizer — the callback no longer
+        performs that drain.
+        """
         from pickhero.audio.performance import PerformanceEvent
+        import time as _time
         capture = self._make_high_accuracy_capture()
+        capture.start()
         engine = capture._engine
-        assert engine is not None
         engine.start()
         try:
             sr = engine.sample_rate
@@ -458,23 +483,19 @@ class TestHighAccuracyCallbackDrain:
             engine.detector._articulation._active = PerformanceEvent(
                 onset_ms=seeded_onset_ms, midi_note=69, confidence=0.9,
             )
-            # Submit one confident-pitch chunk; the worker will process it and
-            # capture the active event at that moment.
-            # Submit ~1s of confident-pitch tone (enough to fill the 4096-sample
-            # aubio window) so the worker produces candidates with valid midi.
-            # The active event seeded above is captured on each processed chunk.
+            # Submit chunks directly to the engine (bypassing the callback);
+            # the worker loop processes them and captures the active event.
             tone_len = int(sr * 0.8)
             tt = np.arange(tone_len) / sr
             tone = (0.5 * np.sin(2 * np.pi * 440 * tt)).astype(np.float32)
             for i in range(0, len(tone) - hop, hop):
                 engine.submit(tone[i:i + hop], chunk_start_sample=4800 + i)
-            import time as _time
-            _time.sleep(0.4)
+            _time.sleep(0.6)
             # Clear the active event BEFORE draining, to prove the result carries
             # the processing-time snapshot, not a drain-time re-read.
             engine.detector._articulation._active = None
-            silence = np.zeros(hop, dtype=np.float32).reshape(-1, 1)
-            capture._audio_callback(silence, hop, _MockTimeInfo(0.1), 0)
+
+            # In the unified architecture, notes flow through get_notes().
             notes = capture.get_notes()
             with_perf = [tn for tn in notes if tn.note.performance is not None]
             assert with_perf, "expected a drained note carrying the seeded performance event"
@@ -486,4 +507,5 @@ class TestHighAccuracyCallbackDrain:
                     "capturing it at processing time"
                 )
         finally:
+            capture.stop()
             engine.stop()

@@ -5,6 +5,7 @@ Detected notes are pushed to a thread-safe queue for consumption by the main thr
 """
 
 import queue
+import threading
 import time
 import sys
 from dataclasses import dataclass
@@ -100,12 +101,20 @@ class AudioCapture:
         self._stabilizer = TrackStabilizer(
             sample_rate=ac.sample_rate, hop_size=ac.hop_size,
         )
+        # Unified worker thread: runs in background, processes audio from
+        # _worker_in_queue.  Replaces the per-hop DSP that used to live in
+        # _audio_callback for both portable and high_accuracy profiles.
+        self._worker_in_queue: queue.Queue = queue.Queue(maxsize=256)
+        self._worker_thread: threading.Thread | None = None
+        self._worker_running: bool = False
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
-        """Sounddevice callback — runs in audio thread."""
+        """Sounddevice callback — runs in audio thread.
+
+        This method is real-time safe: it performs only cheap, non-blocking
+        operations (copy, append, queue.put).  All DSP runs on the unified
+        worker thread.
+        """
         if status:
-            # Count xruns. Only hard-drop the buffer on input underflow or
-            # output errors; input overflow usually still delivers usable
-            # audio, so dropping it guarantees a miss. Keep processing.
             if "input overflow" in str(status).lower():
                 self._xrun_count += 1
             elif "input underflow" in str(status).lower() or "output" in str(status).lower():
@@ -120,86 +129,93 @@ class AudioCapture:
         # Patch 6b: record raw mono audio for offline analysis when armed.
         if self._take_audio is not None:
             self._take_audio.append(mono.copy())
+
         # Feed chord detector (FFT-based, runs on full buffer)
         self.chord_detector.push_audio(mono)
 
         # Determine the ADC timestamp of this buffer's first sample.
-        # On the first callback, initialize _start_time and probe backend support.
         adc_time = getattr(time_info, "inputBufferAdcTime", 0.0) if time_info else 0.0
         if self._adc_time_available is None:
             self._adc_time_available = adc_time > 0.0
             if self._adc_time_available:
                 self._start_time = adc_time
             else:
-                # Backend doesn't populate ADC time — fall back to wall clock
                 self._start_time = time.perf_counter()
         elif self._adc_time_available and self._start_time == 0.0:
             self._start_time = adc_time
 
         sample_rate = self.detector.sample_rate
-
-        # Process in hop_size chunks
         hop = self.detector.hop_size
+
+        # Push hop-sized chunks into the worker input queue with timestamps.
         for i in range(0, len(mono) - hop + 1, hop):
             chunk = mono[i:i + hop]
+            self._worker_in_queue.put((chunk, self._detector_sample_offset))
+            self._detector_sample_offset += hop
+
+        # Drain completed PerformanceEvents from the articulation detector.
+        for event in self.detector.drain_events():
+            self.event_queue.put(event)
+    def _start_unified_worker(self) -> None:
+        """Start the unified worker thread that processes queued audio chunks."""
+        if self._worker_running:
+            return
+        self._worker_running = True
+        self._worker_thread = threading.Thread(
+            target=self._unified_worker_loop, daemon=True
+        )
+        self._worker_thread.start()
+
+    def _unified_worker_loop(self) -> None:
+        """Worker thread: drain chunks, process, emit stable events.
+
+        For high_accuracy profiles the worker also interacts with the
+        PitchEngine.  For portable profiles it calls PitchDetector.process
+        directly.  Results flow through _emit_through_stabilizer → note_queue.
+
+        CRITICAL: we only emit through the stabilizer when a real chunk
+        was processed.  Idle gaps (queue.Empty) are simply skipped — they
+        must not age out stabilizer tracks because nothing is happening yet.
+        """
+        sample_rate = self.detector.sample_rate
+
+        while self._worker_running:
+            try:
+                chunk, chunk_start_sample = self._worker_in_queue.get(timeout=0.05)
+            except queue.Empty:
+                # Idle gap — do NOT emit None to the stabilizer.  Emitting
+                # None every 50 ms ages out active tracks before multi-frame
+                # consensus can form.  We only process chunks that actually
+                # arrived.
+                continue
+
             if self._engine is not None:
-                # HighAccuracy/ExperimentalML: submit to the worker thread.
-                # Pass the absolute stream sample index so worker results carry
-                # their own stable timestamp — never infer from drain time.
-                self._engine.submit(chunk, chunk_start_sample=self._detector_sample_offset)
+                self._engine.submit(chunk, chunk_start_sample)
                 self._signal_db = self.detector.last_signal_db
                 self._tuner_freq = self.detector.last_freq
                 self._tuner_confidence = self.detector.last_confidence
+                frame_ms = chunk_start_sample / sample_rate * 1000.0
+                had_result = False
+                for r in self._engine.get_candidates():
+                    had_result = True
+                    result = r.candidate.to_detected_note(
+                        is_onset=r.is_onset, onset_sample=r.onset_sample,
+                        performance=r.performance,
+                    )
+                    if result is not None:
+                        self._emit_through_stabilizer(result, frame_ms)
+                if not had_result:
+                    self._emit_through_stabilizer(None, frame_ms)
             else:
-                # Portable: process synchronously in the callback.
                 result = self.detector.process(chunk)
                 self._signal_db = self.detector.last_signal_db
                 self._tuner_freq = self.detector.last_freq
                 self._tuner_confidence = self.detector.last_confidence
+                frame_ms = chunk_start_sample / sample_rate * 1000.0
                 if result is not None:
-                    # The stabilizer needs the frame's real-time position
-                    # (stream sample offset), NOT the onset sample. Using
-                    # onset_sample causes all frames in a burst to share
-                    # the onset's timestamp, breaking the refractory period
-                    # and consensus logic. The onset_sample is preserved on
-                    # the DetectedNote for the matcher's timing; the
-                    # stabilizer operates on frame time.
-                    frame_ms = self._detector_sample_offset / sample_rate * 1000.0
                     self._emit_through_stabilizer(result, frame_ms)
                 else:
-                    # Feed silence to the stabilizer so stale tracks age out.
-                    frame_ms = self._detector_sample_offset / sample_rate * 1000.0
-                    self._stabilizer.process(None, frame_ms)
-            # Advance the absolute sample counter by one hop
-            self._detector_sample_offset += hop
-
-        # Drain completed PerformanceEvents from the articulation detector.
-        # A note is completed when the next onset fires (its release_ms is set).
-        for event in self.detector.drain_events():
-            self.event_queue.put(event)
-        # Drain the engine's output queue (if active) into the note queue.
-        # Each result carries its own chunk_start_sample from submit time,
-        # so timestamps are stable regardless of when the callback drains.
-        if self._engine is not None:
-            had_candidates = False
-            for r in self._engine.get_candidates():
-                had_candidates = True
-                result = r.candidate.to_detected_note(
-                    is_onset=r.is_onset, onset_sample=r.onset_sample,
-                    performance=r.performance,
-                )
-                if result is not None:
-                    # Use chunk_start_sample (absolute stream position) for
-                    # the stabilizer, NOT onset_sample. onset_sample gives
-                    # identical timestamps to all frames in a burst, breaking
-                    # the stabilizer's refractory and consensus logic.
-                    ts_ms = r.chunk_start_sample / sample_rate * 1000.0
-                    self._emit_through_stabilizer(result, ts_ms)
-            if not had_candidates:
-                # No results from the engine this drain — feed silence to
-                # the stabilizer so stale tracks age out.
-                frame_ms = self._detector_sample_offset / sample_rate * 1000.0
-                self._stabilizer.process(None, frame_ms)
+                    self._emit_through_stabilizer(None, frame_ms)
     def _compute_timestamp_ms(
         self,
         result: DetectedNote,
@@ -212,12 +228,7 @@ class AudioCapture:
 
         The absolute sample index is the canonical timestamp. The ADC time is used
         only to anchor the sample clock to wall-clock for the first buffer; after
-        that, samples are the source of truth.
-
-        aubio_onset_get_last() already subtracts the algorithmic delay internally
-        (verified in aubio/src/onset/onset.c: aubio_onset_get_last returns
-        o->last_onset - o->delay), so onset_sample is the delay-compensated sample
-        position of the onset. We must NOT subtract the delay again.
+        that the system advances strictly by sample offsets.
         """
         if not self._adc_time_available:
             # Backend without ADC time — use wall clock (legacy behavior)
@@ -341,6 +352,8 @@ class AudioCapture:
         self._xrun_count = 0
         # _start_time will be set on first callback from time_info.inputBufferAdcTime
         self._start_time = 0.0
+        # Start the unified worker thread
+        self._start_unified_worker()
         # Low-latency mode: uses default_low_input_latency (~9ms vs ~35ms default_high).
         # On Windows, request WASAPI exclusive mode for ~3ms hardware latency.
         extra = None
@@ -384,6 +397,11 @@ class AudioCapture:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        # Stop the unified worker thread
+        self._worker_running = False
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=2.0)
+            self._worker_thread = None
         # Flush any pending track that reached consensus but wasn't emitted
         # during the last callback (e.g., a note still ringing at stop time).
         for event in self._stabilizer.flush():
