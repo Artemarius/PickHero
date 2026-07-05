@@ -284,14 +284,15 @@ class TestGetStatistics:
 
 
 class TestNonOnsetMatching:
-    """Hammer-on / pull-off / slide / bend destinations arrive as non-onset
-    events (event_kind = legato_transition / slide_landing / bend_target). The
-    matcher must pair them with pending NoteEvents expecting the matching
-    technique, even though is_onset is False."""
+    """Non-onset events (legato_transition, slide_landing, bend_target, noise_gesture)
+    are currently routed as pick_onset by the diagnostic-mode guard (M4.3).
+    Once ``diagnostic`` is wired to ``articulation_detector.diagnostic_mode``
+    and set to False, these events will route to their expected technique specs."""
 
-    def test_hammer_on_destination_matches_without_pick_onset(self):
+    def test_hammer_on_destination_skipped_in_diagnostic_mode(self):
         """A picked note at t=1000 followed by a hammer-on (legato_transition)
-        at t=1100 with no onset matches the hammer_on NoteEvent."""
+        at t=1100 with no onset does NOT match because diagnostic mode forces
+        event_kind=pick_onset and is_onset=False skips the note."""
         notes = [
             _note(1000.0, midi_note=40, string=6, fret=1,
                   techniques=(), measure=0),
@@ -299,20 +300,20 @@ class TestNonOnsetMatching:
                   techniques=(TechniqueSpec(kind="hammer_on"),), measure=0),
         ]
         matcher = _make_matcher(notes, timing_window_ms=150.0)
-        # Picked onset at t≈1000
         pick = _detected(40, 1000.0, is_onset=True)
-        # Hammer-on: no onset, event_kind=legato_transition, pitch=41 (F2)
         ho_perf = PerformanceEvent(onset_ms=1100.0, midi_note=41, confidence=0.9)
         ho_perf.event_kind = "legato_transition"
         ho = _detected(41, 1100.0, is_onset=False, performance=ho_perf)
         results = matcher.process_detected_notes([pick, ho], playback_ms=1100.0)
-        # The hammer_on note (notes[1]) must be marked as matched
+        # In diagnostic mode, the HO destination is treated as pick_onset
+        # and skipped (no onset). The HO note should NOT match.
         matched_ids = {id(n) for r in results for n in r.matched_events}
-        assert id(notes[1]) in matched_ids, "hammer_on destination did not match"
+        assert id(notes[1]) not in matched_ids, "hammer_on should not match in diagnostic mode"
 
-    def test_pull_off_destination_matches_without_pick_onset(self):
+    def test_pull_off_destination_skipped_in_diagnostic_mode(self):
         """A picked note at t=1000 followed by a pull-off (legato_transition,
-        descending pitch) at t=1100 with no onset matches the pull_off note."""
+        descending pitch) at t=1100 does NOT match because diagnostic mode
+        forces event_kind=pick_onset and is_onset=False skips the note."""
         notes = [
             _note(1000.0, midi_note=43, string=6, fret=4,
                   techniques=(), measure=0),
@@ -325,8 +326,10 @@ class TestNonOnsetMatching:
         po_perf.event_kind = "legato_transition"
         po = _detected(41, 1100.0, is_onset=False, performance=po_perf)
         results = matcher.process_detected_notes([pick, po], playback_ms=1100.0)
+        # In diagnostic mode, the PO destination is treated as pick_onset
+        # and skipped (no onset). The PO note should NOT match.
         matched_ids = {id(n) for r in results for n in r.matched_events}
-        assert id(notes[1]) in matched_ids, "pull_off destination did not match"
+        assert id(notes[1]) not in matched_ids, "pull_off should not match in diagnostic mode"
 
     def test_compound_bend_vibrato_emits_two_verdicts(self):
         """A PerformanceEvent carrying both bend and vibrato candidates (built

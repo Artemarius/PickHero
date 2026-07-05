@@ -129,10 +129,12 @@ class ArticulationDetector:
         self._active: PerformanceEvent | None = None
         self._completed: list[PerformanceEvent] = []
 
-        # Previous event's midi_note (for real-time legato direction proxy).
+        # Whether articulation is in diagnostic-only mode. When True, detectors
+        # still label candidates on PerformanceEvent but the matcher does NOT
+        # route by event_kind — all events match as pick_onset. Technique
+        # scoring is deferred to the after-take analyzer.
+        self.diagnostic_mode: bool = True
         self._prev_event_midi: int | None = None
-
-    # ------------------------------------------------------------------ state
 
     @property
     def active_event(self) -> PerformanceEvent | None:

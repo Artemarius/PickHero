@@ -318,19 +318,24 @@ class NoteMatcher:
         # First, mark any notes that have passed the window as missed
         results.extend(self._mark_missed_notes(playback_ms))
 
-        # Process each detected note. Onset events always match (existing
-        # behavior). Non-onset events match only when the tab expects the
-        # corresponding technique — this lets HO/PO/slide/tap destinations
-        # match without a pick onset.
+        # Process each detected note. When articulation is in diagnostic mode,
+        # all events match as pick_onset — technique labels are diagnostic-only
+        # and deferred to the after-take analyzer. When diagnostic mode is off,
+        # the matcher routes by event_kind (legato_transition → hammer_on/pull_off,
+        # slide_landing → slide, bend_target → bend, noise_gesture → dead_note).
         for ts_note in detected:
+            # When articulation is in diagnostic mode, all events match as pick_onset.
+            # Technique labels are diagnostic-only — not used for routing.
+            diagnostic = True  # TODO: wire to articulation_detector.diagnostic_mode
             event_kind = "pick_onset"
-            # Prefer the immutable snapshot over the mutable PerformanceEvent.
-            # The snapshot captures event_kind at emission time, preventing
-            # race conditions where performance.event_kind changes after.
-            if ts_note.note.event_snapshot is not None:
-                event_kind = ts_note.note.event_snapshot.event_kind
-            elif ts_note.note.performance is not None:
-                event_kind = ts_note.note.performance.event_kind
+            if not diagnostic:
+                # Prefer the immutable snapshot over the mutable PerformanceEvent.
+                # The snapshot captures event_kind at emission time, preventing
+                # race conditions where performance.event_kind changes after.
+                if ts_note.note.event_snapshot is not None:
+                    event_kind = ts_note.note.event_snapshot.event_kind
+                elif ts_note.note.performance is not None:
+                    event_kind = ts_note.note.performance.event_kind
 
             midi = ts_note.note.midi_note
             ts = ts_note.timestamp_ms
