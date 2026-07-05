@@ -334,15 +334,19 @@ class PitchEngine:
     def _process_chunk(self, chunk: np.ndarray) -> _EngineResult | None:
         """Run the consensus pipeline on a single hop-sized chunk.
 
-        Calls PitchDetector.process() ONCE — which internally calls both
-        aubio.pitch and aubio.onset. The is_onset and onset_sample come
-        from that single call. The worker never calls _onset() again.
+        Collects pitch candidates from multiple detectors (primary YIN,
+        large-window YIN, spectral check), resolves conflicts via
+        :meth:`_resolve_candidates`, and returns the best candidate.
         """
-        # Push to the rolling spectral buffer BEFORE processing (so the
-        # spectral check has the latest audio available).
+        # Push to the rolling spectral buffer BEFORE processing.
         self._push_spectral(chunk)
 
-        # Step 1: Primary YIN + onset (called ONCE via detector.process)
+        # Collect candidates from multiple sources
+        candidates: list[PitchCandidate] = []
+        is_onset: bool = False
+        onset_sample: int | None = None
+
+        # Step 1: Primary YIN
         result = self._detector.process(chunk)
         if result is None:
             return None
@@ -352,73 +356,252 @@ class PitchEngine:
         confidence = result.confidence
         is_onset = result.is_onset
         onset_sample = result.onset_sample
-        flags = {"yin"}
 
-        if freq <= 0 or midi <= 0:
+        # Step 4: Read tab prior (available regardless of pitch validity)
+        with self._tab_prior_lock:
+            tab_prior = set(self._tab_prior)
+
+        if freq > 0 and midi > 0:
+            flags: set[str] = {"yin"}
+
+            # Step 2: Large-window YIN for low notes
+            if self._detector_large is not None and freq < 200.0:
+                try:
+                    result_large = self._detector_large.process(chunk)
+                    if result_large is not None and result_large.frequency > 0 and result_large.midi_note > 0:
+                        flags_large = {"yin_large"}
+                        if result_large.confidence > confidence:
+                            freq = result_large.frequency
+                            midi = result_large.midi_note
+                            confidence = result_large.confidence
+                            flags = {"yin", "yin_large"}
+                            if not is_onset and result_large.is_onset:
+                                is_onset = True
+                                onset_sample = result_large.onset_sample
+                        else:
+                            flags_large.add("secondary")
+                except Exception:
+                    pass
+
+            # Primary candidate
+            nearest_midi, cents = freq_to_cents_deviation(freq)
+            candidates.append(PitchCandidate(
+                best_midi=midi,
+                cents_error=cents,
+                raw_frequency=freq,
+                confidence=confidence,
+                source_flags=flags | {"yin_primary"},
+            ))
+
+            # Step 3: Spectral candidate — if spectral check finds a different
+            # strong fundamental, add it as a competing candidate for the
+            # resolver to weigh.
+            if self._spectral_fill >= self._SPECTRAL_BUF_SIZE // 2:
+                spec_freq = self._find_spectral_peak(freq)
+                if spec_freq is not None and spec_freq > 0:
+                    spec_nearest, spec_cents = freq_to_cents_deviation(spec_freq)
+                    # Only add if it differs enough from primary to be interesting
+                    if abs(spec_nearest - nearest_midi) >= 1:
+                        spec_flags = {"spectral"}
+                        candidates.append(PitchCandidate(
+                            best_midi=spec_nearest,
+                            cents_error=spec_cents,
+                            raw_frequency=spec_freq,
+                            confidence=confidence * 0.9,  # slight penalty vs YIN
+                            source_flags=spec_flags,
+                        ))
+
+            if tab_prior:
+                candidates = self._apply_tab_prior(candidates, tab_prior)
+
+        else:
+            # No valid primary — return early with null candidate
+            flags = {"yin"}
+            candidates.append(PitchCandidate(
+                best_midi=None,
+                cents_error=None,
+                raw_frequency=freq,
+                confidence=confidence,
+                source_flags=flags,
+            ))
+
+        # Step 5: Resolve multi-candidate conflicts
+        tab_prior_midi: int | None = None
+        if tab_prior:
+            # Pick the closest tab prior note to the primary MIDI note
+            tab_prior_midi = min(tab_prior, key=lambda m: abs(m - (midi if midi is not None else 0))) if midi is not None else None
+
+        best = self._resolve_candidates(candidates, tab_prior_midi)
+
+        if best is None or best.best_midi is None or best.raw_frequency <= 0:
             return _EngineResult(
                 candidate=PitchCandidate(
                     best_midi=None,
                     cents_error=None,
                     raw_frequency=freq,
-                    confidence=confidence,
-                    source_flags=flags,
+                    confidence=0.0,
+                    source_flags=set(),
                 ),
                 is_onset=is_onset,
                 onset_sample=onset_sample,
                 chunk_start_sample=0,
             )
 
-        # Step 2: Multi-resolution — run second YIN at larger window for low notes.
-        # Only contributes if the large detector has higher confidence.
-        if self._detector_large is not None and freq < 200.0:
-            try:
-                result_large = self._detector_large.process(chunk)
-                if result_large is not None and result_large.confidence > confidence:
-                    freq = result_large.frequency
-                    midi = result_large.midi_note
-                    confidence = result_large.confidence
-                    flags.add("yin_4096")
-                    # Use the larger detector's onset if the primary didn't fire
-                    if not is_onset and result_large.is_onset:
-                        is_onset = True
-                        onset_sample = result_large.onset_sample
-            except Exception:
-                pass
+        # Apply confidence penalty for rejected spectral.
+        # When tab_prior is present and matches the chosen candidate,
+        # the tab signal is stronger evidence than spectral — skip penalty.
+        flags_out = best.source_flags.copy()
+        final_confidence = best.confidence
+        if "spectral" not in flags_out and "tab_prior" not in flags_out:
+            final_confidence *= 0.7
 
-        # Step 3: Spectral sanity check on the rolling 4096 buffer (not the hop chunk).
-        # The hop chunk at 256 samples gives 187.5 Hz bins — useless for low notes.
-        # The 4096 rolling buffer gives 11.7 Hz bins, enough to validate E2 (82 Hz).
-        spectral_ok = self._spectral_check(freq)
-        if spectral_ok:
-            flags.add("spectral")
-
-        # Step 4: Tab prior — adjust confidence but never override the pitch
-        with self._tab_prior_lock:
-            tab_prior = set(self._tab_prior)
-        if midi in tab_prior:
-            flags.add("tab_prior")
-            confidence = min(1.0, confidence + 0.05)
-
-        # Step 5: Cents error
-        nearest_midi, cents = freq_to_cents_deviation(freq)
-
-        # Step 6: Combine confidence
-        if not spectral_ok:
-            confidence *= 0.7
-
-        candidate = PitchCandidate(
-            best_midi=midi,
-            cents_error=cents,
-            raw_frequency=freq,
-            confidence=confidence,
-            source_flags=flags,
-        )
         return _EngineResult(
-            candidate=candidate,
+            candidate=PitchCandidate(
+                best_midi=best.best_midi,
+                cents_error=best.cents_error,
+                raw_frequency=best.raw_frequency,
+                confidence=final_confidence,
+                source_flags=flags_out,
+            ),
             is_onset=is_onset,
             onset_sample=onset_sample,
             chunk_start_sample=0,
         )
+
+    def _find_spectral_peak(self, primary_freq: float) -> float | None:
+        """Find the strongest FFT peak near the primary frequency.
+
+        Returns None if the buffer is not full enough for a reliable check.
+        """
+        if self._spectral_fill < self._SPECTRAL_BUF_SIZE // 2:
+            return None
+
+        buf = self._spectral_buf[:self._SPECTRAL_BUF_SIZE] * self._spectral_window
+        spectrum = np.abs(np.fft.rfft(buf))
+
+        if len(spectrum) == 0:
+            return None
+
+        # Search in a ±3-semitone window around the primary
+        lo_freq = primary_freq * (2 ** (-3 / 12))
+        hi_freq = primary_freq * (2 ** (3 / 12))
+        lo_idx = max(0, int(np.searchsorted(self._spectral_freqs, lo_freq)))
+        hi_idx = min(len(spectrum) - 1, int(np.searchsorted(self._spectral_freqs, hi_freq)))
+
+        if hi_idx <= lo_idx:
+            return None
+
+        window = spectrum[lo_idx:hi_idx + 1]
+        local_peak = float(np.max(window))
+        total = float(np.sum(spectrum))
+        if total <= 0 or local_peak / total < 0.005:
+            return None
+
+        peak_idx = lo_idx + int(np.argmax(window))
+        return float(self._spectral_freqs[peak_idx])
+
+    def _apply_tab_prior(self, candidates: list[PitchCandidate], tab_prior: set[int]) -> list[PitchCandidate]:
+        """Boost confidence of candidates matching the tab prior."""
+        if not tab_prior:
+            return candidates
+
+        for cand in candidates:
+            if cand.best_midi is not None and cand.best_midi in tab_prior:
+                cand.source_flags = cand.source_flags | {"tab_prior"}
+                cand.confidence = min(1.0, cand.confidence + 0.05)
+        return candidates
+
+    def _resolve_candidates(self, candidates: list[PitchCandidate], tab_prior_midi: int | None) -> PitchCandidate | None:
+        """Multi-candidate resolver for pitch detection.
+
+        1. Reject impossible candidates (freq=0, midi out of guitar range,
+           confidence < 0.1).
+        2. If tab prior available, prefer candidates within ±1 octave of it.
+        3. After sustain evidence, commit to the fundamental closest to the
+           median of surviving candidates.
+        4. Return the best candidate, or None if all rejected.
+        """
+        # --- Phase 1: Reject impossible candidates ---
+        MIN_GUITAR_MIDI = 27   # E2
+        MAX_GUITAR_MIDI = 108  # E5 (high guitar range)
+        MIN_CONFIDENCE = 0.1
+
+        valid = []
+        for c in candidates:
+            if c.best_midi is None:
+                continue
+            if c.raw_frequency <= 0:
+                continue
+            if c.best_midi < MIN_GUITAR_MIDI or c.best_midi > MAX_GUITAR_MIDI:
+                continue
+            if c.confidence < MIN_CONFIDENCE:
+                continue
+            valid.append(c)
+
+        if not valid:
+            return None
+
+        # --- Phase 2: Tab-prior scoring ---
+        if tab_prior_midi is not None:
+            for c in valid:
+                midi_diff = abs(c.best_midi - tab_prior_midi)
+                # Candidates within ±1 octave (12 semitones) get a bonus
+                if midi_diff <= 12:
+                    c.confidence = min(1.0, c.confidence + (1.0 - midi_diff / 12.0) * 0.2)
+
+        # --- Phase 3: Octave grouping and commit ---
+        # Group candidates by octave proximity (±1 semitone)
+        valid.sort(key=lambda c: c.best_midi)
+        groups: list[list[PitchCandidate]] = []
+        for c in valid:
+            placed = False
+            for group in groups:
+                # If this candidate is within 1 semitone of any member, add to group
+                if all(abs(c.best_midi - g.best_midi) > 1 for g in group):
+                    continue
+                group.append(c)
+                placed = True
+                break
+            if not placed:
+                groups.append([c])
+
+        # Merge very close groups (within 1 semitone of each other)
+        merged = [groups[0]] if groups else []
+        for i in range(1, len(groups)):
+            last = merged[-1]
+            last_best = max(g.best_midi for g in last)
+            first_next = min(g.best_midi for g in groups[i])
+            if last_best - first_next <= 1:
+                merged[-1].extend(groups[i])
+            else:
+                merged.append(groups[i])
+
+        # Pick the winning group: highest max confidence, tab-prior preferred
+        def _group_score(group: list[PitchCandidate]) -> float:
+            best_conf = max(g.confidence for g in group)
+            # Small bonus if this group contains the tab prior
+            if tab_prior_midi is not None:
+                if any(abs(g.best_midi - tab_prior_midi) <= 1 for g in group):
+                    best_conf += 0.1
+            return best_conf
+
+        merged.sort(key=_group_score, reverse=True)
+        best_group = merged[0]
+
+        # Within the winning group, pick the highest-confidence candidate
+        best = max(best_group, key=lambda c: c.confidence)
+
+        # If the winner is an octave above another candidate, prefer the
+        # lower one (more likely fundamental). Only flip if the lower
+        # candidate has comparable confidence (within 0.15).
+        lower = [c for c in best_group if c.best_midi < best.best_midi]
+        if lower:
+            best_lower = max(lower, key=lambda c: c.confidence)
+            if best.confidence - best_lower.confidence < 0.15:
+                best = best_lower
+                best.source_flags = best.source_flags | {"octave_corrected"}
+
+        return best
 
     def _push_spectral(self, chunk: np.ndarray) -> None:
         """Push audio into the rolling spectral analysis buffer."""
