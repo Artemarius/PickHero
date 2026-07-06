@@ -205,7 +205,7 @@ class TestUnifiedWorker:
         config.audio.hop_size = 512
 
         capture = AudioCapture(config)
-        capture.start()
+        capture._start_unified_worker()
         try:
             assert capture._worker_running
             assert capture._worker_thread is not None
@@ -222,7 +222,7 @@ class TestUnifiedWorker:
         config.audio.hop_size = 512
 
         capture = AudioCapture(config)
-        capture.start()
+        capture._start_unified_worker()
         try:
             assert capture._worker_thread.is_alive()
         finally:
@@ -244,7 +244,7 @@ class TestUnifiedWorker:
         config.audio.sample_rate = 44100
 
         capture = AudioCapture(config)
-        capture.start()
+        capture._start_unified_worker()
         try:
             sr = 44100
             hop = 512
@@ -292,7 +292,7 @@ class TestUnifiedWorker:
         t = np.arange(sr * 0.3) / sr
         tone = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
 
-        capture.start()
+        capture._start_unified_worker()
         try:
             for i in range(0, len(tone) - hop, hop):
                 chunk = tone[i:i + hop]
@@ -323,7 +323,7 @@ class TestUnifiedWorker:
         engine = capture._engine
         assert engine is not None
 
-        capture.start()
+        capture._start_unified_worker()
         try:
             sr = 44100
             hop = engine.hop_size

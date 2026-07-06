@@ -269,6 +269,33 @@ class PitchEngine:
                 break
         return results
 
+    def process_sync(self, chunk: np.ndarray, chunk_start_sample: int = 0) -> _EngineResult | None:
+        """Process a chunk synchronously on the calling thread.
+
+        Used by the unified worker when the engine and the worker share a
+        single thread — avoids the async submit/get_candidates race where
+        get_candidates returns empty because the engine's own worker hasn't
+        processed the chunk yet.
+        """
+        result = self._process_chunk(chunk)
+        if result is None:
+            return None
+        perf = None
+        art = getattr(self._detector, "_articulation", None)
+        if art is not None:
+            perf = art.active_event
+            cand = result.candidate
+            if perf is not None and cand.best_midi is not None and cand.raw_frequency > 0:
+                perf.midi_note = cand.best_midi
+                perf.confidence = cand.confidence
+        return _EngineResult(
+            candidate=result.candidate,
+            is_onset=result.is_onset,
+            onset_sample=result.onset_sample,
+            chunk_start_sample=chunk_start_sample,
+            performance=perf,
+        )
+
     def start(self) -> None:
         """Start the worker thread."""
         if self._running:
@@ -447,13 +474,19 @@ class PitchEngine:
                 chunk_start_sample=0,
             )
 
-        # Apply confidence penalty for rejected spectral.
-        # When tab_prior is present and matches the chosen candidate,
-        # the tab signal is stronger evidence than spectral — skip penalty.
+        # Validate the chosen candidate with harmonic likelihood.
+        # A real guitar note has a harmonic series at 2×-5×F0; a cable
+        # resonance or noise doesn't. Score < 0.05 → heavy penalty.
         flags_out = best.source_flags.copy()
         final_confidence = best.confidence
         if "spectral" not in flags_out and "tab_prior" not in flags_out:
-            final_confidence *= 0.7
+            spectral_score = self._spectral_check(best.raw_frequency)
+            if spectral_score < 0.05:
+                final_confidence *= 0.3  # heavy penalty — likely a resonance
+            elif spectral_score < 0.10:
+                final_confidence *= 0.6  # moderate penalty
+            else:
+                final_confidence *= 0.85  # minor — has harmonics, just no competing peak
 
         return _EngineResult(
             candidate=PitchCandidate(
@@ -492,13 +525,16 @@ class PitchEngine:
             return None
 
         window = spectrum[lo_idx:hi_idx + 1]
-        local_peak = float(np.max(window))
-        total = float(np.sum(spectrum))
-        if total <= 0 or local_peak / total < 0.005:
-            return None
-
         peak_idx = lo_idx + int(np.argmax(window))
-        return float(self._spectral_freqs[peak_idx])
+        peak_freq = float(self._spectral_freqs[peak_idx])
+
+        # Use harmonic likelihood instead of the old 0.005 energy-ratio
+        # threshold. A real guitar note has harmonics at 2×-5×F0; a cable
+        # resonance or noise doesn't. Score < 0.05 → reject.
+        score = self._spectral_check(peak_freq)
+        if score < 0.05:
+            return None
+        return peak_freq
 
     def _apply_tab_prior(self, candidates: list[PitchCandidate], tab_prior: set[int]) -> list[PitchCandidate]:
         """Boost confidence of candidates matching the tab prior."""
@@ -621,32 +657,79 @@ class PitchEngine:
             self._spectral_buf[keep:] = chunk
             self._spectral_fill = self._SPECTRAL_BUF_SIZE
 
-    def _spectral_check(self, freq: float) -> bool:
-        """Harmonic-product sanity check on the rolling 4096-sample buffer.
+    def _spectral_check(self, freq: float) -> float:
+        """Harmonic likelihood score for a candidate fundamental frequency.
 
-        The rolling buffer gives ~11.7 Hz bin spacing at 48 kHz — enough to
-        validate low guitar notes (E2 = 82 Hz). The hop-sized FFT (187.5 Hz
-        bins) was useless for this.
+        Returns a float in [0, 1] indicating how well the spectrum supports
+        freq as a fundamental. The previous check used a 0.005 energy-ratio
+        threshold that was essentially a no-op (any signal with energy near
+        the candidate passed).
+
+        The model:
+          1. Measure F0 peak energy (±5% around freq).
+          2. Sum weighted energy at harmonics 2×-5× F0.
+          3. Estimate noise floor as median of the spectrum.
+          4. harmonic_ratio = (harmonic_energy - noise_floor * n_harmonics)
+                              / (f0_energy + harmonic_energy)
+          5. Apply spectral flatness penalty (broadband noise → low score).
+
+        A real guitar note scores > 0.15. A cable resonance or pure tone
+        with no harmonic series scores < 0.05.
         """
         if freq <= 0 or self._spectral_fill < self._SPECTRAL_BUF_SIZE // 2:
-            return False
+            return 0.0
 
         buf = self._spectral_buf[:self._SPECTRAL_BUF_SIZE] * self._spectral_window
         spectrum = np.abs(np.fft.rfft(buf))
+        if len(spectrum) == 0 or float(np.sum(spectrum)) <= 0:
+            return 0.0
 
-        # Find the bin closest to the detected frequency
-        idx = np.argmin(np.abs(self._spectral_freqs - freq))
-        if idx >= len(spectrum):
-            return False
+        nyquist = self.sample_rate / 2.0
 
-        # Check energy at the fundamental and 2nd harmonic
-        fundamental_energy = spectrum[idx]
-        idx_2h = np.argmin(np.abs(self._spectral_freqs - 2 * freq))
-        harmonic_energy = spectrum[idx_2h] if idx_2h < len(spectrum) else 0.0
+        def _peak_energy(center: float, tol: float = 0.05) -> float:
+            lo = center * (1.0 - tol)
+            hi = center * (1.0 + tol)
+            mask = (self._spectral_freqs >= lo) & (self._spectral_freqs <= hi)
+            if not np.any(mask):
+                return 0.0
+            return float(np.max(spectrum[mask]))
 
-        total_energy = float(np.sum(spectrum))
-        if total_energy <= 0:
-            return False
+        # F0 peak energy
+        f0_energy = _peak_energy(freq)
+        if f0_energy <= 0:
+            return 0.0
 
-        ratio = max(fundamental_energy, harmonic_energy) / total_energy
-        return ratio > 0.005  # lenient threshold — this is a sanity check
+        # Sum weighted energy at harmonics 2×-5× F0
+        weights = [1.0, 0.7, 0.5, 0.3]
+        harmonic_energy = 0.0
+        n_harmonics_found = 0
+        h = 2
+        while freq * h < nyquist and h <= 5:
+            e = _peak_energy(freq * h)
+            harmonic_energy += e * weights[h - 2]
+            if e > 0:
+                n_harmonics_found += 1
+            h += 1
+
+        # Noise floor estimate: median of spectrum (robust to harmonic peaks)
+        noise_floor = float(np.median(spectrum))
+
+        # Harmonic ratio: harmonic energy above noise floor, normalized by
+        # total peak energy (F0 + harmonics). This is robust to added noise
+        # because noise inflates the median floor, which we subtract.
+        total_peak = f0_energy + harmonic_energy
+        noise_contribution = noise_floor * max(n_harmonics_found, 1)
+        harmonic_above_noise = max(0.0, harmonic_energy - noise_contribution)
+        harmonic_ratio = harmonic_above_noise / total_peak if total_peak > 0 else 0.0
+
+        # Spectral flatness penalty: broadband noise has high flatness
+        eps = 1e-12
+        geo = np.exp(np.mean(np.log(np.maximum(spectrum[1:], eps))))
+        ari = np.mean(spectrum[1:])
+        flatness = float(geo / ari) if ari > eps else 1.0
+
+        # Final score: harmonic ratio reduced by noise penalty.
+        # flatness ** 1.5 sharply penalizes broadband noise (flatness ~0.85)
+        # while barely affecting harmonic signals (flatness ~0.15).
+        score = harmonic_ratio * (1.0 - flatness ** 1.5)
+        return min(1.0, max(0.0, score))

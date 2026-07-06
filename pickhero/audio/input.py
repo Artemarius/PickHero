@@ -194,21 +194,21 @@ class AudioCapture:
                 continue
 
             if self._engine is not None:
-                self._engine.submit(chunk, chunk_start_sample)
+                result = self._engine.process_sync(chunk, chunk_start_sample)
                 self._signal_db = self.detector.last_signal_db
                 self._tuner_freq = self.detector.last_freq
                 self._tuner_confidence = self.detector.last_confidence
                 frame_ms = chunk_start_sample / sample_rate * 1000.0
-                had_result = False
-                for r in self._engine.get_candidates():
-                    had_result = True
-                    result = r.candidate.to_detected_note(
-                        is_onset=r.is_onset, onset_sample=r.onset_sample,
-                        performance=r.performance,
+                if result is not None:
+                    note = result.candidate.to_detected_note(
+                        is_onset=result.is_onset, onset_sample=result.onset_sample,
+                        performance=result.performance,
                     )
-                    if result is not None:
-                        self._emit_through_stabilizer(result, frame_ms)
-                if not had_result:
+                    if note is not None:
+                        self._emit_through_stabilizer(note, frame_ms)
+                    else:
+                        self._emit_through_stabilizer(None, frame_ms)
+                else:
                     self._emit_through_stabilizer(None, frame_ms)
             else:
                 result = self.detector.process(chunk)
@@ -404,13 +404,12 @@ class AudioCapture:
                 callback=self._audio_callback,
             )
         self._stream.start()
-        if self._engine is not None:
-            self._engine.start()
+        # Engine worker thread removed — process_sync() runs on the
+        # unified worker thread. No separate engine thread to start.
 
     def stop(self):
         """Stop audio capture."""
-        if self._engine is not None:
-            self._engine.stop()
+        # Engine worker thread removed — no separate engine thread to stop.
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
