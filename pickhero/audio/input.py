@@ -14,8 +14,10 @@ import numpy as np
 import sounddevice as sd
 from pickhero.audio.chord_detector import ChordDetector
 from pickhero.audio.detector import PitchDetector, DetectedNote
+from pickhero.audio.match_mode import MatchMode, _coerce_match_mode
 from pickhero.audio.performance import PerformanceEvent
 from pickhero.config import Config
+from pickhero.audio.clock import StreamClock
 
 @dataclass
 class TimestampedNote:
@@ -41,19 +43,18 @@ class AudioCapture:
 
         # Select pitch engine based on accuracy profile.
         # "portable" uses PitchDetector directly (existing behavior).
-        # "high_accuracy"/"experimental_ml" uses PitchEngine with a worker thread.
+        # "high_accuracy" uses PitchEngine with a worker thread.
         # CRITICAL: the stream, detector, chord_detector, and engine must ALL
         # use the same sample rate. We update ac.sample_rate in-place so the
         # stream opened in start() uses the same rate as the detector.
         self._profile = ac.profile
-        if ac.profile in ("high_accuracy", "experimental_ml"):
+        if ac.profile == "high_accuracy":
             from pickhero.audio.pitch_engine import PitchEngine
-            if ac.profile == "high_accuracy":
-                # Request 48 kHz, hop 256, buf 4096. Update ac so the stream
-                # and chord_detector use the same rate — no split-brain.
-                ac.sample_rate = max(ac.sample_rate, 48000)
-                ac.hop_size = min(ac.hop_size, 256)
-                ac.buf_size = max(ac.buf_size, 4096)
+            # Request 48 kHz, hop 256, buf 4096. Update ac so the stream
+            # and chord_detector use the same rate — no split-brain.
+            ac.sample_rate = max(ac.sample_rate, 48000)
+            ac.hop_size = min(ac.hop_size, 256)
+            ac.buf_size = max(ac.buf_size, 4096)
             self._engine = PitchEngine(
                 sample_rate=ac.sample_rate,
                 hop_size=ac.hop_size,
@@ -93,13 +94,28 @@ class AudioCapture:
         # analysis. None unless start_take_recording() is called.
         self._take_audio: list[np.ndarray] | None = None
 
+        # Raw-audio ring buffer for expected-event verification.
+        # Written by the audio callback (single producer) and read by
+        # get_window_between / get_recent_audio via a short snapshot lock.
+        self._RING_DURATION_MS = 3000.0  # 3 seconds for longer analysis window
+        ring_samples = int(ac.sample_rate * self._RING_DURATION_MS / 1000.0)
+        self._audio_ring: np.ndarray = np.zeros(ring_samples, dtype=np.float32)
+        self._ring_hop: int = ac.hop_size  # fixed chunk size
+        self._ring_write_pos: int = 0  # absolute sample position (producer only)
+        self._ring_sample_rate: int = ac.sample_rate
+        self._ring_snapshot_lock: threading.Lock = threading.Lock()
+        self._ring_overrun: bool = False
+        self._ring_xrun_count: int = 0
+        self.clock = StreamClock()
+
         # Track stabilizer: multi-frame consensus before notes reach the
         # matcher. Raw per-frame detections go through here; only stable
         # note events emerge. Prevents octave glitches, noise transients,
-        # and sustain-frame spam from reaching the matcher.
         from pickhero.audio.track_stabilizer import TrackStabilizer
         self._stabilizer = TrackStabilizer(
-            sample_rate=ac.sample_rate, hop_size=ac.hop_size,
+            sample_rate=ac.sample_rate,
+            hop_size=ac.hop_size,
+            mode=_coerce_match_mode(config.match_mode),
         )
         # Tab context: expected MIDI notes near the current playback position.
         # Fed to the stabilizer for octave resolution. Set by the playback
@@ -134,6 +150,33 @@ class AudioCapture:
         if self._take_audio is not None:
             self._take_audio.append(mono.copy())
 
+        # Chop mono into hop-sized chunks and write to the verification ring.
+        # The callback delivers variable-sized buffers (host block size, e.g.
+        # 256/512/1024). We slice into fixed _ring_hop chunks so the ring's
+        # absolute indexing stays consistent.
+        hop = self._ring_hop
+        pos = self._ring_write_pos  # single-producer read, no race
+        ring_len = len(self._audio_ring)
+        for start in range(0, len(mono), hop):
+            chunk = mono[start:start + hop]
+            n = len(chunk)
+            ring_idx = pos % ring_len
+            end = ring_idx + n
+            if end <= ring_len:
+                self._audio_ring[ring_idx:end] = chunk
+            else:
+                first = ring_len - ring_idx
+                self._audio_ring[ring_idx:] = chunk[:first]
+                self._audio_ring[:end - ring_len] = chunk[first:]
+            pos += n
+        self._ring_write_pos = pos
+
+        # Overrun detection (best-effort)
+        if pos > ring_len and pos - ring_len > self._ring_xrun_count:
+            if not self._ring_overrun:
+                self._ring_overrun = True
+            self._ring_xrun_count += 1
+
         # Feed chord detector (FFT-based, runs on full buffer)
         self.chord_detector.push_audio(mono)
 
@@ -154,12 +197,12 @@ class AudioCapture:
         # Push hop-sized chunks into the worker input queue with timestamps.
         for i in range(0, len(mono) - hop + 1, hop):
             chunk = mono[i:i + hop]
-            self._worker_in_queue.put((chunk, self._detector_sample_offset))
+            try:
+                self._worker_in_queue.put_nowait((chunk, self._detector_sample_offset))
+            except queue.Full:
+                self._xrun_count += 1
             self._detector_sample_offset += hop
 
-        # Drain completed PerformanceEvents from the articulation detector.
-        for event in self.detector.drain_events():
-            self.event_queue.put(event)
     def _start_unified_worker(self) -> None:
         """Start the unified worker thread that processes queued audio chunks."""
         if self._worker_running:
@@ -220,6 +263,10 @@ class AudioCapture:
                     self._emit_through_stabilizer(result, frame_ms)
                 else:
                     self._emit_through_stabilizer(None, frame_ms)
+            # Drain completed PerformanceEvents from the articulation detector.
+            # This runs on the worker thread, not the real-time audio callback.
+            for event in self.detector.drain_events():
+                self.event_queue.put(event)
     def _compute_timestamp_ms(
         self,
         result: DetectedNote,
@@ -258,13 +305,22 @@ class AudioCapture:
         self._tab_expected_midi = expected_midi
         self._tab_context_ms = current_ms
 
-    def _emit_through_stabilizer(self, result: DetectedNote, ts_ms: float) -> None:
+    def set_match_mode(self, mode: MatchMode | str) -> None:
+        """Update the matching mode mid-session (e.g. UI mode toggle).
+
+        Propagates the change to the track stabilizer so real-time
+        consensus policies stay in sync with the matcher.
+        """
+        self._stabilizer.set_mode(mode)
+
+
+    def _emit_through_stabilizer(self, result: DetectedNote | None, ts_ms: float) -> None:
         """Feed a raw detection through the track stabilizer.
 
         Only stable note events (multi-frame consensus) reach the note queue.
         """
         tab_prior = None
-        if self._tab_expected_midi:
+        if result is not None and self._tab_expected_midi:
             tab_prior = min(
                 self._tab_expected_midi,
                 key=lambda m: abs(m - result.midi_note) if result.midi_note > 0 else abs(m - 60),
@@ -325,7 +381,7 @@ class AudioCapture:
 
         # Recreate detector with the resolved sample rate (may have changed)
         calibration = getattr(self.config, 'calibration', None) or None
-        if self._profile in ("high_accuracy", "experimental_ml"):
+        if self._profile == "high_accuracy":
             from pickhero.audio.pitch_engine import PitchEngine
             # CRITICAL: use the SAME sample rate as the stream (ac.sample_rate).
             # The init already updated ac.sample_rate for high_accuracy; we must
@@ -357,6 +413,15 @@ class AudioCapture:
         self.detector.reset()
         self.chord_detector.reset()
         self.chord_detector.set_sample_rate(ac.sample_rate)
+        # Re-allocate the verification ring for the resolved sample rate.
+        with self._ring_snapshot_lock:
+            ring_samples = int(ac.sample_rate * self._RING_DURATION_MS / 1000.0)
+            self._audio_ring = np.zeros(ring_samples, dtype=np.float32)
+            self._ring_write_pos = 0
+            self._ring_hop = ac.hop_size
+            self._ring_sample_rate = ac.sample_rate
+            self._ring_overrun = False
+            self._ring_xrun_count = 0
         # Drain any leftover notes
         while not self.note_queue.empty():
             try:
@@ -404,6 +469,7 @@ class AudioCapture:
                 callback=self._audio_callback,
             )
         self._stream.start()
+        self.clock.reset()
         # Engine worker thread removed — process_sync() runs on the
         # unified worker thread. No separate engine thread to start.
 
@@ -419,6 +485,12 @@ class AudioCapture:
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=2.0)
             self._worker_thread = None
+        # Drain any queued chunks that never got processed.
+        while True:
+            try:
+                self._worker_in_queue.get_nowait()
+            except queue.Empty:
+                break
         # Flush any pending track that reached consensus but wasn't emitted
         # during the last callback (e.g., a note still ringing at stop time).
         for event in self._stabilizer.flush():
@@ -446,6 +518,9 @@ class AudioCapture:
     def get_signal_db(self) -> float:
         """Return the latest signal level in dB. Thread-safe (single float read under GIL)."""
         return self._signal_db
+    def stream_time_ms(self) -> float:
+        """Return the current stream time in milliseconds."""
+        return self._detector_sample_offset / self._ring_sample_rate * 1000.0
 
     def get_tuner_data(self) -> tuple[float, float]:
         """Return (frequency_hz, confidence) for tuner display. Thread-safe."""
@@ -464,6 +539,94 @@ class AudioCapture:
             except queue.Empty:
                 break
         return notes
+
+    def get_recent_audio(
+        self,
+        ms_before: float,
+        ms_after: float,
+        anchor_ms: float | None = None,
+    ) -> np.ndarray:
+        """Extract a window of raw audio from the ring buffer.
+
+        Returns a copy of the float32 samples centered on ``anchor_ms``
+        (defaults to the current stream time). Uses a short snapshot lock
+        to get a consistent view of the ring.
+        """
+        sample_rate = self._ring_sample_rate
+        if anchor_ms is None:
+            anchor_ms = self._detector_sample_offset / sample_rate * 1000.0
+        if sample_rate <= 0:
+            return np.zeros(0, dtype=np.float32)
+
+        before_samples = int(sample_rate * ms_before / 1000.0)
+        after_samples = int(sample_rate * ms_after / 1000.0)
+        total_samples = before_samples + after_samples
+        if total_samples <= 0:
+            return np.zeros(0, dtype=np.float32)
+
+        # Snapshot: lock held only for counter read + ring copy.
+        with self._ring_snapshot_lock:
+            snap_pos = self._ring_write_pos
+            ring_copy = self._audio_ring.copy()
+
+        ring_len = len(ring_copy)
+        if ring_len == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        anchor_sample = int(sample_rate * anchor_ms / 1000.0)
+        ring_start = snap_pos - ring_len
+        start_sample = anchor_sample - before_samples
+        end_sample = anchor_sample + after_samples
+        if start_sample < ring_start or end_sample > snap_pos:
+            # Requested window is partially outside the ring.
+            return np.zeros(0, dtype=np.float32)
+        window = np.zeros(total_samples, dtype=np.float32)
+        for i in range(total_samples):
+            sample_idx = start_sample + i
+            ring_idx = sample_idx % ring_len
+            window[i] = ring_copy[ring_idx]
+        return window
+
+    def get_window_between(
+        self,
+        start_ms: float,
+        end_ms: float,
+    ) -> np.ndarray | None:
+        """Extract a [start_ms, end_ms] window from the verification ring.
+
+        Uses a short snapshot lock to get a consistent view of write position
+        and ring content. Returns None if the window is not fully available
+        (caller retries next frame).
+        """
+        sample_rate = self._ring_sample_rate
+        if sample_rate <= 0:
+            return None
+        start_sample = int(sample_rate * start_ms / 1000.0)
+        end_sample = int(sample_rate * end_ms / 1000.0)
+        total = end_sample - start_sample
+        if total <= 0:
+            return None
+
+        # Snapshot: lock held only for counter read + ring copy.
+        with self._ring_snapshot_lock:
+            snap_pos = self._ring_write_pos
+            ring_copy = self._audio_ring.copy()
+
+        ring_len = len(ring_copy)
+        if ring_len == 0:
+            return None
+
+        # Window must be fully within the ring's coverage.
+        ring_start = snap_pos - ring_len
+        if start_sample < ring_start or end_sample > snap_pos:
+            return None  # window partially evicted or not yet written
+
+        # Extract from ring_copy, handling the circular wrap.
+        window = np.zeros(total, dtype=np.float32)
+        for i in range(total):
+            window[i] = ring_copy[(start_sample + i) % ring_len]
+        return window
+
 
     def get_events(self) -> list[PerformanceEvent]:
         """Drain all pending PerformanceEvents from the queue (non-blocking).
