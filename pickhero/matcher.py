@@ -860,17 +860,6 @@ class NoteMatcher:
                 return EventState.MISS
             return EventState.ATTACKING
 
-        if current == EventState.PITCHED:
-            # Note duration expired → RELEASED
-            if playback_ms > note.timestamp_ms + note.duration_ms:
-                return EventState.RELEASED
-            # Strong pitch contradiction (e.g., octave error across multiple frames)
-            # — only transition to MISS if confirmed wrong pitch
-            if detected_midis and expected_midi not in detected_midis:
-                # Only expire if we're well past the note AND detecting something else
-                if playback_ms > note.timestamp_ms + self._timing_window_ms:
-                    return EventState.MISS
-            return EventState.PITCHED
 
         if current == EventState.SUSTAINING:
             if playback_ms > note.timestamp_ms + note.duration_ms:
@@ -881,21 +870,20 @@ class NoteMatcher:
             # Always → HIT from RELEASED (pitch was correct, note ended)
             # For chord groups, the caller should aggregate all notes in the group.
             return EventState.HIT
-
-        return current
+        if current == EventState.PITCHED:
+            # Note duration expired → HIT
+            if playback_ms > note.timestamp_ms + note.duration_ms:
+                return EventState.HIT
+            # Strong pitch contradiction (e.g., octave error across multiple frames)
+            # — only transition to MISS if confirmed wrong pitch
+            if detected_midis and expected_midi not in detected_midis:
+                if playback_ms > note.timestamp_ms + self._timing_window_ms:
+                    return EventState.MISS
+            return EventState.PITCHED
 
     def _get_event_state(self, key: tuple[float, int]) -> EventState:
         """Get the current state for an event key."""
         return self._event_states.get(key, EventState.PENDING)
-
-    def _find_previous_note_on_string(self, note: NoteEvent) -> NoteEvent | None:
-        """Return the closest earlier note on the same string, if any."""
-        prev: NoteEvent | None = None
-        for n in self._timeline.get_notes_in_range(0.0, note.timestamp_ms):
-            if n.string == note.string and n.timestamp_ms < note.timestamp_ms:
-                if prev is None or n.timestamp_ms > prev.timestamp_ms:
-                    prev = n
-        return prev
 
     def _build_technique_context(self, note: NoteEvent) -> dict:
         """Build a context dict for the technique verifier from a NoteEvent."""

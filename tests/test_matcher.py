@@ -970,3 +970,100 @@ class TestStateMachine:
             detected_midis=set(), has_onset=False, audio_window=window,
         )
         assert new_state == EventState.MISS
+
+    def test_chord_fft_catches_voice_missed_by_yin(self):
+        """Chord detector feeds evidence for a voice YIN missed.
+
+        Two-note chord (C3=48, E3=52). YIN only detects one note.
+        Chord_detector FFT recognizes both. advance_state_machine
+        should transition both notes to HIT over two frames.
+        """
+        from pickhero.audio.event_state import EventState
+        from pickhero.audio.chord_detector import ChordDetector
+        from pickhero.audio.note_utils import midi_to_freq
+        import numpy as np
+
+        chord_notes = [
+            _note_event(1000.0, midi_note=48, string=1, duration_ms=300.0),
+            _note_event(1000.0, midi_note=52, string=2, duration_ms=300.0),
+        ]
+        matcher = self._make_matcher_with_verifier(chord_notes, timing_window_ms=200.0)
+
+        # Create chord detector with synthetic audio containing both notes
+        chord_detector = ChordDetector(sample_rate=48000, fft_size=8192)
+        sample_rate = 48000
+        samples = int(sample_rate * 300.0 / 1000.0)
+        t = np.arange(samples) / sample_rate
+        audio = (0.3 * np.sin(2 * np.pi * midi_to_freq(48) * t) +
+                 0.3 * np.sin(2 * np.pi * midi_to_freq(52) * t)).astype(np.float32)
+        chord_detector.push_audio(audio)
+
+        # YIN only detects C3; E3 is missed by YIN
+        detected = [_detected(48, 1000.0, is_onset=True)]
+
+        # Frame 1: onset + pitch → PITCHED
+        matcher.advance_state_machine(
+            playback_ms=1150.0,
+            audio_window=audio,
+            detected_notes=detected,
+            chord_detector=chord_detector,
+        )
+        state_c3 = matcher._get_event_state((1000.0, 1))
+        state_e3 = matcher._get_event_state((1000.0, 2))
+        assert state_c3 == EventState.PITCHED, f"C3 expected PITCHED after frame 1, got {state_c3}"
+        assert state_e3 == EventState.PITCHED, (
+            f"E3 expected PITCHED (FFT fallback) after frame 1, got {state_e3}"
+        )
+
+        # Frame 2: duration expired (1000+300=1300 < 1400) → RELEASED → HIT
+        results = matcher.advance_state_machine(
+            playback_ms=1400.0,
+            audio_window=audio,
+            detected_notes=detected,
+            chord_detector=chord_detector,
+        )
+        assert matcher._get_event_state((1000.0, 1)) == EventState.HIT
+        assert matcher._get_event_state((1000.0, 2)) == EventState.HIT
+        hit_results = [r for r in results if r.match_type == MatchType.HIT]
+        assert len(hit_results) >= 1, "Expected at least one HIT result"
+
+    def test_chord_fft_without_detector_no_fallback(self):
+        """Without chord_detector, chord group uses YIN detected_midis only."""
+        from pickhero.audio.event_state import EventState
+
+        chord_notes = [
+            _note_event(1000.0, midi_note=48, string=1, duration_ms=300.0),
+            _note_event(1000.0, midi_note=52, string=2, duration_ms=300.0),
+        ]
+        matcher = self._make_matcher_with_verifier(chord_notes, timing_window_ms=200.0)
+
+        # Only C3 detected by YIN
+        detected = [_detected(48, 1000.0, is_onset=True)]
+        audio = np.zeros(int(48000 * 0.3), dtype=np.float32)
+
+        # Frame 1: C3 → PITCHED, E3 stays PENDING (no chord detector)
+        # Frame 1: C3 → PITCHED (YIN detected). E3 → ATTACKING (shared onset
+        # from the chord strum, but no pitch evidence since YIN missed it).
+        matcher.advance_state_machine(
+            playback_ms=1150.0,
+            audio_window=audio,
+            detected_notes=detected,
+        )
+        assert matcher._get_event_state((1000.0, 1)) == EventState.PITCHED, "C3 should be PITCHED"
+        assert matcher._get_event_state((1000.0, 2)) == EventState.ATTACKING, (
+            "E3 should be ATTACKING (shared strum onset, no pitch yet)"
+        )
+
+        # Frame 2: playback at 1400ms keeps C3 in candidate window
+        # (judge=1400-200=1200, range=[1000,1400]).
+        # C3 duration 1000+300=1300 < 1400 → PITCHED→HIT.
+        # E3 ATTACKING: 1400-1000=400 < 3×200=600 → not expired yet, stays ATTACKING.
+        results = matcher.advance_state_machine(
+            playback_ms=1400.0,
+            audio_window=audio,
+            detected_notes=detected,
+        )
+        assert matcher._get_event_state((1000.0, 1)) == EventState.HIT, "C3 should be HIT"
+        assert matcher._get_event_state((1000.0, 2)) == EventState.ATTACKING, (
+            "E3 still ATTACKING (3× window = 600 > 400 elapsed)"
+        )
