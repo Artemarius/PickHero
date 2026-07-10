@@ -515,6 +515,7 @@ class PlayingScreen:
             self._playback_ms = self._loop_start_ms
             self._last_tick = time.perf_counter()
             if self._matcher:
+                stats = self._matcher.get_statistics()
                 self._matcher.reset()
             self._feedback.reset()
             if self._midi_player is not None:
@@ -530,7 +531,6 @@ class PlayingScreen:
 
             # Guided practice auto-progression
             if self._guided_practice and self._matcher is not None:
-                stats = self._matcher.get_statistics()
                 section_acc = stats.get("accuracy_percent", 0.0)
                 self._guided_loop_count += 1
                 if section_acc >= self._guided_target_accuracy:
