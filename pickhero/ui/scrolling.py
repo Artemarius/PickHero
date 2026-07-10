@@ -439,42 +439,22 @@ class PlayingScreen:
             audio_window = self._audio_capture.get_window_between(
                 window_start_stream_ms, window_end_stream_ms
             )
-            # Verifier-driven hit-zone scoring: verify pending chart events
-            # against the raw audio window every frame, independent of YIN.
-            hit_zone_results = self._matcher.verify_hit_zone(
-                self._playback_ms, audio_window, window_start_song_ms
-            )
-            # While frozen in wait mode, pin detected timestamps to the frozen
-            # playback position so matching hits the notes at the hit zone,
-            # not future notes that drift ahead as real time passes.
+            # Single scoring authority: unified event state machine.
+            # Replaces the three legacy paths (verify_hit_zone, process_detected_notes,
+            # verify_chord_at) that produced inconsistent judgments per event.
             if self._wait_mode_frozen and detected:
-                pinned_ts = self._playback_ms  # already in song time
+                # While frozen in wait mode, pin detected timestamps to the frozen
+                # playback position so matching hits the notes at the hit zone,
+                # not future notes that drift ahead as real time passes.
+                pinned_ts = self._playback_ms
                 for d in detected:
                     d.timestamp_ms = pinned_ts
-            results = list(hit_zone_results)
-            results.extend(self._matcher.process_detected_notes(
-                detected, self._playback_ms, audio_window=audio_window
-            ))
-            # Check if any detected note has an onset — used to gate FFT
-            # chord verification (fresh analysis on new strikes, cached
-            # result during sustain to avoid flutter).
-            has_onset = any(d.note.is_onset for d in detected)
-            # FFT-based chord verification for multi-note passages
-            if (self._audio_capture is not None
-                    and self._audio_capture.chord_detector is not None):
-                results.extend(self._matcher.verify_chord_at(
-                    self._playback_ms,
-                    self._audio_capture.chord_detector,
-                    has_onset,
-                    audio_window=audio_window,
-                ))
-            # M2: Unified event state machine (runs alongside legacy scoring during migration)
-            state_results = self._matcher.advance_state_machine(
+            results = list(self._matcher.advance_state_machine(
                 playback_ms=self._playback_ms,
                 audio_window=audio_window,
                 detected_notes=detected,
-            )
-            results.extend(state_results)
+            ))
+            has_onset = any(d.note.is_onset for d in detected) if detected else False
             self._feedback.add_results(results, self._playback_ms)
 
             # Track last detected technique for HUD display.

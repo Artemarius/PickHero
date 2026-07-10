@@ -718,7 +718,6 @@ class NoteMatcher:
         playback_ms: float,
         audio_window: np.ndarray | None,
         detected_notes: list[TimestampedNote],
-        chord_result=None,
     ) -> list[MatchResult]:
         """Advance the event state machine with this frame's evidence.
 
