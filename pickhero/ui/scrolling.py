@@ -468,6 +468,13 @@ class PlayingScreen:
                     has_onset,
                     audio_window=audio_window,
                 ))
+            # M2: Unified event state machine (runs alongside legacy scoring during migration)
+            state_results = self._matcher.advance_state_machine(
+                playback_ms=self._playback_ms,
+                audio_window=audio_window,
+                detected_notes=detected,
+            )
+            results.extend(state_results)
             self._feedback.add_results(results, self._playback_ms)
 
             # Track last detected technique for HUD display.

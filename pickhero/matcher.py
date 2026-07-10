@@ -11,10 +11,13 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Callable
 
-from pickhero.audio.note_utils import semitone_distance
+import numpy as np
+
+from pickhero.audio.match_mode import MatchMode, _coerce_match_mode
 from pickhero.audio.input import TimestampedNote
-from pickhero.audio.performance import PerformanceEvent, TechniqueSpec, TechniqueVerdict
-from pickhero.tabs.timeline import NoteEvent, Timeline
+from pickhero.audio.note_utils import semitone_distance
+from pickhero.audio.event_state import EventState, ChordRoleVerdict
+from pickhero.tabs.timeline import NoteEvent
 from pickhero.timing import (
     PitchVerdict,
     TimingObservation,
@@ -23,11 +26,9 @@ from pickhero.timing import (
     classify_timing_error,
     compute_stats,
 )
-
-if TYPE_CHECKING:
-    from pickhero.audio.analyzer import PerformanceAnalyzer
-    from pickhero.config import ToneProfile
-
+from pickhero.audio.verification_policy import VerificationPolicy
+from pickhero.audio.evidence import ExpectedNote, NoteVerification
+from pickhero.config import ToneProfile
 
 class MatchType(Enum):
     PENDING = "pending"
@@ -36,27 +37,6 @@ class MatchType(Enum):
     MISS = "miss"
 
 
-class MatchMode(Enum):
-    """Matching strictness profile.
-
-    ARCADE: forgiving — octave equivalence, chord auto-complete (mark all siblings).
-    PRACTICE: partial credit — only the matched note is marked, no auto-complete.
-    JUDGE: strict — every note must be independently supported; pitch_strict forced on.
-    """
-    ARCADE = "arcade"
-    PRACTICE = "practice"
-    JUDGE = "judge"
-
-
-def _coerce_match_mode(value: MatchMode | str) -> MatchMode:
-    """Accept a MatchMode or its string value (e.g. from config)."""
-    if isinstance(value, MatchMode):
-        return value
-    normalized = str(value).strip().lower()
-    for m in MatchMode:
-        if m.value == normalized:
-            return m
-    raise ValueError(f"unknown MatchMode: {value!r}")
 
 
 @dataclass
@@ -85,12 +65,14 @@ class NoteMatcher:
         timing_judge_enabled: bool | None = None,
         pitch_strict: bool | None = None,
         mode: MatchMode | str | None = None,
+        verifier: ExpectedEventVerifier | None = None,
     ):
         self._timeline = timeline
         self._timing_window_ms = timing_window_ms
         self._audio_offset_ms = audio_offset_ms
         self._chord_threshold_ms = chord_threshold_ms
         self.note_filter = note_filter
+        self._verifier = verifier
 
         # Resolve the match mode. Explicit `mode` wins; otherwise derive from
         # the legacy booleans for backward compatibility (migration path).
@@ -113,10 +95,21 @@ class NoteMatcher:
         # for backward compatibility; setting them re-derives the mode.
         # Kept through one release, then removed.
         self.chord_partial_credit = self._mode != MatchMode.ARCADE
+        # Diagnostic mode: when True, articulation events are treated as plain
+        # pick_onset.  This mirrors the real-time articulation detector's
+        # diagnostic_mode and lets the matcher route by event_kind when False.
+        self._diagnostic_mode: bool = True
 
         # State per note event, keyed by (timestamp_ms, string)
         self._note_states: dict[tuple[float, int], MatchType] = {}
 
+        # Unified event state machine (replaces _note_states in M2).
+        # Keyed by (timestamp_ms, string), maps to EventState value.
+        self._event_states: dict[tuple[float, int], EventState] = {}
+
+        # Events already resolved as HIT by verify_hit_zone; suppress duplicate
+        # EXTRA recordings in process_detected_notes.
+        self._consumed_event_ids: set[str] = set()
         # Statistics
         self.hits = 0
         self.close = 0
@@ -152,6 +145,10 @@ class NoteMatcher:
     @audio_offset_ms.setter
     def audio_offset_ms(self, value: float) -> None:
         self._audio_offset_ms = value
+
+    def set_diagnostic_mode(self, value: bool) -> None:
+        """Set whether detected notes are routed as diagnostic pick_onset."""
+        self._diagnostic_mode = value
 
     @property
     def match_mode(self) -> MatchMode:
@@ -300,15 +297,21 @@ class NoteMatcher:
                         pitch_verdict=PitchVerdict.UNKNOWN,
                     ))
         return results
-
+    # DEPRECATED: replaced by advance_state_machine(). Kept for backward
+    # compatibility during M2 migration.
     def process_detected_notes(
-        self, detected: list[TimestampedNote], playback_ms: float
+        self,
+        detected: list[TimestampedNote],
+        playback_ms: float,
+        audio_window: np.ndarray | None = None,
     ) -> list[MatchResult]:
         """Process detected notes against the timeline.
 
         Args:
             detected: Notes from AudioCapture.get_notes()
             playback_ms: Current playback position in the song
+            audio_window: Optional raw audio window centered on the current
+                playback position, forwarded to the verifier when available.
 
         Returns:
             List of match results for this frame.
@@ -326,7 +329,7 @@ class NoteMatcher:
         for ts_note in detected:
             # When articulation is in diagnostic mode, all events match as pick_onset.
             # Technique labels are diagnostic-only — not used for routing.
-            diagnostic = True  # TODO: wire to articulation_detector.diagnostic_mode
+            diagnostic = self._diagnostic_mode
             event_kind = "pick_onset"
             if not diagnostic:
                 # Prefer the immutable snapshot over the mutable PerformanceEvent.
@@ -346,7 +349,10 @@ class NoteMatcher:
                 if not onset:
                     self._log(f"SKIP   midi={midi} ts={ts:.0f} onset=False kind=pick_onset")
                     continue
-                mr = self._match_one(ts_note, playback_ms, require_onset=True)
+                mr = self._match_one(
+                    ts_note, playback_ms, require_onset=True,
+                    audio_window=audio_window,
+                )
             elif event_kind in ("legato_transition", "slide_landing", "bend_target"):
                 # Match only if a pending NoteEvent expects the matching technique.
                 expected_kind = {
@@ -358,6 +364,7 @@ class NoteMatcher:
                 mr = self._match_one(
                     ts_note, playback_ms, require_onset=False,
                     restrict_techniques=expected_kind,
+                    audio_window=audio_window,
                 )
             elif event_kind == "noise_gesture":
                 # Dead-note / rake: match by timing window only (pitch may be 0).
@@ -366,6 +373,7 @@ class NoteMatcher:
                     ts_note, playback_ms, require_onset=False,
                     restrict_techniques=("dead_note",),
                     ignore_pitch=True,
+                    audio_window=audio_window,
                 )
             else:
                 # sustain_update / release: no matching action here.
@@ -383,6 +391,7 @@ class NoteMatcher:
         require_onset: bool,
         restrict_techniques: tuple[str, ...] | None = None,
         ignore_pitch: bool = False,
+        audio_window: np.ndarray | None = None,
     ) -> MatchResult | None:
         """Match a single detected note against pending NoteEvents.
 
@@ -392,6 +401,7 @@ class NoteMatcher:
         ``techniques`` contain one of these kinds are candidates.
         ``ignore_pitch``: when True, match by timing window only (dead-note /
         rake events carry no reliable pitch).
+        ``audio_window``: optional raw audio window forwarded to the verifier.
         """
         if require_onset and not ts_note.note.is_onset:
             self._log(f"DROP   midi={ts_note.note.midi_note} ts={ts_note.timestamp_ms:.0f} require_onset but is_onset=False")
@@ -428,6 +438,10 @@ class NoteMatcher:
                     if nearest_dist is None or d < nearest_dist:
                         nearest = n
                         nearest_dist = d
+                if nearest is not None:
+                    nearest_id = f"{nearest.timestamp_ms}:{nearest.string}"
+                    if nearest_id in self._consumed_event_ids:
+                        return None  # nearest event was already resolved HIT by verify_hit_zone
                 expected_ms = nearest.timestamp_ms if nearest else adjusted_ms
                 measure = nearest.measure if nearest else -1
                 expected_midi = nearest.midi_note if nearest else 0
@@ -475,8 +489,42 @@ class NoteMatcher:
                 best = note
                 best_dist = effective
 
-        if best is None or best_dist is None:
-            return None
+        if (
+            self._verifier is not None
+            and audio_window is not None
+            and not ignore_pitch
+        ):
+            # Primary expected-event path: verify each pending note against
+            # the audio window and pick the first one the verifier accepts.
+            # Semitone distance is used only to choose which expected note to
+            # verify first, not as the final match decision.
+            policy = VerificationPolicy.from_mode(self._mode)
+            pending_sorted = sorted(
+                pending,
+                key=lambda n: semitone_distance(detected_midi, n.midi_note),
+            )
+            for note in pending_sorted:
+                verification = self._verifier.verify_single_note(
+                    audio_window, note.midi_note, self._mode
+                )
+                if (
+                    verification.is_pitch_present
+                    and verification.confidence >= policy.min_note_confidence
+                ):
+                    best = note
+                    best_dist = 0
+                    break
+            else:
+                if not policy.allow_semitone_fallback:
+                    self._log(
+                        f"VERIFY midi={detected_midi} ts={adjusted_ms:.0f} "
+                        f"→ no expected note present"
+                    )
+                    return None
+                # Fallback to the closest expected note if no note verified.
+                best = pending_sorted[0]
+                best_dist = semitone_distance(detected_midi, best.midi_note)
+
 
         # Classify match (dead-note / pitch-ignored matches are always HITs)
         if ignore_pitch:
@@ -512,6 +560,9 @@ class NoteMatcher:
             )
             if self.timing_judge_enabled:
                 pitch_v = classify_pitch_distance(best_dist)
+                best_id = f"{best.timestamp_ms}:{best.string}"
+                if best_id in self._consumed_event_ids:
+                    return None  # best event was already resolved HIT by verify_hit_zone
                 self._timing_observations.append(TimingObservation(
                     detected_ms=adjusted_ms,
                     expected_ms=best.timestamp_ms,
@@ -580,22 +631,27 @@ class NoteMatcher:
             semitone_distance=best_dist,
         )
 
+    # DEPRECATED: replaced by advance_state_machine(). Kept for backward
+    # compatibility during M2 migration.
     def verify_chord_at(
         self,
         playback_ms: float,
         chord_detector=None,
         has_onset: bool = False,
+        audio_window: np.ndarray | None = None,
     ) -> list[MatchResult]:
-        """Verify chords at the hit zone using FFT spectral analysis.
+        """Verify chords at the hit zone.
 
         Called when there are multiple pending notes at the same timestamp.
-        Uses the ChordDetector to check if expected frequencies are present.
-        When ``has_onset`` is True, a fresh FFT analysis is triggered;
-        otherwise the cached result from the last onset is returned.
+        Uses the verifier when an audio window is available, otherwise falls
+        back to the FFT-based ChordDetector.
         """
+        if (self._verifier is not None
+                and audio_window is not None
+                and len(audio_window) > 0):
+            return self._verify_chord_with_verifier(playback_ms, audio_window)
         if chord_detector is None:
             return []
-
         results: list[MatchResult] = []
 
         # Find all active notes at the current playback position. A chord in the
@@ -656,6 +712,405 @@ class NoteMatcher:
 
 
         return results
+
+    def advance_state_machine(
+        self,
+        playback_ms: float,
+        audio_window: np.ndarray | None,
+        detected_notes: list[TimestampedNote],
+        chord_result=None,
+    ) -> list[MatchResult]:
+        """Advance the event state machine with this frame's evidence.
+
+        Processes pending events through PENDING→ATTACKING→PITCHED→RELEASED→HIT/MISS
+        transitions. Technique evidence is attached as metadata only — it never
+        blocks or redirects a transition.
+
+        Returns terminal-state results (HIT, PARTIAL, MISS) that were reached
+        this frame.
+        """
+        results: list[MatchResult] = []
+        if not self._verifier or audio_window is None or len(audio_window) == 0:
+            return results
+
+        # Get all pending events within the timing window
+        timing_window = self._timing_window_ms
+        judge_ms = playback_ms - timing_window
+        candidates = self._timeline.get_notes_in_range(
+            judge_ms - timing_window,
+            judge_ms + timing_window,
+        )
+
+        # Build set of detected MIDI notes for pitch matching
+        detected_midis = {d.note.midi_note for d in detected_notes if d.note.midi_note is not None}
+        has_onset = any(d.note.is_onset for d in detected_notes)
+
+        for note in candidates:
+            if self._is_filtered(note):
+                continue
+            event_key = (note.timestamp_ms, note.string)
+
+            # Get or create event state
+            if event_key not in self._event_states:
+                self._event_states[event_key] = EventState.PENDING
+
+            current = self._event_states[event_key]
+            if current in (EventState.HIT, EventState.PARTIAL, EventState.MISS):
+                continue  # terminal — already resolved
+
+            new_state = self._transition(
+                note, current, playback_ms, detected_midis,
+                has_onset, audio_window,
+            )
+
+            if new_state != current:
+                self._event_states[event_key] = new_state
+                if new_state in (EventState.HIT, EventState.PARTIAL, EventState.MISS):
+                    self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
+                    if new_state == EventState.HIT:
+                        self._record_match(note, MatchType.HIT)
+                        results.append(MatchResult(
+                            match_type=MatchType.HIT,
+                            matched_events=[note],
+                        ))
+                    elif new_state == EventState.PARTIAL:
+                        self._record_match(note, MatchType.CLOSE)
+                        results.append(MatchResult(
+                            match_type=MatchType.CLOSE,
+                            matched_events=[note],
+                        ))
+                    else:  # MISS
+                        self._record_match(note, MatchType.MISS)
+                        results.append(MatchResult(
+                            match_type=MatchType.MISS,
+                            matched_events=[note],
+                        ))
+
+        # Miss-expire events whose timing window has passed
+        for key, state in list(self._event_states.items()):
+            if state == EventState.PENDING:
+                ts, string = key
+                if playback_ms - ts > timing_window * 2:
+                    self._event_states[key] = EventState.MISS
+                    self._record_match(
+                        NoteEvent(timestamp_ms=ts, string=string, midi_note=0,
+                                  duration_ms=0, measure=0, fret=0, techniques=()),
+                        MatchType.MISS,
+                    )
+                    results.append(MatchResult(
+                        match_type=MatchType.MISS,
+                        matched_events=[],
+                    ))
+
+        return results
+
+    def _transition(
+        self,
+        note: NoteEvent,
+        current: EventState,
+        playback_ms: float,
+        detected_midis: set[int],
+        has_onset: bool,
+        audio_window: np.ndarray,
+    ) -> EventState:
+        """Determine the next state for a single event given current evidence.
+
+        Technique evidence is completely ignored for state transitions.
+        Only pitch, onset, and timing evidence drive the state machine.
+        """
+        expected_midi = note.midi_note
+        pitch_matches = expected_midi in detected_midis
+
+        if current == EventState.PENDING:
+            # Onset + pitch match → PITCHED directly
+            if has_onset and pitch_matches:
+                return EventState.PITCHED
+            # Onset seen but pitch not yet confirmed → ATTACKING
+            if has_onset:
+                return EventState.ATTACKING
+            # Timing window expired with no onset → MISS
+            if playback_ms - note.timestamp_ms > self._timing_window_ms * 2:
+                return EventState.MISS
+            return EventState.PENDING  # no change
+
+        if current == EventState.ATTACKING:
+            if pitch_matches:
+                return EventState.PITCHED
+            # Window expired without pitch confirmation → MISS
+            if playback_ms - note.timestamp_ms > self._timing_window_ms * 3:
+                return EventState.MISS
+            return EventState.ATTACKING
+
+        if current == EventState.PITCHED:
+            # Note duration expired → RELEASED
+            if playback_ms > note.timestamp_ms + note.duration_ms:
+                return EventState.RELEASED
+            # Strong pitch contradiction (e.g., octave error across multiple frames)
+            # — only transition to MISS if confirmed wrong pitch
+            if detected_midis and expected_midi not in detected_midis:
+                # Only expire if we're well past the note AND detecting something else
+                if playback_ms > note.timestamp_ms + self._timing_window_ms:
+                    return EventState.MISS
+            return EventState.PITCHED
+
+        if current == EventState.SUSTAINING:
+            if playback_ms > note.timestamp_ms + note.duration_ms:
+                return EventState.RELEASED
+            return EventState.SUSTAINING
+
+        if current == EventState.RELEASED:
+            # Always → HIT from RELEASED (pitch was correct, note ended)
+            # For chord groups, the caller should aggregate all notes in the group.
+            return EventState.HIT
+
+        return current
+
+    def _get_event_state(self, key: tuple[float, int]) -> EventState:
+        """Get the current state for an event key."""
+        return self._event_states.get(key, EventState.PENDING)
+
+    def _find_previous_note_on_string(self, note: NoteEvent) -> NoteEvent | None:
+        """Return the closest earlier note on the same string, if any."""
+        prev: NoteEvent | None = None
+        for n in self._timeline.get_notes_in_range(0.0, note.timestamp_ms):
+            if n.string == note.string and n.timestamp_ms < note.timestamp_ms:
+                if prev is None or n.timestamp_ms > prev.timestamp_ms:
+                    prev = n
+        return prev
+
+    def _build_technique_context(self, note: NoteEvent) -> dict:
+        """Build a context dict for the technique verifier from a NoteEvent."""
+        ctx: dict = {"midi_note": note.midi_note}
+        for spec in note.techniques:
+            if spec.kind == "bend":
+                ctx["target_cents"] = spec.target_cents or 100.0
+            elif spec.kind == "slide":
+                prev = self._find_previous_note_on_string(note)
+                ctx["start_midi"] = prev.midi_note if prev else note.midi_note
+                ctx["end_midi"] = note.midi_note
+            elif spec.kind == "harmonic":
+                ctx["midi_note"] = spec.expected_sounding_midi or note.midi_note
+        return ctx
+
+    def _requires_onset(self, note: NoteEvent) -> bool:
+        """Determine whether this event requires a pick onset in the window.
+
+        Technique categories:
+        - normal note (no techniques): True — picked note
+        - hammer_on/pull_off with tied_to_previous: False — legato, no new pick
+        - bend: True — the note is picked then bent
+        - slide: True — the note is picked then slid
+        - vibrato: True — the note is picked then vibrato applied
+        - palm_mute: True — picked with palm muting
+        - harmonic: True — picked (natural) or tapped (artificial), either way an attack
+        - dead_note: True — percussive attack (broadband, not pitch-gated)
+        """
+        if not note.techniques:
+            return True  # normal picked note
+        tied = any(t.kind in ("hammer_on", "pull_off") and t.tied_to_previous
+                   for t in note.techniques)
+        if tied:
+            return False  # legato: no new pick onset
+        return True  # all other techniques require a pick onset
+
+    # DEPRECATED: replaced by advance_state_machine(). Kept for backward
+    # compatibility during M2 migration.
+    def verify_hit_zone(
+        self,
+        playback_ms: float,
+        audio_window: np.ndarray | None,
+        window_start_ms: float = 0.0,
+    ) -> list[MatchResult]:
+        """Verify pending chart events at the hit zone using the audio window.
+
+        Called every frame from the gameplay loop.  If the verifier is not
+        configured or no audio window is available, returns [] (caller falls
+        back to process_detected_notes).
+        """
+        if self._verifier is None or audio_window is None or len(audio_window) == 0:
+            return []
+        results: list[MatchResult] = []
+        timing_window = self._timing_window_ms
+        # Deliberately judge events whose late tolerance has elapsed.
+        judge_ms = playback_ms - timing_window
+        candidates = self._timeline.get_notes_in_range(
+            judge_ms - timing_window,
+            judge_ms + timing_window,
+        )
+        chord_groups: dict[float, list[NoteEvent]] = {}
+        for note in candidates:
+            if self._is_filtered(note):
+                continue
+            if self._get_state(note) != MatchType.PENDING:
+                continue
+            ts = round(note.timestamp_ms, 0)
+            chord_groups.setdefault(ts, []).append(note)
+
+        policy = VerificationPolicy.from_mode(self._mode)
+        for group in chord_groups.values():
+            if len(group) == 1:
+                note = group[0]
+                expected_onset_offset_ms = note.timestamp_ms - window_start_ms
+                is_dead_note = any(t.kind == "dead_note" for t in note.techniques)
+                if is_dead_note:
+                    # Dead notes: route to technique verifier only.
+                    tech_result = self._verifier.verify_technique(
+                        audio_window, "dead_note", {"midi_note": note.midi_note}
+                    )
+                    if not tech_result.is_present:
+                        continue
+                else:
+                    verification = self._verifier.verify_single_note(
+                        audio_window, note.midi_note, self._mode,
+                        expected_onset_offset_ms=expected_onset_offset_ms,
+                        onset_tolerance_ms=self._timing_window_ms,
+                    )
+                    if not verification.is_pitch_present:
+                        continue
+                    if verification.confidence < policy.min_note_confidence:
+                        continue
+                    if self._requires_onset(note):
+                        if not verification.is_onset_present:
+                            continue  # pitch present but no attack — don't score yet
+                    # Technique verification (non-dead-note).
+                    if note.techniques:
+                        tech_context = self._build_technique_context(note)
+                        all_present = True
+                        for spec in note.techniques:
+                            tech_result = self._verifier.verify_technique(
+                                audio_window, spec.kind, tech_context
+                            )
+                            if not tech_result.is_present:
+                                all_present = False
+                                break
+                        if not all_present:
+                            continue
+                self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
+                self._record_match(note, MatchType.HIT)
+                if (self.timing_judge_enabled and not is_dead_note
+                        and verification.onset_ms is not None):
+                    detected_song_ms = window_start_ms + verification.onset_ms
+                    timing_error_ms = detected_song_ms - note.timestamp_ms
+                    verdict = classify_timing_error(timing_error_ms)
+                    self._timing_observations.append(TimingObservation(
+                        detected_ms=detected_song_ms,
+                        expected_ms=note.timestamp_ms,
+                        timing_error_ms=timing_error_ms,
+                        verdict=verdict,
+                        midi_note=note.midi_note,
+                        expected_midi=note.midi_note,
+                        measure=note.measure,
+                        confidence=verification.confidence,
+                        pitch_verdict=PitchVerdict.CORRECT,
+                        techniques=note.techniques,
+                    ))
+                results.append(MatchResult(
+                    match_type=MatchType.HIT,
+                    matched_events=[note],
+                    semitone_distance=0,
+                ))
+            elif len(group) >= 2:
+                results.extend(
+                    self._verify_chord_group(group, audio_window, policy, window_start_ms)
+                )
+        return results
+
+    def _verify_chord_group(
+        self,
+        group: list[NoteEvent],
+        audio_window: np.ndarray,
+        policy: VerificationPolicy,
+        window_start_ms: float = 0.0,
+    ) -> list[MatchResult]:
+        """Verify a pre-grouped chord and record matches."""
+        results: list[MatchResult] = []
+        pending = [n for n in group if self._get_state(n) == MatchType.PENDING]
+        if not pending:
+            return results
+        expected_notes = [
+            ExpectedNote(
+                midi=n.midi_note,
+                string=n.string,
+                fret=n.fret,
+                event_id=f"{n.timestamp_ms}:{n.string}",
+            )
+            for n in group
+        ]
+        expected_onset_offset_ms = group[0].timestamp_ms - window_start_ms
+        verification = self._verifier.verify_chord(
+            audio_window, expected_notes, self._mode,
+            expected_onset_offset_ms=expected_onset_offset_ms,
+            onset_tolerance_ms=self._timing_window_ms,
+        )
+        if not verification.notes:
+            return results
+        chord_requires_onset = all(self._requires_onset(n) for n in group)
+        if chord_requires_onset:
+            if not verification.notes[0].is_onset_present:
+                return results  # no attack detected — don't score chord yet
+
+        shared_onset_ms = verification.notes[0].onset_ms
+        matched_events: list[tuple[NoteEvent, NoteVerification]] = []
+        for note, note_ver in zip(group, verification.notes):
+            if (
+                note_ver.is_pitch_present
+                and note_ver.confidence >= policy.min_chord_confidence
+                and self._get_state(note) == MatchType.PENDING
+            ):
+                self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
+                self._record_match(note, MatchType.HIT)
+                matched_events.append((note, note_ver))
+        if matched_events:
+            all_present = (
+                not policy.require_all_chord_notes
+                or all(nv.is_pitch_present for nv in verification.notes)
+            )
+            matched_notes = [note for note, _ in matched_events]
+            results.append(MatchResult(
+                match_type=MatchType.HIT if all_present else MatchType.CLOSE,
+                matched_events=matched_notes,
+                semitone_distance=0,
+            ))
+            if (self.timing_judge_enabled and shared_onset_ms is not None):
+                detected_song_ms = window_start_ms + shared_onset_ms
+                for note, note_ver in matched_events:
+                    timing_error_ms = detected_song_ms - note.timestamp_ms
+                    verdict = classify_timing_error(timing_error_ms)
+                    self._timing_observations.append(TimingObservation(
+                        detected_ms=detected_song_ms,
+                        expected_ms=note.timestamp_ms,
+                        timing_error_ms=timing_error_ms,
+                        verdict=verdict,
+                        midi_note=note.midi_note,
+                        expected_midi=note.midi_note,
+                        measure=note.measure,
+                        confidence=note_ver.confidence,
+                        pitch_verdict=PitchVerdict.CORRECT,
+                        techniques=note.techniques,
+                    ))
+        return results
+
+    def _verify_chord_with_verifier(
+        self, playback_ms: float, audio_window: np.ndarray
+    ) -> list[MatchResult]:
+        """Verify chords using the expected-event verifier."""
+        results: list[MatchResult] = []
+        candidates = self._timeline.get_active_notes_at_time(
+            playback_ms, self._timing_window_ms
+        )
+        chord_groups: dict[float, list[NoteEvent]] = {}
+        for note in candidates:
+            if self._is_filtered(note):
+                continue
+            ts = round(note.timestamp_ms, 0)
+            chord_groups.setdefault(ts, []).append(note)
+
+        policy = VerificationPolicy.from_mode(self._mode)
+        for group in chord_groups.values():
+            if len(group) >= 2:
+                results.extend(self._verify_chord_group(group, audio_window, policy))
+        return results
+
 
     def _resolve_legato_direction(self, note: NoteEvent) -> NoteEvent:
         """Resolve hammer_on vs pull_off from the neighbor pitch delta.
@@ -852,6 +1307,8 @@ class NoteMatcher:
     def reset(self) -> None:
         """Clear all state. Call on seek/restart."""
         self._note_states.clear()
+        self._event_states.clear()
+        self._consumed_event_ids.clear()
         self.hits = 0
         self.close = 0
         self.misses = 0

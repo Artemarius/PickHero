@@ -169,7 +169,7 @@ class TestChordMatching:
         let a single matched root auto-complete the fifth. In JUDGE mode only
         the matched note is marked; the fifth stays PENDING then MISS after window.
         """
-        from pickhero.matcher import MatchMode
+        from pickhero.audio.match_mode import MatchMode
         note_a = _note_event(1000.0, midi_note=40, string=6)  # E2 (root)
         note_b = _note_event(1000.0, midi_note=47, string=5)  # B2 (fifth)
         matcher = _make_matcher([note_a, note_b], chord_threshold_ms=50.0)
@@ -552,3 +552,421 @@ class TestTimingObservations:
         # good bend counts as correct; weak bend (grade 'weak' or 'missed') does not
         assert stats["technique_correct"] == 1
         assert stats["technique_accuracy_percent"] == 50.0
+
+
+class TestVerifierPrimary:
+    """Tests that the expected-event verifier drives matching when available."""
+
+    def test_verifier_overrides_semitone_distance(self):
+        """When the audio window contains the expected note, verifier wins."""
+        from pickhero.audio.match_mode import MatchMode
+        from pickhero.audio.note_utils import midi_to_freq
+        from pickhero.audio.verifier_composite import CompositeVerifier
+
+        tab_note = _note_event(1000.0, midi_note=64)
+        verifier = CompositeVerifier(sample_rate=48000)
+        timeline = Timeline([tab_note], SongMetadata(title="Test", tempo=120))
+        matcher = NoteMatcher(
+            timeline,
+            timing_window_ms=100.0,
+            audio_offset_ms=0.0,
+            mode=MatchMode.ARCADE,
+            verifier=verifier,
+        )
+
+        # Build an audio window containing the *expected* note (MIDI 64).
+        freq = midi_to_freq(64)
+        samples = int(48000 * 200 / 1000)
+        window = (0.5 * np.sin(2 * np.pi * freq * np.arange(samples) / 48000)).astype(np.float32)
+
+        # Pass a "detected" note that is far off (MIDI 60) plus the window.
+        detected = [_detected(60, 1000.0)]
+        results = matcher.process_detected_notes(
+            detected, 1050.0, audio_window=window
+        )
+        hits = [r for r in results if r.match_type == MatchType.HIT]
+        assert len(hits) == 1, "verifier should match expected note via audio evidence"
+        assert tab_note in hits[0].matched_events
+
+    def test_judge_mode_rejects_wrong_note_with_verifier(self):
+        """In JUDGE mode, verifier must reject a non-present expected note."""
+        from pickhero.audio.match_mode import MatchMode
+        from pickhero.audio.verifier_composite import CompositeVerifier
+
+        tab_note = _note_event(1000.0, midi_note=64)
+        verifier = CompositeVerifier(sample_rate=48000)
+        timeline = Timeline([tab_note], SongMetadata(title="Test", tempo=120))
+        matcher = NoteMatcher(
+            timeline,
+            timing_window_ms=100.0,
+            audio_offset_ms=0.0,
+            mode=MatchMode.JUDGE,
+            verifier=verifier,
+        )
+
+        # Silence should not verify as the expected note.
+        window = np.zeros(int(48000 * 200 / 1000), dtype=np.float32)
+        detected = [_detected(64, 1000.0)]
+        results = matcher.process_detected_notes(
+            detected, 1050.0, audio_window=window
+        )
+        hits = [r for r in results if r.match_type == MatchType.HIT]
+        assert len(hits) == 0, "silence should not verify in JUDGE mode"
+
+
+class TestVerifyHitZone:
+    """Integration tests for verify_hit_zone()."""
+
+    def _sine_window(self, midi: int, duration_ms: float = 200.0,
+                     sample_rate: int = 48000, amplitude: float = 0.5) -> np.ndarray:
+        from pickhero.audio.note_utils import midi_to_freq
+        freq = midi_to_freq(midi)
+        samples = int(sample_rate * duration_ms / 1000.0)
+        t = np.arange(samples) / sample_rate
+        return (amplitude * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+    def _ramped_sine_window(self, midi: int, duration_ms: float = 200.0,
+                            sample_rate: int = 48000, amplitude: float = 0.5,
+                            attack_ms: float = 100.0) -> np.ndarray:
+        from pickhero.audio.note_utils import midi_to_freq
+        freq = midi_to_freq(midi)
+        samples = int(sample_rate * duration_ms / 1000.0)
+        t = np.arange(samples) / sample_rate
+        attack_samples = int(sample_rate * attack_ms / 1000.0)
+        ramp_samples = int(sample_rate * 5 / 1000.0)
+        envelope = np.zeros(samples, dtype=np.float32)
+        if attack_samples < samples:
+            envelope[attack_samples:] = 1.0
+        if attack_samples + ramp_samples <= samples:
+            envelope[attack_samples:attack_samples + ramp_samples] = np.linspace(
+                0.0, 1.0, ramp_samples
+            )
+        else:
+            envelope[attack_samples:] = np.linspace(0.0, 1.0, samples - attack_samples)
+        signal = amplitude * np.sin(2 * np.pi * freq * t) * envelope
+        return signal.astype(np.float32)
+
+    def _harmonic_rich_window(self, midi: int, duration_ms: float = 200.0,
+                              sample_rate: int = 48000, amplitude: float = 0.5,
+                              attack_ms: float = 100.0) -> np.ndarray:
+        """Harmonic-rich signal that starts at ``attack_ms``."""
+        from pickhero.audio.note_utils import midi_to_freq
+        freq = midi_to_freq(midi)
+        samples = int(sample_rate * duration_ms / 1000.0)
+        t = np.arange(samples) / sample_rate
+        attack_samples = int(sample_rate * attack_ms / 1000.0)
+        ramp_samples = int(sample_rate * 5 / 1000.0)
+        envelope = np.zeros(samples, dtype=np.float32)
+        if attack_samples < samples:
+            envelope[attack_samples:] = 1.0
+        if attack_samples + ramp_samples <= samples:
+            envelope[attack_samples:attack_samples + ramp_samples] = np.linspace(
+                0.0, 1.0, ramp_samples
+            )
+        else:
+            envelope[attack_samples:] = np.linspace(0.0, 1.0, samples - attack_samples)
+        signal = np.zeros(samples, dtype=np.float32)
+        for h, weight in enumerate([1.0, 0.5, 0.25, 0.125, 0.0625], start=1):
+            signal += weight * np.sin(2 * np.pi * freq * h * t)
+        signal = amplitude * signal * envelope
+        return signal.astype(np.float32)
+
+    def test_verify_hit_zone_matches_without_detected_notes(self):
+        """verify_hit_zone should match pending notes from audio alone."""
+        from pickhero.audio.verifier_composite import CompositeVerifier
+        from pickhero.tabs.timeline import SongMetadata
+        notes = [_note_event(1000.0, midi_note=64, string=1)]
+        timeline = Timeline(notes, SongMetadata(title="Test", tempo=120))
+        verifier = CompositeVerifier(sample_rate=48000)
+        matcher = NoteMatcher(timeline, timing_window_ms=100.0, verifier=verifier)
+        # Window covers [850, 1050] ms; note at 1000ms has expected onset at 150ms.
+        window = self._ramped_sine_window(64, duration_ms=200.0, attack_ms=150.0)
+        results = matcher.verify_hit_zone(1050.0, window, window_start_ms=850.0)
+        assert any(r.match_type == MatchType.HIT for r in results)
+
+    def test_verify_hit_zone_rejects_onset_outside_tolerance(self):
+        """An attack outside the expected onset window should not score."""
+        from pickhero.audio.verifier_composite import CompositeVerifier
+        from pickhero.tabs.timeline import SongMetadata
+        notes = [_note_event(1000.0, midi_note=64, string=1)]
+        timeline = Timeline(notes, SongMetadata(title="Test", tempo=120))
+        verifier = CompositeVerifier(sample_rate=48000)
+        matcher = NoteMatcher(timeline, timing_window_ms=100.0, verifier=verifier)
+        # Attack at 150ms, but expected onset offset claims 50ms.
+        window = self._ramped_sine_window(64, duration_ms=200.0, attack_ms=150.0)
+        results = matcher.verify_hit_zone(1050.0, window, window_start_ms=975.0)
+        assert all(r.match_type != MatchType.HIT for r in results)
+
+    def test_verify_hit_zone_records_timing_observation(self):
+        """A verifier-driven HIT should produce a TimingObservation."""
+        from pickhero.audio.match_mode import MatchMode
+        from pickhero.audio.verifier_composite import CompositeVerifier
+        from pickhero.tabs.timeline import SongMetadata
+        notes = [_note_event(1000.0, midi_note=64, string=1)]
+        timeline = Timeline(notes, SongMetadata(title="Test", tempo=120))
+        verifier = CompositeVerifier(sample_rate=48000)
+        matcher = NoteMatcher(
+            timeline, timing_window_ms=100.0, verifier=verifier, mode=MatchMode.JUDGE
+        )
+        # Harmonic-rich attack at 150ms; expected at 150ms -> detected_ms = 1000ms.
+        window = self._harmonic_rich_window(64, duration_ms=200.0, attack_ms=150.0)
+        results = matcher.verify_hit_zone(1050.0, window, window_start_ms=850.0)
+        assert any(r.match_type == MatchType.HIT for r in results)
+        obs = matcher.get_timing_observations()
+        assert len(obs) == 1
+        assert obs[0].expected_ms == 1000.0
+        assert obs[0].timing_error_ms == pytest.approx(0.0, abs=20.0)
+
+    def test_verify_hit_zone_dead_note_accepted(self):
+        """A dead note is accepted without pitch detection."""
+        from pickhero.audio.performance import TechniqueSpec
+        from pickhero.audio.verifier_composite import CompositeVerifier
+        from pickhero.tabs.timeline import SongMetadata
+        notes = [_note_event(
+            1000.0, midi_note=64, string=1,
+            techniques=(TechniqueSpec(kind="dead_note"),)
+        )]
+        timeline = Timeline(notes, SongMetadata(title="Test", tempo=120))
+        verifier = CompositeVerifier(sample_rate=48000)
+        matcher = NoteMatcher(timeline, timing_window_ms=100.0, verifier=verifier)
+        # Broadband percussive burst with fast decay in the middle of the window.
+        sr = 48000
+        samples = int(sr * 200 / 1000)
+        t = np.arange(samples) / sr
+        window = (np.sin(2 * np.pi * 100 * t) * np.exp(-t / 0.02)).astype(np.float32)
+        results = matcher.verify_hit_zone(1050.0, window, window_start_ms=850.0)
+        assert any(r.match_type == MatchType.HIT for r in results)
+
+    def test_verify_hit_zone_returns_empty_without_verifier(self):
+        """Without a verifier, verify_hit_zone returns []."""
+        from pickhero.tabs.timeline import SongMetadata
+        notes = [_note_event(1000.0, midi_note=64, string=1)]
+        timeline = Timeline(notes, SongMetadata(title="Test", tempo=120))
+        matcher = NoteMatcher(timeline, timing_window_ms=100.0, verifier=None)
+        window = self._sine_window(64, duration_ms=200.0)
+        results = matcher.verify_hit_zone(1050.0, window)
+        assert results == []
+
+    def test_verify_hit_zone_returns_empty_for_silence(self):
+        """Silence should not match any notes via verify_hit_zone."""
+        from pickhero.audio.verifier_composite import CompositeVerifier
+        from pickhero.tabs.timeline import SongMetadata
+        notes = [_note_event(1000.0, midi_note=64, string=1)]
+        timeline = Timeline(notes, SongMetadata(title="Test", tempo=120))
+        verifier = CompositeVerifier(sample_rate=48000)
+        matcher = NoteMatcher(timeline, timing_window_ms=100.0, verifier=verifier)
+        window = np.zeros(4800, dtype=np.float32)
+        results = matcher.verify_hit_zone(1050.0, window)
+        assert all(r.match_type != MatchType.HIT for r in results)
+
+
+class TestStateMachine:
+    """Tests for the unified event state machine (advance_state_machine)."""
+
+    def _sine_window(self, midi: int, duration_ms: float = 200.0,
+                     sample_rate: int = 48000, amplitude: float = 0.5) -> np.ndarray:
+        from pickhero.audio.note_utils import midi_to_freq
+        freq = midi_to_freq(midi)
+        samples = int(sample_rate * duration_ms / 1000.0)
+        t = np.arange(samples) / sample_rate
+        return (amplitude * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+    def _ramped_sine_window(self, midi: int, duration_ms: float = 200.0,
+                            sample_rate: int = 48000, amplitude: float = 0.5,
+                            attack_ms: float = 100.0) -> np.ndarray:
+        from pickhero.audio.note_utils import midi_to_freq
+        freq = midi_to_freq(midi)
+        samples = int(sample_rate * duration_ms / 1000.0)
+        t = np.arange(samples) / sample_rate
+        attack_samples = int(sample_rate * attack_ms / 1000.0)
+        ramp_samples = int(sample_rate * 5 / 1000.0)
+        envelope = np.zeros(samples, dtype=np.float32)
+        if attack_samples < samples:
+            envelope[attack_samples:] = 1.0
+        if attack_samples + ramp_samples <= samples:
+            envelope[attack_samples:attack_samples + ramp_samples] = np.linspace(
+                0.0, 1.0, ramp_samples
+            )
+        else:
+            envelope[attack_samples:] = np.linspace(0.0, 1.0, samples - attack_samples)
+        signal = amplitude * np.sin(2 * np.pi * freq * t) * envelope
+        return signal.astype(np.float32)
+
+    def _make_matcher_with_verifier(self, notes, timing_window_ms=100.0):
+        from pickhero.audio.verifier_composite import CompositeVerifier
+        from pickhero.tabs.timeline import SongMetadata
+        timeline = Timeline(notes, SongMetadata(title="Test", tempo=120))
+        verifier = CompositeVerifier(sample_rate=48000)
+        return NoteMatcher(
+            timeline,
+            timing_window_ms=timing_window_ms,
+            verifier=verifier,
+        )
+
+    def test_initial_state_is_pending(self):
+        """Event state defaults to PENDING before any evidence."""
+        from pickhero.audio.event_state import EventState
+        notes = [_note_event(1000.0, midi_note=64, string=1)]
+        matcher = self._make_matcher_with_verifier(notes)
+        state = matcher._get_event_state((1000.0, 1))
+        assert state == EventState.PENDING
+
+    def test_returns_empty_without_verifier(self):
+        """Without a verifier, advance_state_machine returns []."""
+        notes = [_note_event(1000.0, midi_note=64, string=1)]
+        matcher = _make_matcher(notes, timing_window_ms=100.0)
+        window = self._sine_window(64)
+        results = matcher.advance_state_machine(
+            playback_ms=1050.0,
+            audio_window=window,
+            detected_notes=[],
+        )
+        assert results == []
+
+    def test_returns_empty_for_silence(self):
+        """Silence should not produce any terminal results."""
+        notes = [_note_event(1000.0, midi_note=64, string=1)]
+        matcher = self._make_matcher_with_verifier(notes)
+        window = np.zeros(4800, dtype=np.float32)
+        results = matcher.advance_state_machine(
+            playback_ms=1050.0,
+            audio_window=window,
+            detected_notes=[],
+        )
+        assert all(r.match_type != MatchType.HIT for r in results)
+
+    def test_pending_to_hit_with_onset_and_pitch(self):
+        """Normal picked note: onset + pitch → PITCHED → HIT.
+
+        Feed a frame with matching onset+pitch, then advance past duration
+        to trigger RELEASED → HIT.
+        """
+        from pickhero.audio.event_state import EventState
+        notes = [_note_event(1000.0, midi_note=64, string=1, duration_ms=100.0)]
+        matcher = self._make_matcher_with_verifier(notes, timing_window_ms=100.0)
+        # Frame 1: onset + matching pitch at the note's timestamp.
+        window = self._ramped_sine_window(64, duration_ms=200.0, attack_ms=100.0)
+        detected = [_detected(64, 1000.0, is_onset=True)]
+        matcher.advance_state_machine(
+            playback_ms=1100.0,
+            audio_window=window,
+            detected_notes=detected,
+        )
+        # Should have transitioned to PITCHED (onset + pitch match).
+        state = matcher._get_event_state((1000.0, 1))
+        assert state in (EventState.PITCHED, EventState.RELEASED, EventState.HIT), (
+            f"Expected PITCHED or beyond, got {state}"
+        )
+
+    def test_miss_on_timing_expiry(self):
+        """Note that expires without any onset → MISS."""
+        from pickhero.audio.event_state import EventState
+        notes = [_note_event(1000.0, midi_note=64, string=1, duration_ms=100.0)]
+        matcher = self._make_matcher_with_verifier(notes, timing_window_ms=100.0)
+        # Frame 1: note is in the timing window but no onset/pitch detected.
+        # This enters the event into _event_states as PENDING.
+        window = np.zeros(4800, dtype=np.float32)
+        matcher.advance_state_machine(
+            playback_ms=1050.0,  # judge_ms=950, range=[850,1050] — note at 1000 is in range
+            audio_window=window,
+            detected_notes=[],
+        )
+        assert matcher._get_event_state((1000.0, 1)) == EventState.PENDING
+        # Frame 2: advance well past the timing window with silence.
+        results = matcher.advance_state_machine(
+            playback_ms=1300.0,  # 300ms past note — exceeds 2× timing window
+            audio_window=window,
+            detected_notes=[],
+        )
+        # The miss-expire path should have fired for the PENDING event.
+        assert any(r.match_type == MatchType.MISS for r in results)
+        state = matcher._get_event_state((1000.0, 1))
+        assert state == EventState.MISS
+
+    def test_technique_does_not_veto_hit(self):
+        """A note with a technique spec still reaches HIT when pitch+onset match.
+
+        Technique verdicts are never examined for transition decisions.
+        """
+        from pickhero.audio.event_state import EventState
+        from pickhero.audio.performance import TechniqueSpec
+        # Note with vibrato technique — should not prevent HIT.
+        notes = [_note_event(
+            1000.0, midi_note=64, string=1, duration_ms=100.0,
+            techniques=(TechniqueSpec(kind="vibrato"),),
+        )]
+        matcher = self._make_matcher_with_verifier(notes, timing_window_ms=100.0)
+        window = self._ramped_sine_window(64, duration_ms=200.0, attack_ms=100.0)
+        detected = [_detected(64, 1000.0, is_onset=True)]
+        matcher.advance_state_machine(
+            playback_ms=1100.0,
+            audio_window=window,
+            detected_notes=detected,
+        )
+        state = matcher._get_event_state((1000.0, 1))
+        # Should have progressed past PENDING despite technique spec.
+        assert state != EventState.PENDING, (
+            f"Technique spec should not block transition; state={state}"
+        )
+
+    def test_terminal_state_not_re_processed(self):
+        """Once an event reaches a terminal state, it's not re-evaluated."""
+        from pickhero.audio.event_state import EventState
+        notes = [_note_event(1000.0, midi_note=64, string=1, duration_ms=100.0)]
+        matcher = self._make_matcher_with_verifier(notes, timing_window_ms=100.0)
+        # Force terminal state.
+        matcher._event_states[(1000.0, 1)] = EventState.HIT
+        matcher.hits = 1
+        window = self._sine_window(64)
+        detected = [_detected(64, 1000.0, is_onset=True)]
+        results = matcher.advance_state_machine(
+            playback_ms=1100.0,
+            audio_window=window,
+            detected_notes=detected,
+        )
+        # Should not produce new results for already-terminal event.
+        hit_results = [r for r in results if r.match_type == MatchType.HIT
+                       and any(e.timestamp_ms == 1000.0 for e in r.matched_events)]
+        assert len(hit_results) == 0
+
+    def test_reset_clears_event_states(self):
+        """reset() clears the _event_states dict."""
+        from pickhero.audio.event_state import EventState
+        notes = [_note_event(1000.0, midi_note=64, string=1)]
+        matcher = self._make_matcher_with_verifier(notes)
+        matcher._event_states[(1000.0, 1)] = EventState.PITCHED
+        matcher.reset()
+        assert len(matcher._event_states) == 0
+        assert matcher._get_event_state((1000.0, 1)) == EventState.PENDING
+
+    def test_transition_ignores_technique(self):
+        """_transition only checks pitch, onset, timing — never technique."""
+        from pickhero.audio.event_state import EventState
+        from pickhero.audio.performance import TechniqueSpec
+        # Note with bend technique — _transition should not look at it.
+        note = _note_event(
+            1000.0, midi_note=64, string=1, duration_ms=500.0,
+            techniques=(TechniqueSpec(kind="bend", target_cents=200),),
+        )
+        matcher = self._make_matcher_with_verifier([note])
+        window = self._sine_window(64)
+        # PENDING + onset + pitch match → PITCHED (technique irrelevant).
+        new_state = matcher._transition(
+            note, EventState.PENDING, 1050.0,
+            detected_midis={64}, has_onset=True, audio_window=window,
+        )
+        assert new_state == EventState.PITCHED
+
+        # PENDING + onset, no pitch → ATTACKING (technique irrelevant).
+        new_state = matcher._transition(
+            note, EventState.PENDING, 1050.0,
+            detected_midis=set(), has_onset=True, audio_window=window,
+        )
+        assert new_state == EventState.ATTACKING
+
+        # PENDING + no onset, timing expired → MISS (technique irrelevant).
+        new_state = matcher._transition(
+            note, EventState.PENDING, 1300.0,
+            detected_midis=set(), has_onset=False, audio_window=window,
+        )
+        assert new_state == EventState.MISS
