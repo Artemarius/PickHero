@@ -32,8 +32,8 @@ class AudioConfig:
     onset_threshold: float = 0.3
     noise_gate_db: float = -60.0  # ignore signals below this dB level
     latency_mode: str = "medium"  # "low", "medium", "high"
-    profile: str = "portable"  # "portable", "high_accuracy", "experimental_ml"
-    ml_model_path: str = ""  # path to ONNX model for ExperimentalML profile (empty = default)
+    profile: str = "portable"  # "portable", "high_accuracy"
+    ml_model_path: str = ""  # path to ONNX model for optional ML assist (empty = disabled)
 
 
 @dataclass
@@ -84,6 +84,12 @@ JOSE_HIGH_ACCURACY_PRESET = {
     "tone_profile_required": True,
     "offline_deep_analysis": True,
 }
+
+
+# Inactive preset fields (informational only — behavior not implemented):
+# - multi_label_techniques: True     — not implemented
+# - after_take_analyzer: True        — not implemented
+# - tone_profile_required: True       — not implemented
 
 
 def apply_preset(config: Config, preset_name: str) -> None:

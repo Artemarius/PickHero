@@ -1635,14 +1635,15 @@ class PlayingScreen:
             # when the preset requests it.
             if getattr(self._config, "offline_deep_analysis", False):
                 self._audio_capture.start_take_recording()
-            from pickhero.audio.verifier_composite import CompositeVerifier
+            chord_fft = getattr(self._config, 'preset_flags', {}).get('chord_fft_size', 8192)
             verifier = CompositeVerifier(
                 sample_rate=self._audio_capture.detector.sample_rate,
+                fft_size=chord_fft,
             )
             self._matcher = NoteMatcher(
                 self._timeline,
                 timing_window_ms=self._config.timing_window_ms,
-                audio_offset_ms=0.0,
+                audio_offset_ms=self._config.audio_latency_offset_ms,
                 chord_threshold_ms=self._config.chord_threshold_ms,
                 note_filter=self._note_passes_filter if self._is_filter_active() else None,
                 mode=self._match_mode,

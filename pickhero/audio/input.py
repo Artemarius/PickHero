@@ -304,6 +304,9 @@ class AudioCapture:
         """
         self._tab_expected_midi = expected_midi
         self._tab_context_ms = current_ms
+        # Feed the pitch engine with the expected notes as a prior
+        if self._engine is not None:
+            self._engine.set_tab_prior(set(expected_midi))
 
     def set_match_mode(self, mode: MatchMode | str) -> None:
         """Update the matching mode mid-session (e.g. UI mode toggle).
@@ -446,6 +449,8 @@ class AudioCapture:
             except AttributeError:
                 # Older sounddevice without WasapiSettings — shared mode only.
                 pass
+        _latency_map = {'low': 'low', 'medium': 'low', 'high': 'high'}
+        requested_latency = _latency_map.get(ac.latency_mode, 'low')
         try:
             self._stream = sd.InputStream(
                 device=resolved,
@@ -453,18 +458,19 @@ class AudioCapture:
                 samplerate=ac.sample_rate,
                 blocksize=ac.hop_size,
                 dtype="float32",
-                latency='low',
+                latency=requested_latency,
                 extra_settings=extra,
                 callback=self._audio_callback,
             )
         except sd.PortAudioError:
-            # Device doesn't support latency='low' — retry with default latency
+            # Device doesn't support requested latency — retry with default latency
             self._stream = sd.InputStream(
                 device=resolved,
                 channels=1,
                 samplerate=ac.sample_rate,
                 blocksize=ac.hop_size,
                 dtype="float32",
+                latency=requested_latency,
                 extra_settings=extra,
                 callback=self._audio_callback,
             )
