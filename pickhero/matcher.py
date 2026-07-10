@@ -746,13 +746,13 @@ class NoteMatcher:
             judge_ms + timing_window,
         )
 
-        # Build set of detected MIDI notes for pitch matching (single notes)
+        # Build set of detected MIDI notes for pitch matching
         detected_midis = {d.note.midi_note for d in detected_notes if d.note.midi_note is not None}
         has_onset = any(d.note.is_onset for d in detected_notes)
 
-        # Group candidates by timestamp for chord vs. single-note handling
+        # Identify chord groups (≥2 notes at same timestamp) for FFT evidence.
         chord_groups: dict[float, list[NoteEvent]] = {}
-        single_notes: list[NoteEvent] = []
+        all_candidates: list[NoteEvent] = []
         for note in candidates:
             if self._is_filtered(note):
                 continue
@@ -760,18 +760,31 @@ class NoteMatcher:
                 EventState.HIT, EventState.PARTIAL, EventState.MISS
             ):
                 continue
+            all_candidates.append(note)
             ts = round(note.timestamp_ms, 0)
             chord_groups.setdefault(ts, []).append(note)
-        for group in chord_groups.values():
-            if len(group) == 1:
-                single_notes.extend(group)
 
-        # Process single notes via pitch-based state machine
-        for note in single_notes:
+        # Feed chord detector evidence into detected_midis for chord groups.
+        # This catches voices that YIN missed, without immediately classifying
+        # absent notes — the per-note state machine handles timing windows uniformly.
+        if chord_detector is not None and hasattr(chord_detector, 'verify_chord_with_onset'):
+            for ts, group in chord_groups.items():
+                if len(group) < 2:
+                    continue
+                expected_midis = [n.midi_note for n in group]
+                present = chord_detector.verify_chord_with_onset(expected_midis, has_onset)
+                for i, note in enumerate(group):
+                    if present[i] and note.midi_note not in detected_midis:
+                        detected_midis.add(note.midi_note)
+
+        # Process all candidates through the per-note state machine.
+        # Every note follows PENDING→ATTACKING→PITCHED→RELEASED→HIT/MISS.
+        # Chord-group notes get augmented pitch evidence from the above FFT
+        # feed, but the same timing-policy applies to all notes uniformly.
+        for note in all_candidates:
             event_key = (note.timestamp_ms, note.string)
             if event_key not in self._event_states:
                 self._event_states[event_key] = EventState.PENDING
-
             current = self._event_states[event_key]
             new_state = self._transition(
                 note, current, playback_ms, detected_midis,
@@ -791,65 +804,6 @@ class NoteMatcher:
                         match_type=match_type,
                         matched_events=[note],
                     ))
-
-        # Process chord groups (≥2 notes at same timestamp) via FFT chord verification
-        for ts, group in chord_groups.items():
-            if len(group) < 2:
-                continue
-            pending = [n for n in group if self._get_event_state((n.timestamp_ms, n.string))
-                       not in (EventState.HIT, EventState.PARTIAL, EventState.MISS)]
-            if not pending:
-                continue
-            expected_midis = [n.midi_note for n in pending]
-            present: list[bool] | None = None
-            if chord_detector is not None and hasattr(chord_detector, 'verify_chord_with_onset'):
-                present = chord_detector.verify_chord_with_onset(expected_midis, has_onset)
-            if present is None:
-                # Fall back to detected_midis for each note
-                present = [n.midi_note in detected_midis for n in pending]
-
-            all_present = all(present)
-            any_present = any(present)
-
-            if all_present:
-                # All notes hit — HIT all pending notes in the group
-                matched = []
-                for i, note in enumerate(pending):
-                    self._event_states[(note.timestamp_ms, note.string)] = EventState.HIT
-                    self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
-                    self._record_match(note, MatchType.HIT)
-                    matched.append(note)
-                results.append(MatchResult(
-                    match_type=MatchType.HIT,
-                    matched_events=matched,
-                ))
-            elif any_present:
-                # Partial chord — PARTIAL for the group, HIT for matched notes
-                matched = []
-                for i, note in enumerate(pending):
-                    if present[i]:
-                        self._event_states[(note.timestamp_ms, note.string)] = EventState.PARTIAL
-                        self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
-                        self._record_match(note, MatchType.CLOSE)
-                        matched.append(note)
-                    else:
-                        self._event_states[(note.timestamp_ms, note.string)] = EventState.MISS
-                        self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
-                        self._record_match(note, MatchType.MISS)
-                results.append(MatchResult(
-                    match_type=MatchType.CLOSE,
-                    matched_events=matched,
-                ))
-            else:
-                # No notes detected — MISS all
-                for note in pending:
-                    self._event_states[(note.timestamp_ms, note.string)] = EventState.MISS
-                    self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
-                    self._record_match(note, MatchType.MISS)
-                results.append(MatchResult(
-                    match_type=MatchType.MISS,
-                    matched_events=[],
-                ))
 
         # Miss-expire events whose timing window has passed
         for key, state in list(self._event_states.items()):
