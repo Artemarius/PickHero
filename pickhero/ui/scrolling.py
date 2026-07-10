@@ -14,7 +14,8 @@ import pygame
 
 from pickhero.audio.midi_playback import BackingTrack, MidiPlayer
 from pickhero.config import Config
-from pickhero.matcher import NoteMatcher, MatchMode, _coerce_match_mode
+from pickhero.matcher import NoteMatcher
+from pickhero.audio.match_mode import MatchMode, _coerce_match_mode
 from pickhero.progress import ProgressTracker
 from pickhero.tabs.timeline import NoteEvent, Timeline
 from pickhero.audio.note_utils import freq_to_cents_deviation, midi_to_name
@@ -253,6 +254,10 @@ class PlayingScreen:
             # Only start audio capture when past count-in
             if self._audio_enabled and self._playback_ms >= 0:
                 self._start_audio()
+                if self._audio_capture is not None:
+                    self._audio_capture.clock.set_segment(
+                        self._playback_ms, 0.0, self._tempo_factor
+                    )
             if self._midi_player is not None:
                 if self._playback_ms >= 0:
                     self._midi_player.seek(self._playback_ms)
@@ -274,6 +279,11 @@ class PlayingScreen:
         if self._audio_enabled and self._playing:
             self._stop_audio()
             self._start_audio()
+            if self._audio_capture is not None:
+                stream_ms = self._audio_capture.stream_time_ms()
+                self._audio_capture.clock.set_segment(
+                    self._playback_ms, stream_ms, self._tempo_factor
+                )
 
     def is_playing(self) -> bool:
         return self._playing
@@ -286,6 +296,11 @@ class PlayingScreen:
         self._config.tempo_factor = factor
         if self._matcher:
             self._matcher.reset()
+        if self._audio_capture is not None:
+            stream_ms = self._audio_capture.stream_time_ms()
+            self._audio_capture.clock.set_segment(
+                self._playback_ms, stream_ms, self._tempo_factor
+            )
         self._feedback.reset()
 
     def set_noise_gate_db(self, db: float) -> None:
@@ -352,15 +367,28 @@ class PlayingScreen:
         if (self._wait_mode and self._audio_enabled
                 and self._playback_ms >= 0 and self._matcher is not None):
             if self._matcher.has_pending_notes_at(self._playback_ms):
-                self._playback_ms = prev_ms
-                self._last_tick = now
-                self._wait_mode_frozen = True
-                if self._midi_player is not None and not self._backing_muted:
-                    self._midi_player.pause()
+                if not self._wait_mode_frozen:
+                    # First freeze frame: pin song position and add clock segment
+                    self._playback_ms = prev_ms
+                    self._last_tick = now
+                    self._wait_mode_frozen = True
+                    if self._midi_player is not None and not self._backing_muted:
+                        self._midi_player.pause()
+                    if self._audio_capture is not None:
+                        stream_ms = self._audio_capture.stream_time_ms()
+                        self._audio_capture.clock.set_segment(
+                            self._playback_ms, stream_ms, 0.0  # tempo=0: stream advances, song frozen
+                        )
+                # else: already frozen — don't add another segment, don't modify playback_ms
             elif self._wait_mode_frozen:
                 self._wait_mode_frozen = False
                 if self._midi_player is not None and not self._backing_muted:
                     self._midi_player.seek(self._playback_ms)
+                if self._audio_capture is not None:
+                    stream_ms = self._audio_capture.stream_time_ms()
+                    self._audio_capture.clock.set_segment(
+                        self._playback_ms, stream_ms, self._tempo_factor
+                    )
 
         # Count-in: play metronome clicks and start audio/midi when crossing 0
         if prev_ms < 0:
@@ -395,15 +423,38 @@ class PlayingScreen:
             self._audio_capture.set_tab_context(expected_midi, self._playback_ms)
             detected = self._audio_capture.get_notes()
             for d in detected:
-                d.timestamp_ms *= self._tempo_factor
+                d.timestamp_ms = self._audio_capture.clock.stream_to_song_ms(d.timestamp_ms)
+            # Extract a raw audio window for expected-event verification.
+            # We deliberately delay judgment by one timing window so the full
+            # tolerable audio range is already captured. The window covers from
+            # two timing windows before the judgment point up to the current
+            # playback position, ensuring we never request future samples.
+            timing_window_ms = self._config.timing_window_ms
+            judge_ms = self._playback_ms - timing_window_ms
+            window_start_song_ms = judge_ms - timing_window_ms - 50.0
+            window_end_song_ms = self._playback_ms
+            clock = self._audio_capture.clock
+            window_start_stream_ms = clock.song_to_stream_ms(window_start_song_ms)
+            window_end_stream_ms = clock.song_to_stream_ms(window_end_song_ms)
+            audio_window = self._audio_capture.get_window_between(
+                window_start_stream_ms, window_end_stream_ms
+            )
+            # Verifier-driven hit-zone scoring: verify pending chart events
+            # against the raw audio window every frame, independent of YIN.
+            hit_zone_results = self._matcher.verify_hit_zone(
+                self._playback_ms, audio_window, window_start_song_ms
+            )
             # While frozen in wait mode, pin detected timestamps to the frozen
             # playback position so matching hits the notes at the hit zone,
             # not future notes that drift ahead as real time passes.
             if self._wait_mode_frozen and detected:
-                pinned_ts = self._playback_ms - self._matcher.audio_offset_ms
+                pinned_ts = self._playback_ms  # already in song time
                 for d in detected:
                     d.timestamp_ms = pinned_ts
-            results = self._matcher.process_detected_notes(detected, self._playback_ms)
+            results = list(hit_zone_results)
+            results.extend(self._matcher.process_detected_notes(
+                detected, self._playback_ms, audio_window=audio_window
+            ))
             # Check if any detected note has an onset — used to gate FFT
             # chord verification (fresh analysis on new strikes, cached
             # result during sustain to avoid flutter).
@@ -415,6 +466,7 @@ class PlayingScreen:
                     self._playback_ms,
                     self._audio_capture.chord_detector,
                     has_onset,
+                    audio_window=audio_window,
                 ))
             self._feedback.add_results(results, self._playback_ms)
 
@@ -470,6 +522,11 @@ class PlayingScreen:
             if self._audio_enabled and self._playing:
                 self._stop_audio()
                 self._start_audio()
+                if self._audio_capture is not None:
+                    stream_ms = self._audio_capture.stream_time_ms()
+                    self._audio_capture.clock.set_segment(
+                        self._loop_start_ms, stream_ms, self._tempo_factor
+                    )
 
             # Guided practice auto-progression
             if self._guided_practice and self._matcher is not None:
@@ -1357,6 +1414,8 @@ class PlayingScreen:
             self._last_obs_count = 0
         if self._matcher:
             self._matcher.match_mode = self._match_mode
+        if self._audio_capture is not None:
+            self._audio_capture.set_match_mode(self._match_mode)
 
     def _toggle_guided_practice(self) -> None:
         """Toggle guided practice mode on/off."""
@@ -1569,17 +1628,25 @@ class PlayingScreen:
             if self._audio_capture is None:
                 self._audio_capture = AudioCapture(self._config)
             self._audio_capture.start()
+            self._audio_capture.clock.set_segment(
+                self._playback_ms, 0.0, self._tempo_factor
+            )
             # Patch 6b/d: arm raw-take recording for offline polyphonic analysis
             # when the preset requests it.
             if getattr(self._config, "offline_deep_analysis", False):
                 self._audio_capture.start_take_recording()
+            from pickhero.audio.verifier_composite import CompositeVerifier
+            verifier = CompositeVerifier(
+                sample_rate=self._audio_capture.detector.sample_rate,
+            )
             self._matcher = NoteMatcher(
                 self._timeline,
                 timing_window_ms=self._config.timing_window_ms,
-                audio_offset_ms=self._playback_ms + self._config.audio_latency_offset_ms,
+                audio_offset_ms=0.0,
                 chord_threshold_ms=self._config.chord_threshold_ms,
                 note_filter=self._note_passes_filter if self._is_filter_active() else None,
                 mode=self._match_mode,
+                verifier=verifier,
             )
             if self._timing_judge and self._timing_overlay is None:
                 self._timing_overlay = TimingOverlay()
