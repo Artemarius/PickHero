@@ -104,6 +104,7 @@ class AudioCapture:
         self._ring_write_pos: int = 0  # absolute sample position (producer only)
         self._ring_sample_rate: int = ac.sample_rate
         self._ring_snapshot_lock: threading.Lock = threading.Lock()
+        self._ring_read_pos: int = 0  # last consumed position (updated by get_window_between)
         self._ring_overrun: bool = False
         self._ring_xrun_count: int = 0
         self.clock = StreamClock()
@@ -170,9 +171,9 @@ class AudioCapture:
                 self._audio_ring[:end - ring_len] = chunk[first:]
             pos += n
         self._ring_write_pos = pos
-
-        # Overrun detection (best-effort)
-        if pos > ring_len and pos - ring_len > self._ring_xrun_count:
+        # Overrun detection: producer lapped consumer if write has passed
+        # the ring length beyond where the consumer last read.
+        if pos - self._ring_read_pos > ring_len:
             if not self._ring_overrun:
                 self._ring_overrun = True
             self._ring_xrun_count += 1
@@ -425,6 +426,7 @@ class AudioCapture:
             self._ring_sample_rate = ac.sample_rate
             self._ring_overrun = False
             self._ring_xrun_count = 0
+            self._ring_read_pos = 0
         # Drain any leftover notes
         while not self.note_queue.empty():
             try:
@@ -591,6 +593,7 @@ class AudioCapture:
             sample_idx = start_sample + i
             ring_idx = sample_idx % ring_len
             window[i] = ring_copy[ring_idx]
+        self._ring_read_pos = snap_pos
         return window
 
     def get_window_between(
@@ -631,6 +634,7 @@ class AudioCapture:
         window = np.zeros(total, dtype=np.float32)
         for i in range(total):
             window[i] = ring_copy[(start_sample + i) % ring_len]
+        self._ring_read_pos = snap_pos
         return window
 
 
