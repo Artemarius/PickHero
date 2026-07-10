@@ -1067,3 +1067,17 @@ class TestStateMachine:
         assert matcher._get_event_state((1000.0, 2)) == EventState.ATTACKING, (
             "E3 still ATTACKING (3× window = 600 > 400 elapsed)"
         )
+        # Frame 3: both notes outside candidate window. Safety net fires:
+        # E3 ATTACKING: 1700-1000=700 > 3×200=600 → MISS via safety net
+        # C3 PITCHED: 1700 < 1000+4×200=1800 → stays PITCHED (not yet expired by safety net)
+        results = matcher.advance_state_machine(
+            playback_ms=1700.0,
+            audio_window=audio,
+            detected_notes=detected,
+        )
+        assert matcher._get_event_state((1000.0, 1)) == EventState.HIT, "C3 still HIT from frame 2"
+        assert matcher._get_event_state((1000.0, 2)) == EventState.MISS, (
+            "E3 should be MISS (ATTACKING expired at 3×200=600ms)"
+        )
+        miss_results = [r for r in results if r.match_type == MatchType.MISS]
+        assert len(miss_results) >= 1, "Expected at least one MISS from E3 expiry"

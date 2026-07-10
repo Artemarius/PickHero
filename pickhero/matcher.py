@@ -805,22 +805,47 @@ class NoteMatcher:
                         matched_events=[note],
                     ))
 
-        # Miss-expire events whose timing window has passed
+        # Miss-expire any event whose timing window has passed
+        # without reaching a terminal state (handles frame drops, seeks,
+        # and notes that fell outside the candidate window).
         for key, state in list(self._event_states.items()):
-            if state == EventState.PENDING:
-                ts, string = key
-                if playback_ms - ts > timing_window * 2:
-                    self._event_states[key] = EventState.MISS
+            if state in (EventState.HIT, EventState.PARTIAL, EventState.MISS):
+                continue
+            ts, string = key
+            if state == EventState.PENDING and playback_ms - ts > timing_window * 2:
+                self._event_states[key] = EventState.MISS
+                self._record_match(
+                    NoteEvent(timestamp_ms=ts, string=string, midi_note=0,
+                              duration_ms=0, measure=0, fret=0, techniques=()),
+                    MatchType.MISS,
+                )
+                results.append(MatchResult(match_type=MatchType.MISS, matched_events=[]))
+            elif state == EventState.ATTACKING and playback_ms - ts > timing_window * 3:
+                self._event_states[key] = EventState.MISS
+                self._record_match(
+                    NoteEvent(timestamp_ms=ts, string=string, midi_note=0,
+                              duration_ms=0, measure=0, fret=0, techniques=()),
+                    MatchType.MISS,
+                )
+                results.append(MatchResult(match_type=MatchType.MISS, matched_events=[]))
+            elif state == EventState.PITCHED:
+                # Look up the actual note duration from the timeline.
+                notes_at_ts = self._timeline.get_notes_in_range(ts - 1, ts + 1)
+                actual_duration = 0.0
+                for n in notes_at_ts:
+                    if n.string == string and abs(n.timestamp_ms - ts) < 1:
+                        actual_duration = n.duration_ms
+                        break
+                if actual_duration > 0 and playback_ms > ts + actual_duration + timing_window:
+                    # PITCHED note duration expired but _transition didn't catch it
+                    # (e.g., candidate window shifted past the note).
+                    self._event_states[key] = EventState.PARTIAL
                     self._record_match(
                         NoteEvent(timestamp_ms=ts, string=string, midi_note=0,
                                   duration_ms=0, measure=0, fret=0, techniques=()),
-                        MatchType.MISS,
+                        MatchType.CLOSE,
                     )
-                    results.append(MatchResult(
-                        match_type=MatchType.MISS,
-                        matched_events=[],
-                    ))
-
+                    results.append(MatchResult(match_type=MatchType.CLOSE, matched_events=[]))
         return results
 
     def _transition(
