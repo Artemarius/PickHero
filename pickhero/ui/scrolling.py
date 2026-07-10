@@ -453,6 +453,10 @@ class PlayingScreen:
                 playback_ms=self._playback_ms,
                 audio_window=audio_window,
                 detected_notes=detected,
+                chord_detector=self._audio_capture.chord_detector if (
+                    self._audio_capture is not None
+                    and self._audio_capture.chord_detector is not None
+                ) else None,
             ))
             has_onset = any(d.note.is_onset for d in detected) if detected else False
             self._feedback.add_results(results, self._playback_ms)

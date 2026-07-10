@@ -718,12 +718,18 @@ class NoteMatcher:
         playback_ms: float,
         audio_window: np.ndarray | None,
         detected_notes: list[TimestampedNote],
+        chord_detector=None,
     ) -> list[MatchResult]:
         """Advance the event state machine with this frame's evidence.
 
         Processes pending events through PENDING→ATTACKING→PITCHED→RELEASED→HIT/MISS
         transitions. Technique evidence is attached as metadata only — it never
         blocks or redirects a transition.
+
+        When ``chord_detector`` is provided and multiple notes share a timestamp
+        (chord group), FFT-based chord verification is used for pitch matching
+        instead of individual YIN-detected MIDI notes. This ensures missed chord
+        voices are caught.
 
         Returns terminal-state results (HIT, PARTIAL, MISS) that were reached
         this frame.
@@ -740,50 +746,110 @@ class NoteMatcher:
             judge_ms + timing_window,
         )
 
-        # Build set of detected MIDI notes for pitch matching
+        # Build set of detected MIDI notes for pitch matching (single notes)
         detected_midis = {d.note.midi_note for d in detected_notes if d.note.midi_note is not None}
         has_onset = any(d.note.is_onset for d in detected_notes)
 
+        # Group candidates by timestamp for chord vs. single-note handling
+        chord_groups: dict[float, list[NoteEvent]] = {}
+        single_notes: list[NoteEvent] = []
         for note in candidates:
             if self._is_filtered(note):
                 continue
-            event_key = (note.timestamp_ms, note.string)
+            if self._get_event_state((note.timestamp_ms, note.string)) in (
+                EventState.HIT, EventState.PARTIAL, EventState.MISS
+            ):
+                continue
+            ts = round(note.timestamp_ms, 0)
+            chord_groups.setdefault(ts, []).append(note)
+        for group in chord_groups.values():
+            if len(group) == 1:
+                single_notes.extend(group)
 
-            # Get or create event state
+        # Process single notes via pitch-based state machine
+        for note in single_notes:
+            event_key = (note.timestamp_ms, note.string)
             if event_key not in self._event_states:
                 self._event_states[event_key] = EventState.PENDING
 
             current = self._event_states[event_key]
-            if current in (EventState.HIT, EventState.PARTIAL, EventState.MISS):
-                continue  # terminal — already resolved
-
             new_state = self._transition(
                 note, current, playback_ms, detected_midis,
                 has_onset, audio_window,
             )
-
             if new_state != current:
                 self._event_states[event_key] = new_state
                 if new_state in (EventState.HIT, EventState.PARTIAL, EventState.MISS):
                     self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
-                    if new_state == EventState.HIT:
-                        self._record_match(note, MatchType.HIT)
-                        results.append(MatchResult(
-                            match_type=MatchType.HIT,
-                            matched_events=[note],
-                        ))
-                    elif new_state == EventState.PARTIAL:
+                    match_type = {
+                        EventState.HIT: MatchType.HIT,
+                        EventState.PARTIAL: MatchType.CLOSE,
+                        EventState.MISS: MatchType.MISS,
+                    }[new_state]
+                    self._record_match(note, match_type)
+                    results.append(MatchResult(
+                        match_type=match_type,
+                        matched_events=[note],
+                    ))
+
+        # Process chord groups (≥2 notes at same timestamp) via FFT chord verification
+        for ts, group in chord_groups.items():
+            if len(group) < 2:
+                continue
+            pending = [n for n in group if self._get_event_state((n.timestamp_ms, n.string))
+                       not in (EventState.HIT, EventState.PARTIAL, EventState.MISS)]
+            if not pending:
+                continue
+            expected_midis = [n.midi_note for n in pending]
+            present: list[bool] | None = None
+            if chord_detector is not None and hasattr(chord_detector, 'verify_chord_with_onset'):
+                present = chord_detector.verify_chord_with_onset(expected_midis, has_onset)
+            if present is None:
+                # Fall back to detected_midis for each note
+                present = [n.midi_note in detected_midis for n in pending]
+
+            all_present = all(present)
+            any_present = any(present)
+
+            if all_present:
+                # All notes hit — HIT all pending notes in the group
+                matched = []
+                for i, note in enumerate(pending):
+                    self._event_states[(note.timestamp_ms, note.string)] = EventState.HIT
+                    self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
+                    self._record_match(note, MatchType.HIT)
+                    matched.append(note)
+                results.append(MatchResult(
+                    match_type=MatchType.HIT,
+                    matched_events=matched,
+                ))
+            elif any_present:
+                # Partial chord — PARTIAL for the group, HIT for matched notes
+                matched = []
+                for i, note in enumerate(pending):
+                    if present[i]:
+                        self._event_states[(note.timestamp_ms, note.string)] = EventState.PARTIAL
+                        self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
                         self._record_match(note, MatchType.CLOSE)
-                        results.append(MatchResult(
-                            match_type=MatchType.CLOSE,
-                            matched_events=[note],
-                        ))
-                    else:  # MISS
+                        matched.append(note)
+                    else:
+                        self._event_states[(note.timestamp_ms, note.string)] = EventState.MISS
+                        self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
                         self._record_match(note, MatchType.MISS)
-                        results.append(MatchResult(
-                            match_type=MatchType.MISS,
-                            matched_events=[note],
-                        ))
+                results.append(MatchResult(
+                    match_type=MatchType.CLOSE,
+                    matched_events=matched,
+                ))
+            else:
+                # No notes detected — MISS all
+                for note in pending:
+                    self._event_states[(note.timestamp_ms, note.string)] = EventState.MISS
+                    self._consumed_event_ids.add(f"{note.timestamp_ms}:{note.string}")
+                    self._record_match(note, MatchType.MISS)
+                results.append(MatchResult(
+                    match_type=MatchType.MISS,
+                    matched_events=[],
+                ))
 
         # Miss-expire events whose timing window has passed
         for key, state in list(self._event_states.items()):
