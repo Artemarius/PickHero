@@ -41,6 +41,10 @@ class SongRecord:
     # Detected tempo where accuracy drops sharply
     cliff_bpm: float | None = None
 
+    # Rocksmith-style phrase mastery / dynamic difficulty state.
+    # Keys are phrase ids serialized as strings; values are PhraseMastery dicts.
+    phrase_mastery: dict[str, dict] = field(default_factory=dict)
+
 
 class ProgressTracker:
     """Loads and saves per-song progress data."""
@@ -146,6 +150,13 @@ class ProgressTracker:
         )
 
         return is_new_best, recommendations
+
+    def update_phrase_mastery(self, song_key: str, phrase_mastery: dict[str, dict]) -> None:
+        """Persist dynamic-difficulty state independently of full-song results."""
+        record = self._data.get(song_key, SongRecord())
+        record.phrase_mastery = dict(phrase_mastery)
+        self._data[song_key] = record
+        self._save()
 
     def get_best(self, song_key: str) -> SongRecord | None:
         """Get best record for a song, or None if never played."""
