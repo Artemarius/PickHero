@@ -20,11 +20,33 @@ class StringCalibration:
     noise_floor_db: float  # noise floor measured before playing
 
 
+
+@dataclass
+class LatencyBreakdown:
+    """Runtime latency breakdown for diagnostics and HUD display.
+
+    All fields are in milliseconds except ``adc_timestamped`` (bool).
+    Populated at runtime by ``AudioCapture.get_latency_breakdown()``.
+    """
+    input_latency_ms: float = 0.0
+    output_latency_ms: float = 0.0
+    detector_window_ms: float = 0.0
+    stabilizer_confirmation_ms: float = 0.0
+    render_display_ms: float = 16.667  # ~60 fps
+    manual_or_loopback_trim_ms: float = 0.0
+    total_latency_ms: float = 0.0
+    adc_timestamped: bool = False
+
+    def to_dict(self) -> dict:
+        """Return as a plain dict for serialisation and backward-compat dict returns."""
+        return asdict(self)
+
 @dataclass
 class AudioConfig:
     """Audio capture and detection settings."""
     device_index: int | None = None  # resolved at runtime
     device_name: str = ""  # preferred device name (resolved to index at runtime)
+    input_channel: int = 0  # zero-based interface input channel
     sample_rate: int = 44100
     buf_size: int = 2048
     hop_size: int = 512
@@ -34,6 +56,8 @@ class AudioConfig:
     latency_mode: str = "medium"  # "low", "medium", "high"
     profile: str = "portable"  # "portable", "high_accuracy"
     ml_model_path: str = ""  # path to ONNX model for optional ML assist (empty = disabled)
+    asio_enabled: bool = False  # use ASIO driver on Windows (instead of WASAPI exclusive)
+    asio_buffer_size: int = 0   # ASIO buffer size in frames (0 = driver default)
 
 
 @dataclass
@@ -68,9 +92,7 @@ LATENCY_PRESETS = {
 
 
 # Jose High Accuracy Coach preset — maximal detection + judge fidelity.
-# Applies to the Config in place via apply_preset(). Fields that don't exist on
-# Config yet (multi_label_techniques, after_take_analyzer, tone_profile_required)
-# are informational flags; the behavior is already enabled by the Patch 1-5 code.
+# Applies to the Config in place via apply_preset().
 JOSE_HIGH_ACCURACY_PRESET = {
     "profile": "high_accuracy",
     "match_mode": "judge",
@@ -79,17 +101,13 @@ JOSE_HIGH_ACCURACY_PRESET = {
     "buf_size": 4096,
     "chord_fft_size": 16384,
     "strict_chord_verification": True,
-    "multi_label_techniques": True,
-    "after_take_analyzer": True,
-    "tone_profile_required": True,
     "offline_deep_analysis": True,
 }
+# Note: multi_label_techniques, after_take_analyzer, and tone_profile_required
+# were removed from the preset — they referenced unimplemented behavior that
+# masked detector errors. Do not re-add them without implementing the features.
 
 
-# Inactive preset fields (informational only — behavior not implemented):
-# - multi_label_techniques: True     — not implemented
-# - after_take_analyzer: True        — not implemented
-# - tone_profile_required: True       — not implemented
 
 
 def apply_preset(config: Config, preset_name: str) -> None:
@@ -146,12 +164,24 @@ class Config:
     tempo_factor: float = 1.0
     timing_window_ms: float = 100.0
     audio_latency_offset_ms: float = 0.0
+    # Device/rate/buffer-specific calibration trims. A global offset cannot be
+    # reused safely after changing interface, sample rate or latency preset.
+    audio_latency_profiles: dict[str, float] = field(default_factory=dict)
+    audio_latency_measurements: dict[str, dict] = field(default_factory=dict)
+    # Last known runtime latency breakdown, populated by
+    # AudioCapture.get_latency_breakdown(). Persisted so overlay/calibration
+    # screens can display it without requiring a running stream.
+    latency_breakdown: dict = field(default_factory=dict)
     chord_threshold_ms: float = 50.0
     backing_track_enabled: bool = True
     count_in_beats: int = 4
     theme: str = "dark"
     max_fret: int = 24
     active_strings: list[bool] = field(default_factory=lambda: [True] * 8)
+    dynamic_difficulty_enabled: bool = True
+    dynamic_difficulty_start_level: int = 3
+    dynamic_difficulty_target_accuracy: float = 88.0
+    adaptive_scoring_enabled: bool = True
     chord_partial_credit: bool = True
     wait_mode: bool = False
     timing_judge_mode: bool = False
@@ -169,6 +199,66 @@ class Config:
     # multi_label_techniques, etc.) for downstream feature-flagging.
     preset_flags: dict = field(default_factory=dict)
     _default_chord_partial_credit: bool = field(default=True, repr=False)
+
+    def audio_latency_profile_key(self) -> str:
+        ac = self.audio
+        device = ac.device_name.strip() or (
+            str(ac.device_index) if ac.device_index is not None else "default"
+        )
+        return "|".join((
+            device,
+            str(max(0, int(ac.input_channel))),
+            str(int(ac.sample_rate)),
+            str(int(ac.hop_size)),
+            ac.latency_mode,
+            ac.profile,
+        ))
+
+    def get_audio_latency_offset(self) -> float:
+        """Return the calibration trim for the current audio configuration."""
+        value = self.audio_latency_profiles.get(self.audio_latency_profile_key())
+        if value is None:
+            value = self.audio_latency_offset_ms
+        return float(value)
+
+    def set_audio_latency_offset(self, value_ms: float) -> None:
+        """Persist latency independently for each device/rate/buffer profile."""
+        value = round(max(-250.0, min(500.0, float(value_ms))), 1)
+        self.audio_latency_offset_ms = value  # legacy/global fallback
+        self.audio_latency_profiles[self.audio_latency_profile_key()] = value
+
+    def set_audio_latency_measurement(self, measurement: dict, *, apply: bool = False) -> None:
+        """Store one automatic loopback measurement for the active profile."""
+        data = dict(measurement)
+        data["delay_ms"] = round(float(data.get("delay_ms", 0.0)), 2)
+        data["confidence"] = round(float(data.get("confidence", 0.0)), 4)
+        self.audio_latency_measurements[self.audio_latency_profile_key()] = data
+        if apply and bool(data.get("accepted", False)):
+            self.set_audio_latency_offset(data["delay_ms"])
+
+    def get_audio_latency_measurement(self) -> dict | None:
+        value = self.audio_latency_measurements.get(self.audio_latency_profile_key())
+        return dict(value) if isinstance(value, dict) else None
+
+    def get_latency_breakdown(self) -> LatencyBreakdown:
+        """Return the last known latency breakdown, or a sensible default.
+
+        When no stream has populated ``latency_breakdown`` yet, computes
+        static values from the current audio config (sample rate, hop size).
+        """
+        data = self.latency_breakdown
+        if data:
+            known = {f.name for f in LatencyBreakdown.__dataclass_fields__.values()}
+            filtered = {k: v for k, v in data.items() if k in known}
+            return LatencyBreakdown(**filtered)
+        # No breakdown recorded yet — compute what we can from config defaults.
+        sr = max(1, int(self.audio.sample_rate))
+        hop = int(self.audio.hop_size)
+        return LatencyBreakdown(
+            stabilizer_confirmation_ms=max(0.0, 2.0 * hop / sr * 1000.0),
+            manual_or_loopback_trim_ms=self.get_audio_latency_offset(),
+            render_display_ms=1000.0 / 60.0,
+        )
 
     def get_string_calibration(self, string: int) -> StringCalibration | None:
         """Return calibration for a string (1-N), or None if not calibrated."""
