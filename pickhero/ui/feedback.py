@@ -56,11 +56,13 @@ class FeedbackRenderer:
                     start_ms=playback_ms,
                 )
 
-            # Update streak
-            if result.match_type == MatchType.HIT:
-                self._streak += 1
-            elif result.match_type in (MatchType.MISS, MatchType.CLOSE):
-                self._streak = 0
+            # Release/sustain updates recolor the authored note but must not
+            # count as a second attack or erase an otherwise valid streak.
+            if result.affects_streak:
+                if result.match_type == MatchType.HIT:
+                    self._streak += 1
+                elif result.match_type in (MatchType.MISS, MatchType.CLOSE):
+                    self._streak = 0
 
     def get_note_color(
         self,

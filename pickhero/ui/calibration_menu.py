@@ -13,6 +13,7 @@ measured reaction time + display + input latency, not audio latency alone.
 from __future__ import annotations
 
 import statistics
+import threading
 import time
 from typing import Callable, TYPE_CHECKING
 
@@ -77,6 +78,9 @@ class CalibrationMenuScreen:
         # Latency nudge UI: optional provider of TimingStats from the last run,
         # used to render a live early/late histogram. None when no run exists.
         self._timing_stats_provider = timing_stats_provider
+        self._latency_thread: threading.Thread | None = None
+        self._latency_result = None
+        self._latency_error: str = ""
 
     @property
     def _string_order(self) -> list[int]:
@@ -124,6 +128,8 @@ class CalibrationMenuScreen:
                 self._nudge_latency(-LATENCY_NUDGE_MS)
             elif event.key == pygame.K_RIGHT:
                 self._nudge_latency(+LATENCY_NUDGE_MS)
+            elif event.key == pygame.K_a:
+                self._begin_auto_latency()
             elif event.key == pygame.K_RETURN:
                 self._state = "intro"
             return None
@@ -295,7 +301,7 @@ class CalibrationMenuScreen:
             # and measured reaction+display+input latency, not audio latency.
             self._render_centered(surface, big_font,
                                   "Latency Offset (manual)", t.hud_accent, cy - 60)
-            current_offset = float(getattr(self._config, 'audio_latency_offset_ms', 0.0))
+            current_offset = self._config.get_audio_latency_offset()
             sign = "+" if current_offset >= 0 else ""
             self._render_centered(surface, body_font,
                                   f"Audio offset: {sign}{current_offset:.0f} ms",
@@ -304,12 +310,33 @@ class CalibrationMenuScreen:
                                   "LEFT: earlier  |  RIGHT: later  (±5 ms per press)",
                                   t.hud_text, cy + 24)
             self._render_centered(surface, hint_font,
-                                  "Negative = audio is ahead  |  Positive = audio is behind",
+                                  "A: automatic loopback probe  |  ENTER: back",
                                   t.hud_text, cy + 48)
+            auto_y = cy + 72
+            if self._latency_thread is not None and self._latency_thread.is_alive():
+                self._render_centered(surface, hint_font,
+                                      "Measuring... keep the output-to-input path connected",
+                                      t.hud_accent, auto_y)
+            elif self._latency_result is not None:
+                result = self._latency_result
+                state = "applied" if result.accepted else "rejected (low confidence)"
+                self._render_centered(
+                    surface, hint_font,
+                    f"Automatic: {result.delay_ms:.1f} ms, confidence {result.confidence:.0%} — {state}",
+                    t.tuner_in_tune if result.accepted else t.feedback_miss, auto_y,
+                )
+            elif self._latency_error:
+                self._render_centered(surface, hint_font,
+                                      f"Automatic calibration failed: {self._latency_error}",
+                                      t.feedback_miss, auto_y)
+            else:
+                self._render_centered(surface, hint_font,
+                                      "Best result: physical loopback cable; acoustic probe is less reliable",
+                                      t.hud_text, auto_y)
 
             # Live early/late histogram from the Timing Judge, when available.
             stats = self._timing_stats_provider() if self._timing_stats_provider else None
-            hist_y = cy + 80
+            hist_y = cy + 104
             if stats is not None and stats.count > 0:
                 self._render_centered(surface, hint_font,
                                       f"Early/late distribution ({stats.count} obs):",
@@ -489,6 +516,36 @@ class CalibrationMenuScreen:
         self._config.active_tone_profile = profile.name
         self._config.save()
 
+    # -- Latency measurement --
+
+    def _begin_auto_latency(self) -> None:
+        """Run a non-blocking output-to-input loopback measurement."""
+        if self._latency_thread is not None and self._latency_thread.is_alive():
+            return
+        self._latency_result = None
+        self._latency_error = ""
+
+        def worker() -> None:
+            try:
+                from pickhero.audio.latency_calibrator import measure_roundtrip_latency
+                ac = self._config.audio
+                input_device = ac.device_name or ac.device_index
+                result = measure_roundtrip_latency(
+                    sample_rate=ac.sample_rate,
+                    input_device=input_device,
+                    input_channel=ac.input_channel,
+                )
+                self._latency_result = result
+                self._config.set_audio_latency_measurement(
+                    result.to_dict(), apply=result.accepted
+                )
+                self._config.save()
+            except Exception as exc:
+                self._latency_error = str(exc)
+
+        self._latency_thread = threading.Thread(target=worker, daemon=True)
+        self._latency_thread.start()
+
     # -- Latency offset nudge (manual) --
 
     def _nudge_latency(self, delta_ms: float) -> None:
@@ -498,8 +555,8 @@ class CalibrationMenuScreen:
         onset ms with absolute perf_counter ms. The offset is now a small
         signed value set by ear using the early/late histogram.
         """
-        current = float(getattr(self._config, 'audio_latency_offset_ms', 0.0))
-        self._config.audio_latency_offset_ms = round(current + delta_ms, 1)
+        current = self._config.get_audio_latency_offset()
+        self._config.set_audio_latency_offset(current + delta_ms)
         self._config.save()
 
     def _draw_histogram(self, surface: pygame.Surface, screen_w: int,
@@ -547,3 +604,5 @@ class CalibrationMenuScreen:
         late_surf = hint_font.render("late", True, t.hud_text)
         surface.blit(early_surf, (start_x - early_surf.get_width() - 6, y + max_h // 2))
         surface.blit(late_surf, (start_x + total_w + 6, y + max_h // 2))
+# Backwards-compatible alias used by some verification scripts.
+CalibrationMenu = CalibrationMenuScreen
