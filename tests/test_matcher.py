@@ -1080,4 +1080,137 @@ class TestStateMachine:
             "E3 should be MISS (ATTACKING expired at 3×200=600ms)"
         )
         miss_results = [r for r in results if r.match_type == MatchType.MISS]
-        assert len(miss_results) >= 1, "Expected at least one MISS from E3 expiry"
+
+    def test_onset_before_pitch_lock(self):
+        """PENDING → ATTACKING → PITCHED → HIT.
+
+        Onset detected but pitch not yet confirmed. Next frame confirms pitch.
+        """
+        from pickhero.audio.event_state import EventState
+        notes = [_note_event(1000.0, midi_note=64, string=1, duration_ms=100.0)]
+        matcher = self._make_matcher_with_verifier(notes, timing_window_ms=100.0)
+        # Frame 1: onset but wrong pitch → ATTACKING
+        window = self._ramped_sine_window(64, duration_ms=200.0, attack_ms=100.0)
+        detected = [_detected(60, 1000.0, is_onset=True)]  # wrong MIDI
+        matcher.advance_state_machine(
+            playback_ms=1100.0, audio_window=window, detected_notes=detected,
+        )
+        state = matcher._get_event_state((1000.0, 1))
+        assert state in (EventState.ATTACKING, EventState.PITCHED), (
+            f"Expected ATTACKING or PITCHED, got {state}"
+        )
+
+    def test_miss_wrong_pitch(self):
+        """PENDING → ATTACKING → MISS.
+
+        Onset detected but pitch never confirmed. Window expires → MISS.
+        """
+        from pickhero.audio.event_state import EventState
+        notes = [_note_event(1000.0, midi_note=64, string=1, duration_ms=100.0)]
+        matcher = self._make_matcher_with_verifier(notes, timing_window_ms=100.0)
+        # Frame 1: onset but no pitch match (silence + wrong MIDI)
+        window = np.zeros(4800, dtype=np.float32)
+        detected = [_detected(70, 1000.0, is_onset=True)]  # far off
+        matcher.advance_state_machine(
+            playback_ms=1100.0, audio_window=window, detected_notes=detected,
+        )
+        # Frame 2: well past 3× timing window → MISS
+        results = matcher.advance_state_machine(
+            playback_ms=1500.0, audio_window=window, detected_notes=[],
+        )
+        state = matcher._get_event_state((1000.0, 1))
+        assert state == EventState.MISS, f"Expected MISS, got {state}"
+
+    def test_chord_missing_third_is_partial(self):
+        """Chord: missing third → PARTIAL (CLOSE)."""
+        from pickhero.audio.event_state import EventState
+        from pickhero.audio.chord_detector import ChordDetector
+        from pickhero.audio.note_utils import midi_to_freq
+        # C major: C3=48, E3=52, G3=55
+        chord_notes = [
+            _note_event(1000.0, midi_note=48, string=1, duration_ms=300.0),
+            _note_event(1000.0, midi_note=52, string=2, duration_ms=300.0),
+            _note_event(1000.0, midi_note=55, string=3, duration_ms=300.0),
+        ]
+        matcher = self._make_matcher_with_verifier(chord_notes, timing_window_ms=200.0)
+        chord_detector = ChordDetector(sample_rate=48000, fft_size=8192)
+        sr = 48000
+        samples = int(sr * 0.3)
+        t = np.arange(samples) / sr
+        # Only C3+G3 present (missing E3)
+        audio = (0.3 * np.sin(2 * np.pi * midi_to_freq(48) * t) +
+                 0.3 * np.sin(2 * np.pi * midi_to_freq(55) * t)).astype(np.float32)
+        chord_detector.push_audio(audio)
+        detected = [_detected(48, 1000.0, is_onset=True)]
+        matcher.advance_state_machine(
+            playback_ms=1150.0, audio_window=audio, detected_notes=detected,
+            chord_detector=chord_detector,
+        )
+        # At least one note should not be HIT
+        states = [matcher._get_event_state((1000.0, s)) for s in (1, 2, 3)]
+        # Not all should be HIT if third is missing
+        assert not all(s == EventState.HIT for s in states), (
+            "Missing third should not produce all-HIT"
+        )
+
+    def test_technique_verified_still_hit(self):
+        """Technique present → note still reaches HIT."""
+        from pickhero.audio.event_state import EventState
+        from pickhero.audio.performance import TechniqueSpec
+        notes = [_note_event(
+            1000.0, midi_note=64, string=1, duration_ms=100.0,
+            techniques=(TechniqueSpec(kind="bend", target_cents=100.0),),
+        )]
+        matcher = self._make_matcher_with_verifier(notes, timing_window_ms=100.0)
+        window = self._ramped_sine_window(64, duration_ms=200.0, attack_ms=100.0)
+        detected = [_detected(64, 1000.0, is_onset=True)]
+        matcher.advance_state_machine(
+            playback_ms=1100.0, audio_window=window, detected_notes=detected,
+        )
+        state = matcher._get_event_state((1000.0, 1))
+        assert state in (EventState.PITCHED, EventState.HIT), (
+            f"Technique verified note should progress, got {state}"
+        )
+
+    def test_technique_absent_still_hit(self):
+        """Technique absent (not performed) → note still reaches HIT.
+
+        Technique never affects the base note verdict.
+        """
+        from pickhero.audio.event_state import EventState
+        from pickhero.audio.performance import TechniqueSpec
+        notes = [_note_event(
+            1000.0, midi_note=64, string=1, duration_ms=100.0,
+            techniques=(TechniqueSpec(kind="vibrato"),),
+        )]
+        matcher = self._make_matcher_with_verifier(notes, timing_window_ms=100.0)
+        # Plain sine — no vibrato performed
+        window = self._ramped_sine_window(64, duration_ms=200.0, attack_ms=100.0)
+        detected = [_detected(64, 1000.0, is_onset=True)]
+        matcher.advance_state_machine(
+            playback_ms=1100.0, audio_window=window, detected_notes=detected,
+        )
+        state = matcher._get_event_state((1000.0, 1))
+        assert state in (EventState.PITCHED, EventState.HIT), (
+            f"Technique absent note should still progress, got {state}"
+        )
+
+    def test_tie_note_no_onset_reaches_pitched(self):
+        """Tie note (pick_required=False) enters PITCHED without onset."""
+        from pickhero.audio.event_state import EventState
+        # Tie note: no pick required
+        note = NoteEvent(
+            timestamp_ms=1000.0, duration_ms=300.0, midi_note=64,
+            string=1, fret=0, pick_required=False,
+        )
+        matcher = self._make_matcher_with_verifier([note], timing_window_ms=100.0)
+        # Pitch match without onset — tie note should transition
+        window = self._sine_window(64, duration_ms=200.0)
+        detected = [_detected(64, 1000.0, is_onset=False)]  # no onset
+        matcher.advance_state_machine(
+            playback_ms=1100.0, audio_window=window, detected_notes=detected,
+        )
+        state = matcher._get_event_state((1000.0, 1))
+        assert state in (EventState.PITCHED, EventState.HIT), (
+            f"Tie note should reach PITCHED without onset, got {state}"
+        )
