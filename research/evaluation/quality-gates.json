@@ -1,0 +1,19 @@
+{
+  "description": "Aspirational held-out release gates for Rocksmith-class judgement quality. Do not tune on the test split.",
+  "gates": [
+    {"path": "case_count", "min": 5000},
+    {"path": "overall.event.f1", "min": 0.97},
+    {"path": "overall.event.precision", "min": 0.98},
+    {"path": "overall.event.recall", "min": 0.96},
+    {"path": "overall.event.false_accept_rate", "max": 0.01},
+    {"path": "overall.absolute_onset_error_ms.median", "max": 15.0},
+    {"path": "overall.absolute_onset_error_ms.p95", "max": 35.0},
+    {"path": "overall.absolute_cents_error.median", "max": 15.0},
+    {"path": "overall.technique.count", "min": 500},
+    {"path": "overall.technique.f1", "min": 0.90},
+    {"path": "overall.technique.false_accept_rate", "max": 0.03},
+    {"path": "overall.technique_uncertain_rate", "max": 0.15},
+    {"path": "overall.clipped_cases", "max": 0},
+    {"path": "overall.dc_offset_cases", "max": 0}
+  ]
+}

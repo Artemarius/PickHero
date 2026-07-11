@@ -1,0 +1,16 @@
+<instrumentRecording>
+  <globalParameter>
+    <audioFileName>sample.wav</audioFileName>
+  </globalParameter>
+  <transcription>
+    <event>
+      <pitch>67</pitch>
+      <onsetSec>0.0</onsetSec>
+      <offsetSec>0.2</offsetSec>
+      <fretNumber>12</fretNumber>
+      <stringNumber>1</stringNumber>
+      <excitationStyle>PK</excitationStyle>
+      <expressionStyle>NO</expressionStyle>
+    </event>
+  </transcription>
+</instrumentRecording>
