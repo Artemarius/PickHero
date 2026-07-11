@@ -32,7 +32,6 @@ from pickhero.ui.overlays import (
     CompletionState,
     draw_completion_overlay,
     draw_help_overlay,
-    draw_technique_heatmap,
     draw_timing_summary,
     draw_why_missed,
 )
@@ -918,7 +917,7 @@ class PlayingScreen:
         detected = curve_verdict.metrics.get("detected_cents") or curve_verdict.metrics.get("depth_cents") or 0.0
         scale = max(1.0, abs(target), abs(detected))
         # Draw target (faint) and detected (bright) bars
-        tx = bx + bar_w // 2 + int((target / scale) * (bar_w // 2))
+        bx + bar_w  # compute but unused // 2 + int((target / scale) * (bar_w // 2))
         dx = bx + bar_w // 2 + int((detected / scale) * (bar_w // 2))
         pygame.draw.line(surface, (120, 120, 120), (bx, by), (bx + bar_w, by), 1)
         pygame.draw.line(surface, t.hud_accent, (bx + bar_w // 2, by - 4), (dx, by + 4), 3)

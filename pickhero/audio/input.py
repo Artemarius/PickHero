@@ -448,7 +448,7 @@ class AudioCapture:
                 pass
         return ac.device_index
 
-    
+
     def list_asio_devices(self) -> list[dict]:
         """List available ASIO audio input devices.
 

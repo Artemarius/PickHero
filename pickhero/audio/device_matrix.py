@@ -370,7 +370,6 @@ def validate_device_config(
         )
 
     # Buffer too small for preset
-    preset_buf = MIN_BUF_BY_PRESET.get("low", 1024)
     if buffer_size < 256:
         warnings.append(
             f"Buffer size {buffer_size} is below the minimum supported size "

@@ -14,7 +14,6 @@ from pickhero.audio.input import validate_device_index
 from pickhero.config import Config
 from pickhero.progress import ProgressTracker
 from pickhero.tabs.loader import extract_backing_track, list_tracks, load_gp_file
-from pickhero.ui.colors import set_theme
 from pickhero.ui.calibration_menu import CalibrationMenuScreen
 from pickhero.ui.device_menu import DeviceMenuScreen
 from pickhero.ui.download_menu import DownloadMenuScreen
@@ -94,7 +93,7 @@ class App:
                 return
 
             if event.type == pygame.VIDEORESIZE:
-                surface = pygame.display.set_mode(
+                _ = pygame.display.set_mode(
                     (event.w, event.h), pygame.RESIZABLE | pygame.SCALED, vsync=1
                 )
 

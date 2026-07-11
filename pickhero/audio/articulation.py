@@ -33,7 +33,6 @@ import numpy as np
 
 from pickhero.audio.performance import (
     PerformanceEvent,
-    TechniqueCandidate,
 )
 
 

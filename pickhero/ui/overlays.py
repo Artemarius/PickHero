@@ -15,7 +15,7 @@ import pygame
 from pickhero.ui.colors import STRING_COLORS, get_theme
 
 if TYPE_CHECKING:
-    from pickhero.tabs.timeline import NoteEvent
+    from pickhero.matcher import NoteMatcher
     from pickhero.timing import TimingStats
 
 

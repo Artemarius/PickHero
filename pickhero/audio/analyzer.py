@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING
 
 from pickhero.audio.performance import (
     PerformanceEvent,
-    TechniqueCandidate,
     TechniqueSpec,
     TechniqueVerdict,
 )
@@ -381,7 +380,6 @@ class LegatoJudge(Judge):
             no_pick = 1.0
         # Volume ratio: peak rms of this note vs previous picked note.
         # We don't have the previous event here directly; approximate from energy envelope.
-        peak_rms = max((e[1] for e in event.energy_envelope), default=0.0)
         # Use a proxy if no prior data: assume 0.5 (medium) — graded as ok at best.
         volume_ratio = onset_features.get("hammer_volume_ratio", 0.5)
         # Transition time: from onset_features or default

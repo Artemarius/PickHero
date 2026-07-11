@@ -25,7 +25,7 @@ import numpy as np
 
 from pickhero.audio.detector import PitchDetector, DetectedNote
 from pickhero.audio.log_frequency import MultiResolutionLogSpectrum
-from pickhero.audio.note_utils import freq_to_midi, freq_to_cents_deviation, midi_to_name
+from pickhero.audio.note_utils import freq_to_cents_deviation, midi_to_name
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -606,7 +606,7 @@ class PitchEngine:
             return "other"
 
         def group_score(midi: int, group: list[PitchCandidate]) -> float:
-            best = max(group, key=lambda item: item.confidence)
+
             confidence = max(item.confidence for item in group)
             families = {source_family(item) for item in group}
             agreement = min(0.18, max(0, len(families) - 1) * 0.09)

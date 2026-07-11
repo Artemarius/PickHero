@@ -7,7 +7,7 @@ existing playback clock. No audio files or temp files needed.
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # MIDI status bytes

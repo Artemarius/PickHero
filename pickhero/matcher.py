@@ -11,12 +11,18 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Callable
 
+if TYPE_CHECKING:
+    from pickhero.audio.performance import PerformanceEvent, TechniqueSpec, TechniqueVerdict
+    from pickhero.audio.evidence import ExpectedEventVerifier
+    from pickhero.tabs.timeline import Timeline
+    from pickhero.timing import TimingStats
+
 import numpy as np
 
 from pickhero.audio.match_mode import MatchMode, _coerce_match_mode
 from pickhero.audio.input import TimestampedNote
 from pickhero.audio.note_utils import semitone_distance
-from pickhero.audio.event_state import EventState, ChordRoleVerdict
+from pickhero.audio.event_state import EventState
 from pickhero.tabs.timeline import NoteEvent
 from pickhero.timing import (
     PitchVerdict,
@@ -205,7 +211,6 @@ class NoteMatcher:
 
     def get_timing_stats(self) -> "TimingStats":
         """Compute and return timing statistics from observations."""
-        from pickhero.timing import TimingStats
         return compute_stats(self._timing_observations)
 
     def _note_key(self, event: NoteEvent) -> tuple[float, int]:

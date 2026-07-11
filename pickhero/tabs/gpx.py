@@ -21,7 +21,6 @@ implementations agree on the layout.
 from __future__ import annotations
 
 import struct
-from io import BytesIO
 from pathlib import Path
 
 _BCFS = b"BCFS"

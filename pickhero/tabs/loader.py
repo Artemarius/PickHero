@@ -6,7 +6,6 @@ stdlib xml.etree. Builds note timelines for both formats.
 
 from __future__ import annotations
 
-import json
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -237,10 +236,14 @@ def _harmonic_subtype(ht) -> str:
         return _HARMONIC_SUBTYPES.get(val, "natural")
     if isinstance(val, str):
         low = val.lower()
-        if "pinch" in low: return "pinch"
-        if "artificial" in low: return "artificial"
-        if "tap" in low: return "tapped"
-        if "semi" in low: return "semi"
+        if "pinch" in low:
+            return "pinch"
+        if "artificial" in low:
+            return "artificial"
+        if "tap" in low:
+            return "tapped"
+        if "semi" in low:
+            return "semi"
         return "natural"
     return "natural"
 
@@ -284,13 +287,20 @@ def _slide_subtype(slides) -> str:
         val = getattr(s, "value", s)
         if isinstance(val, str):
             low = val.lower()
-            if "shift" in low: val = 1
-            elif "legato" in low: val = 2
-            elif "outdown" in low or "out_down" in low: val = 3
-            elif "outup" in low or "out_up" in low: val = 4
-            elif "below" in low: val = -1
-            elif "above" in low: val = -2
-            else: continue
+            if "shift" in low:
+                val = 1
+            elif "legato" in low:
+                val = 2
+            elif "outdown" in low or "out_down" in low:
+                val = 3
+            elif "outup" in low or "out_up" in low:
+                val = 4
+            elif "below" in low:
+                val = -1
+            elif "above" in low:
+                val = -2
+            else:
+                continue
         seen.add(val)
     for v in (1, 2, 3, 4, -1, -2):
         if v in seen:
@@ -320,11 +330,16 @@ def _gpif_harmonic_subtype(text: str) -> str:
     low = (text or "").strip().lower()
     if low in _GPIF_HARMONIC_SUBTYPES:
         return _GPIF_HARMONIC_SUBTYPES[low]
-    if "pinch" in low: return "pinch"
-    if "artificial" in low: return "artificial"
-    if "tap" in low: return "tapped"
-    if "feedback" in low: return "feedback"
-    if "semi" in low: return "semi"
+    if "pinch" in low:
+        return "pinch"
+    if "artificial" in low:
+        return "artificial"
+    if "tap" in low:
+        return "tapped"
+    if "feedback" in low:
+        return "feedback"
+    if "semi" in low:
+        return "semi"
     return "natural"
 
 

@@ -253,7 +253,6 @@ def measure_roundtrip_latency(
         )
 
     click, output = _build_click(sample_rate)
-    click_samples = len(click)
     record_duration_ms = len(output) * 1000.0 / sample_rate
 
     # --- Single playrec shared by both electrical and acoustic paths ---
