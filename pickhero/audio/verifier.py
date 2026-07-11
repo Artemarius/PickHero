@@ -90,7 +90,7 @@ class ExpectedEventVerifier(ABC):
         expected = set(expected_midi)
         if len(expected) == 1:
             midi = next(iter(expected))
-            verified = self.verify_single_note(
+            verified: NoteVerification | ChordVerification = self.verify_single_note(
                 audio_window, midi, mode,
                 expected_onset_offset_ms=expected_onset_offset_ms,
                 onset_tolerance_ms=onset_tolerance_ms,

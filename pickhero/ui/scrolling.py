@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import pygame
 
@@ -35,7 +35,10 @@ from pickhero.ui.overlays import (
     draw_timing_summary,
     draw_why_missed,
 )
-from pickhero.timing import TimingVerdict
+from pickhero.timing import TimingStats, TimingVerdict
+
+if TYPE_CHECKING:
+    from pickhero.audio.input import AudioCapture
 
 class _FontCache:
     """Cache rendered font surfaces to avoid repeated font.render() calls."""
@@ -130,8 +133,7 @@ class PlayingScreen:
         self._count_in_ms = count_in_beats * self._ms_per_beat
         self._last_count_in_beat: int = -1
 
-        # Audio matching
-        self._audio_capture = None  # AudioCapture, created on demand
+        self._audio_capture: AudioCapture | None = None  # created on demand
         self._matcher: NoteMatcher | None = None
         self._feedback = FeedbackRenderer()
         self._audio_enabled = True
@@ -147,9 +149,11 @@ class PlayingScreen:
         self._song_key = song_key
         self._song_completed = False
         self._is_new_best = False
+        self._weakest_sections: list[tuple[int, int, float]] = []
         self._recommendations: list[str] = []
 
         # MIDI backing track
+        self._backing_muted: bool = False
         self._midi_player: MidiPlayer | None = None
         self._tempo_factor = max(0.5, min(1.0, self._config.tempo_factor))
 
@@ -188,7 +192,7 @@ class PlayingScreen:
         # Wait mode
         self._wait_mode: bool = self._config.wait_mode
         self._wait_mode_frozen: bool = False
-
+        self._timing_summary: TimingStats | None = None
         self._last_obs_count: int = 0
         self._timing_overlay: TimingOverlay | None = None
         self._timing_summary = None
@@ -491,8 +495,6 @@ class PlayingScreen:
                 playback_ms=scoring_playback_ms,
                 audio_window=audio_window,
                 detected_notes=detected,
-                window_start_ms=window_start_song_ms,
-                audio_window_provider=audio_for_song_range,
             ))
             has_onset = any(d.note.is_onset for d in detected) if detected else False
             self._feedback.add_results(results, self._playback_ms)
@@ -674,17 +676,17 @@ class PlayingScreen:
         elif event.key == pygame.K_f:
             self._cycle_fret_limit()
         elif event.key == pygame.K_F1:
-            self._toggle_string(1)
+            self.toggle_string(1)
         elif event.key == pygame.K_F2:
-            self._toggle_string(2)
+            self.toggle_string(2)
         elif event.key == pygame.K_F3:
-            self._toggle_string(3)
+            self.toggle_string(3)
         elif event.key == pygame.K_F4:
-            self._toggle_string(4)
+            self.toggle_string(4)
         elif event.key == pygame.K_F5:
-            self._toggle_string(5)
+            self.toggle_string(5)
         elif event.key == pygame.K_F6:
-            self._toggle_string(6)
+            self.toggle_string(6)
         elif event.key == pygame.K_j:
             self._cycle_match_mode()
         elif event.key == pygame.K_l:
@@ -1744,7 +1746,6 @@ class PlayingScreen:
                 note_filter=self._note_passes_filter,
                 mode=self._match_mode,
                 verifier=verifier,
-                adaptive_scoring=self._config.adaptive_scoring_enabled,
             )
             if self._timing_judge and self._timing_overlay is None:
                 self._timing_overlay = TimingOverlay()
@@ -1800,3 +1801,9 @@ class PlayingScreen:
             return
         self._backing_muted = not self._backing_muted
         self._midi_player.set_muted(self._backing_muted)
+
+    def _toggle_wait_mode(self) -> None:
+        """Toggle wait mode on/off."""
+        self._wait_mode = not self._wait_mode
+        self._config.wait_mode = self._wait_mode
+        self._config.save()

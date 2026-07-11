@@ -38,9 +38,9 @@ class CorpusExpectedNote:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "CorpusExpectedNote":
         return cls(
-            midi=int(data["midi"]),
-            string=int(data["string"]) if data.get("string") is not None else None,
-            fret=int(data["fret"]) if data.get("fret") is not None else None,
+            midi=int(str(data["midi"])),
+            string=int(str(data["string"])) if data.get("string") is not None else None,
+            fret=int(str(data["fret"])) if data.get("fret") is not None else None,
             role=str(data["role"]) if data.get("role") is not None else None,
         )
 
@@ -118,7 +118,7 @@ class CorpusCase:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "CorpusCase":
-        version = int(data.get("schema_version", 1))
+        version = int(str(data.get("schema_version", 1)))
         if version != 1:
             raise ValueError(f"unsupported corpus schema_version {version}")
         raw_notes = data.get("notes", ())
@@ -134,8 +134,8 @@ class CorpusCase:
             source=str(data.get("source", "local")),
             split=CorpusSplit(str(data.get("split", CorpusSplit.TEST.value))),
             event_kind=EventKind(str(data["event_kind"])),
-            start_s=float(data.get("start_s", 0.0)),
-            end_s=float(data["end_s"]),
+            start_s=float(str(data.get("start_s", 0.0))),
+            end_s=float(str(data["end_s"])),
             expected_present=bool(data.get("expected_present", True)),
             notes=tuple(CorpusExpectedNote.from_dict(note) for note in raw_notes),
             technique=(
@@ -147,11 +147,11 @@ class CorpusCase:
                 else None
             ),
             expected_onset_s=(
-                float(data["expected_onset_s"])
+                float(str(data["expected_onset_s"]))
                 if data.get("expected_onset_s") is not None
                 else None
             ),
-            annotation_confidence=float(data.get("annotation_confidence", 1.0)),
+            annotation_confidence=float(str(data.get("annotation_confidence", 1.0))),
             negative_reason=(
                 str(data["negative_reason"])
                 if data.get("negative_reason") is not None
@@ -159,9 +159,9 @@ class CorpusCase:
             ),
             metadata={str(k): str(v) for k, v in raw_metadata.items()},
             technique_context=dict(raw_context),
-            window_before_ms=float(data.get("window_before_ms", 120.0)),
+            window_before_ms=float(str(data.get("window_before_ms", 120.0))),
             window_after_ms=(
-                float(data["window_after_ms"])
+                float(str(data["window_after_ms"]))
                 if data.get("window_after_ms") is not None
                 else None
             ),

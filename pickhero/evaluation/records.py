@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
 @dataclass
@@ -55,7 +55,7 @@ class EvaluationRecord:
             "failure_reasons",
         ):
             if key in payload and isinstance(payload[key], list):
-                payload[key] = tuple(payload[key])
+                payload[key] = tuple(cast(list, payload[key]))
         return cls(**payload)  # type: ignore[arg-type]
 
     def to_dict(self) -> dict[str, object]:

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from typing import cast
 
 CONFIG_DIR = Path.home() / ".pickhero"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
@@ -124,12 +125,11 @@ def apply_preset(config: Config, preset_name: str) -> None:
     if preset is None:
         raise ValueError(f"unknown preset: {preset_name!r}")
     # Audio fields
-    config.audio.profile = preset["profile"]
-    config.audio.sample_rate = preset["sample_rate"]
-    config.audio.hop_size = preset["hop_size"]
-    config.audio.buf_size = preset["buf_size"]
-    # Match / judge fields
-    config.match_mode = preset["match_mode"]
+    config.audio.profile = str(preset["profile"])
+    config.audio.sample_rate = cast(int, preset["sample_rate"])
+    config.audio.hop_size = cast(int, preset["hop_size"])
+    config.audio.buf_size = cast(int, preset["buf_size"])
+    config.match_mode = str(preset["match_mode"])
     config.timing_judge_mode = True
     config.pitch_strict_mode = True
     # Offline deep-analysis flag (consumed by scrolling.py, Patch 6d)
@@ -363,5 +363,5 @@ class Config:
         """
         if not isinstance(raw, dict) or not raw:
             return {}
-        known = {f.name for f in datacls.__dataclass_fields__.values()}
+        known = {f.name for f in getattr(datacls, "__dataclass_fields__", {}).values()}
         return {k: v for k, v in raw.items() if k in known}

@@ -102,7 +102,7 @@ def _empty_curve_verdict(kind: str) -> TechniqueVerdict:
     )
 
 
-def _stddev(values: list[float]) -> float:
+def _stddev(values: list[float] | list[int]) -> float:
     if len(values) < 2:
         return 0.0
     return statistics.pstdev(values)

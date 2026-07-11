@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from pickhero.audio.performance import PerformanceEvent, TechniqueSpec, TechniqueVerdict
-    from pickhero.audio.evidence import ExpectedEventVerifier
+    from pickhero.audio.verifier import ExpectedEventVerifier
     from pickhero.tabs.timeline import Timeline
     from pickhero.timing import TimingStats
 
@@ -267,7 +267,7 @@ class NoteMatcher:
 
     def _mark_missed_notes(self, playback_ms: float) -> list[MatchResult]:
         """Mark PENDING notes that have passed the timing window as MISS."""
-        results = []
+        results: list[MatchResult] = []
         cutoff = playback_ms - self._timing_window_ms
         if cutoff <= 0:
             return results
@@ -942,6 +942,7 @@ class NoteMatcher:
                 if playback_ms > note.timestamp_ms + self._timing_window_ms:
                     return EventState.MISS
             return EventState.PITCHED
+        return EventState.PENDING  # fallback
 
     def _get_event_state(self, key: tuple[float, int]) -> EventState:
         """Get the current state for an event key."""
@@ -1308,6 +1309,32 @@ class NoteMatcher:
             "technique_total": technique_total,
             "technique_accuracy_percent": technique_accuracy,
         }
+
+    def get_phrase_statistics(self) -> dict[int, dict[str, float]]:
+        """Return per-phrase match statistics, keyed by phrase_id.
+
+        Returns {phrase_id: {"accuracy": accuracy_percent}}.
+        Only includes phrases with notes that pass the active filter.
+        """
+        # Collect phrase_id -> set of measure indices for notes that pass the filter
+        phrase_measures: dict[int, set[int]] = {}
+        for note in self._timeline.notes:
+            if self.note_filter is not None and not self.note_filter(note):
+                continue
+            phrase_measures.setdefault(note.phrase_id, set()).add(note.measure)
+
+        result: dict[int, dict[str, float]] = {}
+        for phrase_id, measures in phrase_measures.items():
+            hits = close = misses = 0
+            for m in measures:
+                mstats = self._measure_stats.get(m, {})
+                hits += mstats.get("hits", 0)
+                close += mstats.get("close", 0)
+                misses += mstats.get("misses", 0)
+            total = hits + close + misses
+            accuracy = (hits / total * 100) if total > 0 else 0.0
+            result[phrase_id] = {"accuracy": accuracy}
+        return result
 
     def get_weakest_sections(
         self, threshold: float = 0.6, min_length: int = 2

@@ -462,7 +462,7 @@ def _find_next_fret_on_string(
 
 def _extract_measures(track: guitarpro.Track, tempo_map: TempoMap) -> list[MeasureInfo]:
     """Extract measure time ranges from a track."""
-    measures = []
+    measures: list[MeasureInfo] = []
     for idx, measure in enumerate(track.measures):
         # Each measure has a header with start tick. We compute start/end from beats.
         beats_in_measure = []

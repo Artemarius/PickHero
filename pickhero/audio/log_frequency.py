@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 
 
-def _midi_to_freq(midi: int) -> float:
+def _midi_to_freq(midi: float) -> float:
     return 440.0 * 2.0 ** ((midi - 69) / 12.0)
 
 

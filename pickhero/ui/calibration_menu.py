@@ -25,6 +25,7 @@ from pickhero.config import Config, StringCalibration
 from pickhero.ui.colors import get_theme
 
 if TYPE_CHECKING:
+    from pickhero.audio.latency_calibrator import LatencyResult
     from pickhero.timing import TimingStats
 
 # Collection time per string (seconds)
@@ -79,7 +80,7 @@ class CalibrationMenuScreen:
         # used to render a live early/late histogram. None when no run exists.
         self._timing_stats_provider = timing_stats_provider
         self._latency_thread: threading.Thread | None = None
-        self._latency_result = None
+        self._latency_result: LatencyResult | None = None
         self._latency_error: str = ""
 
     @property

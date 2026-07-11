@@ -45,7 +45,7 @@ def freq_to_midi(freq: float) -> int:
     return round(12 * math.log2(freq / A4_FREQ) + A4_MIDI)
 
 
-def midi_to_freq(midi_note: int) -> float:
+def midi_to_freq(midi_note: float) -> float:
     """Convert MIDI note number to frequency in Hz."""
     return A4_FREQ * (2 ** ((midi_note - A4_MIDI) / 12))
 

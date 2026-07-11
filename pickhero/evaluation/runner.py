@@ -7,7 +7,7 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from pickhero import __version__
 from pickhero.audio.chord_semantics import score_chord
@@ -108,7 +108,7 @@ class CorpusEvaluator:
         if health.has_dc_offset:
             failures.append("dc_offset")
 
-        common = dict(
+        common: dict[str, Any] = dict(
             case_id=case.case_id,
             source=case.source,
             split=case.split.value,
@@ -151,7 +151,7 @@ class CorpusEvaluator:
         ]
 
         if case.event_kind == EventKind.CHORD or len(expected_notes) > 1:
-            verification = self.verifier.verify_chord(
+            chord_result = self.verifier.verify_chord(
                 window.samples,
                 expected_notes,
                 self.config.mode,
@@ -160,15 +160,15 @@ class CorpusEvaluator:
             )
             chord = score_chord(
                 expected_notes,
-                verification,
+                chord_result,
                 hit_threshold=self.policy.chord_hit_threshold,
                 partial_threshold=self.policy.chord_partial_threshold,
                 max_extra_for_hit=self.policy.max_extra_pitch_classes,
                 max_strum_spread_ms=self.policy.max_strum_spread_ms,
             )
-            onset_detected = any(note.is_onset_present for note in verification.notes)
+            onset_detected = any(note.is_onset_present for note in chord_result.notes)
             onset_ms = next(
-                (note.onset_ms for note in verification.notes if note.onset_ms is not None),
+                (note.onset_ms for note in chord_result.notes if note.onset_ms is not None),
                 None,
             )
             predicted = chord.verdict == "hit"

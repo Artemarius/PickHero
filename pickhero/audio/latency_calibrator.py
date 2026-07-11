@@ -24,12 +24,14 @@ from dataclasses import dataclass
 import numpy as np
 
 
-def _device_kind(device: object) -> str:
+def _device_kind(device: dict | object) -> str:
     """Return a short kind string for an input device dict."""
-    try:
-        return str(device.get("hostApi", "?"))
-    except Exception:
-        return "?"
+    if isinstance(device, dict):
+        try:
+            return str(device.get("hostApi", "?"))
+        except Exception:
+            return "?"
+    return "?"
 
 
 @dataclass

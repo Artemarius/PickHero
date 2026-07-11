@@ -63,7 +63,7 @@ def _expected_frequency_bounds(expected_midis: tuple[float, ...]) -> tuple[float
         return 55.0, 1500.0
     lo = min(expected_midis) - 5.0
     hi = max(expected_midis) + 5.0
-    return max(25.0, midi_to_freq(lo)), min(1800.0, midi_to_freq(hi))
+    return max(25.0, midi_to_freq(int(lo))), min(1800.0, midi_to_freq(int(hi)))
 
 
 def estimate_pitch_trajectory(

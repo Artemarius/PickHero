@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pygame.midi
 
 
 # MIDI status bytes
@@ -76,7 +80,7 @@ class MidiPlayer:
 
     def __init__(self, backing_track: BackingTrack):
         self._track = backing_track
-        self._output = None
+        self._output: pygame.midi.Output | None = None
         self._active_notes: set[tuple[int, int]] = set()  # (channel, note)
         self._muted = False
         self._opened = False
