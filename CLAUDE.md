@@ -12,7 +12,8 @@ Desktop guitar practice app. Scrolling Guitar Pro tabs (GP3/GP4/GP5/GP6/GP7/GP8)
 - **pyguitarpro** for reading GP3/GP4/GP5 tab files; native XML/BCFZ parser for GP6/GP7/GP8
 - **pygame** for UI rendering (scrolling display, game loop)
 - **pygame.mixer** for backing track / metronome playback
-- ML is optional (ExperimentalML profile only). The base app is signal-processing only and runs without any ML dependency.
+- ML is optional and never required for the base app. The app runs
+  identically without any ML dependency.
 
 ## Architecture
 
@@ -135,19 +136,13 @@ pip install pyinstaller
 pyinstaller pickhero.spec --noconfirm
 # Or use build.bat on Windows
 
-## Accuracy Profiles
-
-Three profiles, selectable at runtime. The audio callback must only copy audio
+Two profiles, selectable at runtime. The audio callback must only copy audio
 and run the lightweight aubio detectors; heavy analysis runs in worker threads
 or on the main thread.
 
 - **Portable**: aubio yinfast, 2048/512, 44.1 kHz, forgiving matching (ARCADE mode).
-  Runs on any hardware. This is the default and the baseline for CI.
 - **HighAccuracy**: multi-resolution YIN + spectral checks, strict chords
   (JUDGE mode), 48 kHz, hop 128-256, parallel 2048+4096 windows. For capable CPUs.
-- **ExperimentalML**: optional neural pitch/onset assist. Never required for the
-  base app. Never runs inside the audio callback. Gated behind an optional
-  dependency; the app runs identically without it.
 
 Do not add ML as a hard dependency. Do not run FFT/ML in the PortAudio callback.
 

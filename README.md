@@ -163,6 +163,18 @@ Notes can be given as names (`E2`, `C#4`, `Db4`) or MIDI numbers (`40`, `61`). C
 - Slow the song down with **PgDn** while practicing
 - Press **H** during playback to see a full help overlay with controls and color legend
 
+## Detector quality and corpus evaluation
+
+Recognition quality is measured against versioned real-guitar corpora rather
+than synthetic tones alone. See [`docs/evaluation.md`](docs/evaluation.md) for
+the capture manifest, held-out evaluation, threshold calibration, failure
+reports, and release-gate workflow.
+
+The live path uses a deadline-safe callback, worker-thread DSP, multi-resolution
+fundamental hypotheses, octave-risk suppression, and fused expected-note
+evidence. See [`docs/audio-pipeline.md`](docs/audio-pipeline.md) for the exact
+real-time and latency-calibration contracts.
+
 ## References
 
 - [aubio](https://github.com/aubio/aubio) — pitch/onset detection
