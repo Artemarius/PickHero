@@ -7,6 +7,10 @@ AudioCapture tests mock sounddevice and feed synthetic audio.
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
 from unittest import mock
 
 import numpy as np
