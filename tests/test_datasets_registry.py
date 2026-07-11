@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from pickhero.datasets import ClipEvent, DatasetRegistry
+from pickhero.datasets.registry import DatasetRegistry as _DirectDatasetRegistry  # noqa: F401
 from pickhero.datasets.schema import ClipExpectedNote
 
 
