@@ -233,6 +233,10 @@ class PitchDetector:
         """
         return self._articulation.drain_completed()
 
+    def set_expected_techniques(self, techniques: set[str]) -> None:
+        """Forward expected techniques to the articulation detector."""
+        self._articulation.set_expected_techniques(techniques)
+
     def _correct_octave_jump(self, freq: float, confidence: float) -> float:
         """Suppress octave jumps caused by harmonic detection.
 

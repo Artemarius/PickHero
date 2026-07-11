@@ -159,3 +159,8 @@ def semitone_distance(midi_a: int, midi_b: int) -> int:
 def is_in_guitar_range(midi_note: int) -> bool:
     """Check if a MIDI note falls within standard guitar range."""
     return GUITAR_MIDI_MIN <= midi_note <= GUITAR_MIDI_MAX
+
+def cents_band(freq: float, cents: float) -> tuple[float, float]:
+    """Return (lo, hi) frequency bounds for +/-cents around freq."""
+    ratio = 2 ** (cents / 1200.0)
+    return freq / ratio, freq * ratio

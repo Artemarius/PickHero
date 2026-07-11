@@ -23,11 +23,13 @@ emission from the same onset.
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+import warnings
 
 import numpy as np
 
 from pickhero.audio.detector import DetectedNote
 from pickhero.audio.event_types import EventKindSnapshot
+from pickhero.audio.match_mode import MatchMode
 from pickhero.audio.note_utils import freq_to_midi, midi_to_name, is_in_guitar_range
 
 if TYPE_CHECKING:
@@ -119,17 +121,32 @@ class TrackStabilizer:
             for event in events:
                 # feed to matcher
     """
-
-    def __init__(self, sample_rate: int = 44100, hop_size: int = 512):
+    def __init__(
+        self,
+        sample_rate: int = 44100,
+        hop_size: int = 512,
+        mode: MatchMode = MatchMode.ARCADE,
+    ):
         self.sample_rate = sample_rate
         self.hop_size = hop_size
+        self._mode = mode
+        warnings.warn(
+            "TrackStabilizer is deprecated; use the expected-event verifier path instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
         self._active: CandidateTrack | None = None
         self._last_emitted_ts: float = -1e9  # for refractory
         self._octave_locked_until: float = -1e9  # suppress octave jumps
 
+    def set_mode(self, mode: MatchMode | str) -> None:
+        """Update the matching mode mid-session (e.g. UI mode toggle)."""
+        from pickhero.audio.match_mode import _coerce_match_mode
+        self._mode = _coerce_match_mode(mode)
+
     def reset(self) -> None:
-        """Clear all state."""
+        """Drop all temporal state after a seek, xrun or stream restart."""
         self._active = None
         self._last_emitted_ts = -1e9
         self._octave_locked_until = -1e9
@@ -345,10 +362,12 @@ class TrackStabilizer:
         for f in recent:
             if f.frequency > 0 and track.base_freq > 0:
                 cents = 1200.0 * np.log2(f.frequency / track.base_freq)
-                # Octave-aware: fold to [-600, 600] so a frame at 2×F0
-                # or 0.5×F0 doesn't break consensus. The octave commitment
-                # resolves the true fundamental later.
-                cents = ((cents + 600) % 1200) - 600
+                # Octave-aware folding is disabled in JUDGE mode, where an
+                # octave error must break consensus instead of being forgiven.
+                # ARCADE/PRACTICE keep folding so attack harmonics don't
+                # destabilize real-time play.
+                if self._mode != MatchMode.JUDGE:
+                    cents = ((cents + 600) % 1200) - 600
                 cents_list.append(cents)
                 conf_list.append(f.confidence)
 

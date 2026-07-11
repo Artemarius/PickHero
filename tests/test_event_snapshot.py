@@ -10,6 +10,9 @@ from pickhero.audio.track_stabilizer import TrackStabilizer
 from pickhero.audio.detector import DetectedNote
 from pickhero.audio.performance import PerformanceEvent, TechniqueCandidate
 
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:TrackStabilizer is deprecated:DeprecationWarning"
+)
 
 def _make_note(freq=440.0, conf=0.95, is_onset=False, ts=0.0, perf=None):
     from pickhero.audio.note_utils import freq_to_midi, midi_to_name

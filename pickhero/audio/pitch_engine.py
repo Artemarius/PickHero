@@ -11,8 +11,6 @@ the callback drains the output queue.
 Profiles:
 - "portable": uses PitchDetector (aubio yinfast) — no worker needed.
 - "high_accuracy": uses PitchEngine with multi-resolution YIN + spectral checks.
-- "experimental_ml": uses PitchEngine with optional ML assist (Step 8).
-
 The audio callback must NEVER block on the worker. If the ring buffer is full,
 the oldest buffer is dropped (xrun logged).
 """
@@ -26,6 +24,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from pickhero.audio.detector import PitchDetector, DetectedNote
+from pickhero.audio.log_frequency import MultiResolutionLogSpectrum
 from pickhero.audio.note_utils import freq_to_midi, freq_to_cents_deviation, midi_to_name
 from typing import TYPE_CHECKING
 
@@ -39,7 +38,9 @@ class PitchCandidate:
     cents_error: float | None
     raw_frequency: float
     confidence: float
-    source_flags: set[str] = field(default_factory=set)  # {"yin", "yin_4096", "spectral", "tab_prior", "octave_corrected"}
+    source_flags: set[str] = field(default_factory=set)  # detector/evidence sources
+    harmonic_support: float = 0.0
+    subharmonic_risk: float = 0.0
 
     def to_detected_note(self, is_onset: bool = False, onset_sample: int | None = None,
                          performance=None) -> DetectedNote | None:
@@ -97,8 +98,9 @@ class PitchEngine:
     the oldest buffer is dropped (xrun logged via the xrun counter).
     """
 
-    # Rolling spectral buffer size for the validator.
-    _SPECTRAL_BUF_SIZE = 4096
+    # Long enough to resolve low guitar/bass fundamentals. High-note analysis
+    # still uses shorter windows inside MultiResolutionLogSpectrum.
+    _SPECTRAL_BUF_SIZE = 16384
 
     def __init__(
         self,
@@ -119,7 +121,6 @@ class PitchEngine:
         self.onset_threshold = onset_threshold
         self.noise_gate_db = noise_gate_db
         self.profile = profile
-        self._ml_model_path = ml_model_path
 
         # The primary PitchDetector does the actual aubio processing (onset + YIN).
         # It is the ONLY thing that touches aubio's onset detector — no double calls.
@@ -162,6 +163,14 @@ class PitchEngine:
         self._spectral_freqs = np.fft.rfftfreq(
             self._SPECTRAL_BUF_SIZE, 1.0 / sample_rate
         )
+        self._log_front_end = MultiResolutionLogSpectrum(
+            sample_rate=sample_rate,
+            min_midi=24,
+            max_midi=108,
+            fft_sizes=(4096, 8192, self._SPECTRAL_BUF_SIZE),
+        )
+        self._last_committed_midi: int | None = None
+        self._last_commit_confidence: float = 0.0
 
         # Ring buffer: audio callback pushes work items, worker drains.
         self._in_queue: queue.Queue[_WorkItem] = queue.Queue(maxsize=64)
@@ -175,25 +184,12 @@ class PitchEngine:
         self._running = False
         self._thread: threading.Thread | None = None
 
-        # ML assist (Step 8 — None unless experimental_ml profile)
+        # ML assist is not bundled.  The config path ``ml_model_path`` is
+        # reserved for users who provide their own ONNX model.  When no
+        # model is provided, ``_ml_assist`` stays None so callers can
+        # check for ML availability without importing the optional dep.
+        self._ml_model_path = ml_model_path
         self._ml_assist = None
-        if profile == "experimental_ml":
-            self._init_ml_assist()
-
-    def _init_ml_assist(self) -> None:
-        """Try to load ML assist. Falls back to None if unavailable."""
-        try:
-            from pickhero.audio.ml_assist import MLAssist
-            if self._ml_model_path:
-                model_path = self._ml_model_path
-            else:
-                from pathlib import Path
-                model_path = str(Path.home() / ".pickhero" / "models" / "crepe_small.onnx")
-            self._ml_assist = MLAssist(model_path=model_path)
-            if not self._ml_assist.available:
-                self._ml_assist = None
-        except Exception:
-            self._ml_assist = None
 
     @property
     def detector(self) -> PitchDetector:
@@ -227,6 +223,8 @@ class PitchEngine:
             self._detector_large.reset()
         self._spectral_buf[:] = 0
         self._spectral_fill = 0
+        self._last_committed_midi = None
+        self._last_commit_confidence = 0.0
 
     def set_tab_prior(self, midi_notes: set[int]) -> None:
         """Set expected MIDI notes near current playback position (thread-safe)."""
@@ -359,113 +357,103 @@ class PitchEngine:
                         pass
 
     def _process_chunk(self, chunk: np.ndarray) -> _EngineResult | None:
-        """Run the consensus pipeline on a single hop-sized chunk.
+        """Run multi-resolution pitch consensus on one hop-sized chunk.
 
-        Collects pitch candidates from multiple detectors (primary YIN,
-        large-window YIN, spectral check), resolves conflicts via
-        :meth:`_resolve_candidates`, and returns the best candidate.
+        YIN remains the low-latency observation, while a harmonic-sieve front
+        end contributes several fundamental hypotheses from the rolling audio
+        window.  The resolver can therefore reject octave aliases instead of
+        merely validating whichever single pitch YIN produced first.
         """
-        # Push to the rolling spectral buffer BEFORE processing.
         self._push_spectral(chunk)
 
-        # Collect candidates from multiple sources
         candidates: list[PitchCandidate] = []
-        is_onset: bool = False
+        is_onset = False
         onset_sample: int | None = None
+        primary_freq = 0.0
+        primary_midi: int | None = None
+        primary_confidence = 0.0
 
-        # Step 1: Primary YIN
-        result = self._detector.process(chunk)
-        if result is None:
-            return None
-
-        freq = result.frequency
-        midi = result.midi_note
-        confidence = result.confidence
-        is_onset = result.is_onset
-        onset_sample = result.onset_sample
-
-        # Step 4: Read tab prior (available regardless of pitch validity)
         with self._tab_prior_lock:
             tab_prior = set(self._tab_prior)
 
-        if freq > 0 and midi > 0:
-            flags: set[str] = {"yin"}
+        result = self._detector.process(chunk)
+        if result is not None:
+            primary_freq = float(result.frequency)
+            primary_midi = int(result.midi_note) if result.midi_note > 0 else None
+            primary_confidence = float(result.confidence)
+            is_onset = bool(result.is_onset)
+            onset_sample = result.onset_sample
 
-            # Step 2: Large-window YIN for low notes
-            if self._detector_large is not None and freq < 200.0:
+        if primary_freq > 0.0 and primary_midi is not None:
+            selected_freq = primary_freq
+            selected_midi = primary_midi
+            selected_confidence = primary_confidence
+            flags: set[str] = {"yin", "yin_primary"}
+
+            if self._detector_large is not None and primary_freq < 220.0:
                 try:
-                    result_large = self._detector_large.process(chunk)
-                    if result_large is not None and result_large.frequency > 0 and result_large.midi_note > 0:
-                        flags_large = {"yin_large"}
-                        if result_large.confidence > confidence:
-                            freq = result_large.frequency
-                            midi = result_large.midi_note
-                            confidence = result_large.confidence
-                            flags = {"yin", "yin_large"}
-                            if not is_onset and result_large.is_onset:
-                                is_onset = True
-                                onset_sample = result_large.onset_sample
-                        else:
-                            flags_large.add("secondary")
+                    large = self._detector_large.process(chunk)
                 except Exception:
-                    pass
+                    large = None
+                if large is not None and large.frequency > 0 and large.midi_note > 0:
+                    candidates.append(PitchCandidate(
+                        best_midi=int(large.midi_note),
+                        cents_error=freq_to_cents_deviation(float(large.frequency))[1],
+                        raw_frequency=float(large.frequency),
+                        confidence=float(large.confidence) * 0.96,
+                        source_flags={"yin_large"},
+                    ))
+                    if large.confidence > selected_confidence + 0.04:
+                        selected_freq = float(large.frequency)
+                        selected_midi = int(large.midi_note)
+                        selected_confidence = float(large.confidence)
+                        flags.add("yin_large")
+                    if not is_onset and large.is_onset:
+                        is_onset = True
+                        onset_sample = large.onset_sample
 
-            # Primary candidate
-            nearest_midi, cents = freq_to_cents_deviation(freq)
+            _, cents = freq_to_cents_deviation(selected_freq)
             candidates.append(PitchCandidate(
-                best_midi=midi,
+                best_midi=selected_midi,
                 cents_error=cents,
-                raw_frequency=freq,
-                confidence=confidence,
-                source_flags=flags | {"yin_primary"},
-            ))
-
-            # Step 3: Spectral candidate — if spectral check finds a different
-            # strong fundamental, add it as a competing candidate for the
-            # resolver to weigh.
-            if self._spectral_fill >= self._SPECTRAL_BUF_SIZE // 2:
-                spec_freq = self._find_spectral_peak(freq)
-                if spec_freq is not None and spec_freq > 0:
-                    spec_nearest, spec_cents = freq_to_cents_deviation(spec_freq)
-                    # Only add if it differs enough from primary to be interesting
-                    if abs(spec_nearest - nearest_midi) >= 1:
-                        spec_flags = {"spectral"}
-                        candidates.append(PitchCandidate(
-                            best_midi=spec_nearest,
-                            cents_error=spec_cents,
-                            raw_frequency=spec_freq,
-                            confidence=confidence * 0.9,  # slight penalty vs YIN
-                            source_flags=spec_flags,
-                        ))
-
-            if tab_prior:
-                candidates = self._apply_tab_prior(candidates, tab_prior)
-
-        else:
-            # No valid primary — return early with null candidate
-            flags = {"yin"}
-            candidates.append(PitchCandidate(
-                best_midi=None,
-                cents_error=None,
-                raw_frequency=freq,
-                confidence=confidence,
+                raw_frequency=selected_freq,
+                confidence=selected_confidence,
                 source_flags=flags,
             ))
 
-        # Step 5: Resolve multi-candidate conflicts
-        tab_prior_midi: int | None = None
-        if tab_prior:
-            # Pick the closest tab prior note to the primary MIDI note
-            tab_prior_midi = min(tab_prior, key=lambda m: abs(m - (midi if midi is not None else 0))) if midi is not None else None
+        # The multi-resolution front end sees a long rolling window and returns
+        # several mutually competing fundamentals. It is useful even when YIN
+        # reports no pitch during a noisy attack.
+        if self._spectral_fill >= 4096:
+            window = self._spectral_buf[:self._spectral_fill]
+            frame = self._log_front_end.analyse(
+                window,
+                top_k=5,
+                prior_midis=tab_prior,
+            )
+            for hypothesis in frame.hypotheses:
+                confidence = (
+                    0.12
+                    + hypothesis.salience * 0.62
+                    + hypothesis.harmonic_support * 0.26
+                    - hypothesis.subharmonic_risk * 0.16
+                )
+                candidates.append(PitchCandidate(
+                    best_midi=hypothesis.midi,
+                    cents_error=hypothesis.cents_error,
+                    raw_frequency=hypothesis.frequency,
+                    confidence=max(0.0, min(1.0, confidence)),
+                    source_flags={"harmonic_sieve", "multi_resolution"},
+                    harmonic_support=hypothesis.harmonic_support,
+                    subharmonic_risk=hypothesis.subharmonic_risk,
+                ))
 
-        best = self._resolve_candidates(candidates, tab_prior_midi)
-
-        if best is None or best.best_midi is None or best.raw_frequency <= 0:
+        if not candidates:
             return _EngineResult(
                 candidate=PitchCandidate(
                     best_midi=None,
                     cents_error=None,
-                    raw_frequency=freq,
+                    raw_frequency=primary_freq,
                     confidence=0.0,
                     source_flags=set(),
                 ),
@@ -474,27 +462,61 @@ class PitchEngine:
                 chunk_start_sample=0,
             )
 
-        # Validate the chosen candidate with harmonic likelihood.
-        # A real guitar note has a harmonic series at 2×-5×F0; a cable
-        # resonance or noise doesn't. Score < 0.05 → heavy penalty.
-        flags_out = best.source_flags.copy()
-        final_confidence = best.confidence
-        if "spectral" not in flags_out and "tab_prior" not in flags_out:
-            spectral_score = self._spectral_check(best.raw_frequency)
-            if spectral_score < 0.05:
-                final_confidence *= 0.3  # heavy penalty — likely a resonance
-            elif spectral_score < 0.10:
-                final_confidence *= 0.6  # moderate penalty
+        if tab_prior:
+            candidates = self._apply_tab_prior(candidates, tab_prior)
+
+        reference_midi = primary_midi
+        if reference_midi is None:
+            pitched = [candidate for candidate in candidates if candidate.best_midi is not None]
+            if pitched:
+                reference_midi = max(pitched, key=lambda candidate: candidate.confidence).best_midi
+        tab_prior_midi = None
+        if tab_prior and reference_midi is not None:
+            tab_prior_midi = min(tab_prior, key=lambda midi: abs(midi - reference_midi))
+
+        best = self._resolve_candidates(candidates, tab_prior_midi)
+        if best is None or best.best_midi is None or best.raw_frequency <= 0.0:
+            return _EngineResult(
+                candidate=PitchCandidate(
+                    best_midi=None,
+                    cents_error=None,
+                    raw_frequency=primary_freq,
+                    confidence=0.0,
+                    source_flags=set(),
+                ),
+                is_onset=is_onset,
+                onset_sample=onset_sample,
+                chunk_start_sample=0,
+            )
+
+        flags_out = set(best.source_flags)
+        spectral_available = self._spectral_fill >= self._SPECTRAL_BUF_SIZE // 2
+        harmonic_score = best.harmonic_support or (
+            self._spectral_check(best.raw_frequency) if spectral_available else 0.0
+        )
+        final_confidence = float(best.confidence)
+        if spectral_available:
+            if harmonic_score < 0.08:
+                final_confidence *= 0.42
+            elif harmonic_score < 0.16:
+                final_confidence *= 0.68
             else:
-                final_confidence *= 0.85  # minor — has harmonics, just no competing peak
+                final_confidence = min(1.0, final_confidence * (0.88 + harmonic_score * 0.20))
+            final_confidence *= 1.0 - min(0.28, best.subharmonic_risk * 0.22)
+
+        if final_confidence >= 0.28:
+            self._last_committed_midi = best.best_midi
+            self._last_commit_confidence = final_confidence
 
         return _EngineResult(
             candidate=PitchCandidate(
                 best_midi=best.best_midi,
                 cents_error=best.cents_error,
                 raw_frequency=best.raw_frequency,
-                confidence=final_confidence,
+                confidence=max(0.0, min(1.0, final_confidence)),
                 source_flags=flags_out,
+                harmonic_support=harmonic_score,
+                subharmonic_risk=best.subharmonic_risk,
             ),
             is_onset=is_onset,
             onset_sample=onset_sample,
@@ -547,97 +569,103 @@ class PitchEngine:
                 cand.confidence = min(1.0, cand.confidence + 0.05)
         return candidates
 
-    def _resolve_candidates(self, candidates: list[PitchCandidate], tab_prior_midi: int | None) -> PitchCandidate | None:
-        """Multi-candidate resolver for pitch detection.
+    def _resolve_candidates(
+        self,
+        candidates: list[PitchCandidate],
+        tab_prior_midi: int | None,
+    ) -> PitchCandidate | None:
+        """Resolve YIN and harmonic-sieve hypotheses without octave snap.
 
-        1. Reject impossible candidates (freq=0, midi out of guitar range,
-           confidence < 0.1).
-        2. If tab prior available, prefer candidates within ±1 octave of it.
-        3. After sustain evidence, commit to the fundamental closest to the
-           median of surviving candidates.
-        4. Return the best candidate, or None if all rejected.
+        Evidence is grouped by semitone. Agreement between independent sources
+        is rewarded, while subharmonic risk and unsupported octave jumps are
+        penalised. Tab context and temporal continuity remain priors only.
         """
-        # --- Phase 1: Reject impossible candidates ---
-        MIN_GUITAR_MIDI = 27   # E2
-        MAX_GUITAR_MIDI = 108  # E5 (high guitar range)
-        MIN_CONFIDENCE = 0.1
-
-        valid = []
-        for c in candidates:
-            if c.best_midi is None:
-                continue
-            if c.raw_frequency <= 0:
-                continue
-            if c.best_midi < MIN_GUITAR_MIDI or c.best_midi > MAX_GUITAR_MIDI:
-                continue
-            if c.confidence < MIN_CONFIDENCE:
-                continue
-            valid.append(c)
-
+        valid = [
+            candidate for candidate in candidates
+            if candidate.best_midi is not None
+            and 24 <= candidate.best_midi <= 108
+            and candidate.raw_frequency > 0.0
+            and candidate.confidence >= 0.08
+        ]
         if not valid:
             return None
 
-        # --- Phase 2: Tab-prior scoring ---
-        if tab_prior_midi is not None:
-            for c in valid:
-                midi_diff = abs(c.best_midi - tab_prior_midi)
-                # Candidates within ±1 octave (12 semitones) get a bonus
-                if midi_diff <= 12:
-                    c.confidence = min(1.0, c.confidence + (1.0 - midi_diff / 12.0) * 0.2)
+        groups: dict[int, list[PitchCandidate]] = {}
+        for candidate in valid:
+            groups.setdefault(int(candidate.best_midi), []).append(candidate)
 
-        # --- Phase 3: Octave grouping and commit ---
-        # Group candidates by octave proximity (±1 semitone)
-        valid.sort(key=lambda c: c.best_midi)
-        groups: list[list[PitchCandidate]] = []
-        for c in valid:
-            placed = False
-            for group in groups:
-                # If this candidate is within 1 semitone of any member, add to group
-                if all(abs(c.best_midi - g.best_midi) > 1 for g in group):
-                    continue
-                group.append(c)
-                placed = True
-                break
-            if not placed:
-                groups.append([c])
+        def source_family(candidate: PitchCandidate) -> str:
+            if "harmonic_sieve" in candidate.source_flags:
+                return "harmonic"
+            if "yin_large" in candidate.source_flags:
+                return "yin_large"
+            if "yin" in candidate.source_flags:
+                return "yin"
+            if "spectral" in candidate.source_flags:
+                return "spectral"
+            return "other"
 
-        # Merge very close groups (within 1 semitone of each other)
-        merged = [groups[0]] if groups else []
-        for i in range(1, len(groups)):
-            last = merged[-1]
-            last_best = max(g.best_midi for g in last)
-            first_next = min(g.best_midi for g in groups[i])
-            if last_best - first_next <= 1:
-                merged[-1].extend(groups[i])
-            else:
-                merged.append(groups[i])
+        def group_score(midi: int, group: list[PitchCandidate]) -> float:
+            best = max(group, key=lambda item: item.confidence)
+            confidence = max(item.confidence for item in group)
+            families = {source_family(item) for item in group}
+            agreement = min(0.18, max(0, len(families) - 1) * 0.09)
+            harmonic = max(item.harmonic_support for item in group)
+            risk = max(item.subharmonic_risk for item in group)
+            score = confidence + agreement + harmonic * 0.10 - risk * 0.18
 
-        # Pick the winning group: highest max confidence, tab-prior preferred
-        def _group_score(group: list[PitchCandidate]) -> float:
-            best_conf = max(g.confidence for g in group)
-            # Small bonus if this group contains the tab prior
             if tab_prior_midi is not None:
-                if any(abs(g.best_midi - tab_prior_midi) <= 1 for g in group):
-                    best_conf += 0.1
-            return best_conf
+                distance = abs(midi - tab_prior_midi)
+                if distance <= 1:
+                    score += 0.12
+                elif distance <= 3:
+                    score += 0.05
+                elif distance <= 12:
+                    score += 0.03
+                elif distance > 12:
+                    score -= 0.05
 
-        merged.sort(key=_group_score, reverse=True)
-        best_group = merged[0]
+            if self._last_committed_midi is not None:
+                distance = abs(midi - self._last_committed_midi)
+                if distance <= 1:
+                    score += 0.11 * max(0.4, self._last_commit_confidence)
+                elif distance == 12:
+                    score -= 0.12 * max(0.4, self._last_commit_confidence)
+                elif distance > 12:
+                    score -= min(0.16, (distance - 12) * 0.01)
 
-        # Within the winning group, pick the highest-confidence candidate
-        best = max(best_group, key=lambda c: c.confidence)
+            # Prefer a lower fundamental when an upper candidate is explicitly
+            # marked as its likely harmonic and their evidence is otherwise close.
+            lower_group = groups.get(midi - 12)
+            if lower_group:
+                lower_conf = max(item.confidence for item in lower_group)
+                if risk >= 0.45 and lower_conf >= confidence - 0.14:
+                    score -= 0.14
+            return score
 
-        # If the winner is an octave above another candidate, prefer the
-        # lower one (more likely fundamental). Only flip if the lower
-        # candidate has comparable confidence (within 0.15).
-        lower = [c for c in best_group if c.best_midi < best.best_midi]
-        if lower:
-            best_lower = max(lower, key=lambda c: c.confidence)
-            if best.confidence - best_lower.confidence < 0.15:
-                best = best_lower
-                best.source_flags = best.source_flags | {"octave_corrected"}
+        winning_midi, winning_group = max(
+            groups.items(), key=lambda item: group_score(item[0], item[1])
+        )
 
-        return best
+        # Prefer the most accurate frequency estimate from the winning group.
+        # Harmonic-sieve candidates provide refined cents; YIN remains favoured
+        # when confidence is materially higher.
+        winner = max(
+            winning_group,
+            key=lambda item: (
+                item.confidence
+                + item.harmonic_support * 0.10
+                - item.subharmonic_risk * 0.10
+            ),
+        )
+        merged_flags: set[str] = set()
+        for item in winning_group:
+            merged_flags.update(item.source_flags)
+        winner.source_flags = merged_flags
+        winner.harmonic_support = max(item.harmonic_support for item in winning_group)
+        winner.subharmonic_risk = max(item.subharmonic_risk for item in winning_group)
+        winner.confidence = max(item.confidence for item in winning_group)
+        return winner
 
     def _push_spectral(self, chunk: np.ndarray) -> None:
         """Push audio into the rolling spectral analysis buffer."""
@@ -687,12 +715,26 @@ class PitchEngine:
         nyquist = self.sample_rate / 2.0
 
         def _peak_energy(center: float, tol: float = 0.05) -> float:
-            lo = center * (1.0 - tol)
-            hi = center * (1.0 + tol)
-            mask = (self._spectral_freqs >= lo) & (self._spectral_freqs <= hi)
-            if not np.any(mask):
+            # Narrow center band for the peak; wider sidebands (excluding the
+            # center) provide a local median baseline. This rejects broadband
+            # noise without erasing narrow harmonic peaks at low frequencies
+            # where the ±5% band may contain only a few bins.
+            c_lo = center * 0.99
+            c_hi = center * 1.01
+            s_lo = center * (1.0 - tol)
+            s_hi = center * (1.0 + tol)
+            center_mask = (self._spectral_freqs >= c_lo) & (self._spectral_freqs <= c_hi)
+            side_mask = ((self._spectral_freqs >= s_lo) & (self._spectral_freqs < c_lo)) | (
+                (self._spectral_freqs > c_hi) & (self._spectral_freqs <= s_hi)
+            )
+            if not np.any(center_mask):
                 return 0.0
-            return float(np.max(spectrum[mask]))
+            peak = float(np.max(spectrum[center_mask]))
+            if np.any(side_mask):
+                baseline = float(np.median(spectrum[side_mask]))
+            else:
+                baseline = 0.0
+            return max(0.0, peak - baseline)
 
         # F0 peak energy
         f0_energy = _peak_energy(freq)
@@ -718,7 +760,7 @@ class PitchEngine:
         # total peak energy (F0 + harmonics). This is robust to added noise
         # because noise inflates the median floor, which we subtract.
         total_peak = f0_energy + harmonic_energy
-        noise_contribution = noise_floor * max(n_harmonics_found, 1)
+        noise_contribution = noise_floor * max(n_harmonics_found, 1) * 2.0
         harmonic_above_noise = max(0.0, harmonic_energy - noise_contribution)
         harmonic_ratio = harmonic_above_noise / total_peak if total_peak > 0 else 0.0
 

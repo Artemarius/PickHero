@@ -1,4 +1,4 @@
-"""Optional ML-based pitch/onset assist for the ExperimentalML profile.
+"""Optional ML-based pitch/onset assist.
 
 This module is an optional scaffold behind a try/except import. It provides
 an MLAssist class that wraps an optional ONNX-runtime model (CREPE-small or
@@ -6,7 +6,7 @@ similar) for pitch estimation, run in the worker thread from PitchEngine.
 
 Hard rules (enforced in code):
 - ml_assist is never imported at module top level — only inside
-  PitchEngine.__init__ when profile == "experimental_ml".
+  PitchEngine.__init__ when an explicit ML model path is configured.
 - The audio callback never calls into ml_assist.
 - If onnxruntime import fails, log a warning and continue with the
   signal-processing path. No crash.

@@ -227,19 +227,16 @@ class TestPalmMute:
 class TestHarmonic:
     """Test harmonic detection: weak fundamental, strong overtones."""
 
-    @pytest.mark.skip(reason="Harmonic detection disabled in real-time pipeline — "
-                         "1.5×F0 subharmonic check fires on every normal pick. "
-                         "Pending tab-conditioned detection (Patch 4d/5c).")
     def test_harmonic_detected(self):
         """Strong overtone at 1.5×F0 → harmonic candidate on onset."""
         d = _make_detector()
+        d.set_expected_techniques({"harmonic"})
         sr = 44100
         hop = 512
         t = np.arange(hop, dtype=np.float32) / sr
         fundamental = 0.1 * np.sin(2 * np.pi * E2 * t)
         subharmonic = 0.8 * np.sin(2 * np.pi * 1.5 * E2 * t)
         audio = (fundamental + subharmonic).astype(np.float32)
-
         d.process(E2, 0.9, True, audio, 0.0)
         cands = _candidates_on_active(d)
         assert any(c.kind == "harmonic" for c in cands)
@@ -247,6 +244,7 @@ class TestHarmonic:
     def test_normal_note_not_harmonic(self):
         """Strong fundamental, normal overtones → not harmonic."""
         d = _make_detector()
+        d.set_expected_techniques({"harmonic"})
         sr = 44100
         hop = 512
         t = np.arange(hop, dtype=np.float32) / sr

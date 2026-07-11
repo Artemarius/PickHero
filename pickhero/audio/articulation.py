@@ -33,6 +33,7 @@ import numpy as np
 
 from pickhero.audio.performance import (
     PerformanceEvent,
+    TechniqueCandidate,
 )
 
 
@@ -135,11 +136,23 @@ class ArticulationDetector:
         # scoring is deferred to the after-take analyzer.
         self.diagnostic_mode: bool = True
         self._prev_event_midi: int | None = None
+        # Expected techniques from the tab (set by set_expected_techniques).
+        # When non-empty, harmonic detection only fires for notes whose tab
+        # entry expects a harmonic technique.
+        self._expected_techniques: set[str] = set()
 
     @property
     def active_event(self) -> PerformanceEvent | None:
         """The PerformanceEvent currently being built (the sounding note)."""
         return self._active
+
+    def set_expected_techniques(self, techniques: set[str]) -> None:
+        """Set the techniques expected near the current playback position.
+
+        Called by the playback loop so harmonic detection only fires when
+        the tab actually expects a harmonic technique.
+        """
+        self._expected_techniques = techniques
 
     def reset(self) -> None:
         """Clear all internal state. Call on new song/session."""
@@ -212,27 +225,18 @@ class ArticulationDetector:
                 midi_note=_freq_to_midi(freq),
                 confidence=confidence,
             )
-            self._base_freq = freq
-            self._pitch_history.clear()
-            self._vib_buffer.clear()
-            self._vib_peak_times.clear()
-            self._slide_cents_history.clear()
-            self._bend_active = False
-            self._bend_start_ms = 0.0
-
-            # Spectral features for the onset frame (gated behind is_onset).
+            # Tab-conditioned harmonic detection: only check for harmonics
+            # when the tab expects one. The 1.5×F0 subharmonic check fires
+            # on every normal pick without this guard.
+            if "harmonic" in self._expected_techniques and freq > 0:
+                if self._detect_harmonic(audio_buffer, freq):
+                    self._active.upsert_technique_candidate(
+                        kind="harmonic",
+                        confidence=0.8,
+                        metrics={"method": "1.5xf0_subharmonic"},
+                    )
             if audio_buffer is not None:
                 self._record_spectral_features(audio_buffer, freq, timestamp_ms)
-                # Harmonic detection disabled in real-time pipeline.
-                # The 1.5×F0 subharmonic check fires on every normal guitar
-                # note (spectral leakage + inharmonicity produce energy at
-                # non-harmonic frequencies). Harmonic detection must be
-                # tab-conditioned (only run when the tab expects a harmonic)
-                # — a spectral heuristic alone can't distinguish a real
-                # harmonic from a normal pick. See Patch 4d/5c for the
-                # tab-conditioned path in the analyzer.
-                # if freq > 0 and self._detect_harmonic(audio_buffer, freq):
-                #     self._active.upsert_technique_candidate(...)
                 # Onset features (pick transient / noise burst proxies)
                 self._active.onset_features = self._compute_onset_features(audio_buffer)
 
@@ -246,6 +250,7 @@ class ArticulationDetector:
 
             # Record f0 point at onset
             self._active.f0_curve.append((timestamp_ms, freq, 0.0))
+            self._base_freq = freq
             self._pitch_history.append((timestamp_ms, freq, 0.0, True))
             return newly_completed
 

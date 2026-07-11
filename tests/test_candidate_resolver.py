@@ -136,9 +136,9 @@ class TestResolverTabPrior:
 class TestResolverOctaveHandling:
     """Multiple octave candidates handled via fundamental preference."""
 
-    def test_e2_and_e3_both_valid_but_resolver_picks_lower(self):
-        """E2 (40) and E3 (52) differ in octave group; lower fundamental wins
-        when confidence diff < 0.15."""
+    def test_e2_and_e3_are_separate_groups_higher_confidence_wins(self):
+        """E2 (40) and E3 (52) are >1 semitone apart and now stay in separate
+        groups. The higher-confidence group wins cleanly."""
         engine = PitchEngine()
         candidates = [
             _candidate(midi=52, freq=164.81, confidence=0.85, source="yin_primary"),
@@ -146,8 +146,10 @@ class TestResolverOctaveHandling:
         ]
         result = engine._resolve_candidates(candidates, tab_prior_midi=None)
         assert result is not None
-        assert result.best_midi == 40
-        assert "octave_corrected" in result.source_flags
+        assert result.best_midi == 52, (
+            f"expected higher-confidence upper group to win, got {result.best_midi}"
+        )
+
 
     def test_higher_confidence_overrules_octave_bias(self):
         """When the upper candidate has substantially higher confidence, it wins."""
@@ -206,6 +208,29 @@ class TestResolverConfidence:
         engine = PitchEngine()
         result = engine._resolve_candidates([], tab_prior_midi=None)
         assert result is None
+
+    def test_well_separated_groups_do_not_merge(self):
+        """Two groups separated by >1 semitone must stay separate.
+
+        With the buggy merge condition, all candidates collapsed into one
+        group, so the resolver's fundamental-preference flip returned 60
+        even though the upper group had higher confidence. With the fix,
+        the upper group stays isolated and wins cleanly.
+        """
+        engine = PitchEngine()
+        candidates = [
+            _candidate(midi=60, freq=261.63, confidence=0.90, source="yin_primary"),
+            _candidate(midi=61, freq=277.18, confidence=0.88, source="yin_primary"),
+            _candidate(midi=72, freq=523.25, confidence=0.92, source="yin_primary"),
+            _candidate(midi=73, freq=554.37, confidence=0.89, source="yin_primary"),
+        ]
+        result = engine._resolve_candidates(candidates, tab_prior_midi=None)
+        assert result is not None
+        assert result.best_midi == 72, (
+            f"expected isolated upper group to win, got {result.best_midi}"
+        )
+
+
 
 
 # ---------------------------------------------------------------------------

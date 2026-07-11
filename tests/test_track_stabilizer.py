@@ -13,6 +13,9 @@ from pickhero.audio.detector import DetectedNote
 from pickhero.audio.track_stabilizer import TrackStabilizer, StableNoteEvent
 from pickhero.audio.note_utils import freq_to_midi
 
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:TrackStabilizer is deprecated:DeprecationWarning"
+)
 E2 = 82.41
 A2 = 110.00
 E3 = 164.81  # octave harmonic of E2
@@ -245,3 +248,32 @@ class TestTwoNotes:
         assert len(events) == 2, f"expected 2 events, got {len(events)}"
         assert events[0].midi_note == 40  # E2
         assert events[1].midi_note == 45  # A2
+
+class TestJudgeModeOctaveFolding:
+    """In JUDGE mode, an octave difference must break consensus."""
+
+    def test_judge_octave_difference_rejects_consensus(self):
+        """Two frames at the same pitch class but one octave apart must NOT
+        reach consensus when the stabilizer is in JUDGE mode.
+
+        The tab prior anchors the base pitch to E2 so that sustain frames at
+        E3 are measured against E2. In ARCADE mode the octave fold would make
+        those frames look like 0 cents and reach consensus; in JUDGE mode the
+        raw -1200 cents deviation must break consensus.
+        """
+        from pickhero.audio.match_mode import MatchMode
+        s = TrackStabilizer(sample_rate=48000, hop_size=512, mode=MatchMode.JUDGE)
+        events = []
+
+        # Onset at E2, anchored by tab prior.
+        n = _make_note(E2, conf=0.95, is_onset=True, ts=0.0)
+        events.extend(s.process(n, 0.0, tab_prior_midi=40))
+
+        # Sustain at E3 (octave above) — in Judge mode this breaks consensus.
+        for i in range(1, 6):
+            n = _make_note(E3, conf=0.99, is_onset=False, ts=i * 10.7)
+            events.extend(s.process(n, i * 10.7, tab_prior_midi=40))
+
+        assert len(events) == 0, (
+            f"expected no consensus with octave jump in JUDGE mode, got {len(events)} events"
+        )
