@@ -351,8 +351,10 @@ def _gpif_bend_spec(n: ET.Element) -> TechniqueSpec | None:
 
     GPIF stores bend origin/destination as float attrs on
     ``<Property name="BendDestinationValue">`` / ``BendOriginValue``.
-    Values are in 1/4-semitone units (matching the GP5 convention), so
-    target_cents = (dest - origin) * 25.0.
+    Values are in 1/4-semitone units (matching the GP5 convention). The target
+    is the absolute bend height above the fretted note, not merely the delta
+    from a pre-bent origin; using ``dest - origin`` under-graded pre-bend-and-
+    bend passages and made their authored curve disagree with the target.
     """
     origin = None
     dest = None
@@ -372,7 +374,7 @@ def _gpif_bend_spec(n: ET.Element) -> TechniqueSpec | None:
         return None
     if origin is None:
         origin = 0.0
-    target_cents = (dest - origin) * 25.0
+    target_cents = dest * 25.0
     subtype = _bend_subtype(origin, dest, target_cents)
     return TechniqueSpec(
         kind="bend", subtype=subtype, target_cents=target_cents,
@@ -392,9 +394,12 @@ def _extract_notes(track: guitarpro.Track, tempo_map: TempoMap) -> list[NoteEven
                     beat.duration.time, beat.start
                 )
                 for note in beat.notes:
-                    # Keep normal (1) and dead (3), skip rest (0) and tie (2)
-                    if note.type.value not in (1, 3):
+                    # Keep normal (1), dead (3), and tie (2) notes.
+                    # Tie notes enter the state machine at PITCHED (no onset
+                    # required, sustain from parent note).
+                    if note.type.value not in (1, 2, 3):
                         continue
+                    is_tie = note.type.value == 2
                     # Slide destination: the next note on the same string in the
                     # next beat of this voice (pyguitarpro encodes slide dest
                     # as the following note's fret). None if no successor.
@@ -409,6 +414,7 @@ def _extract_notes(track: guitarpro.Track, tempo_map: TempoMap) -> list[NoteEven
                             string=note.string,
                             fret=note.value,
                             measure=measure_idx,
+                            pick_required=not is_tie,
                             techniques=_extract_techniques(
                                 note,
                                 string=note.string,
@@ -1181,7 +1187,7 @@ def extract_backing_track(
                     )
 
                     for note in beat.notes:
-                        if note.type.value not in (1, 3):
+                        if note.type.value not in (1, 2, 3):
                             continue
 
                         velocity = note.velocity if note.velocity > 0 else 80

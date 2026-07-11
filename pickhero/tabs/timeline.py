@@ -7,7 +7,7 @@ of NoteEvents and provides efficient range queries for the game loop.
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -24,7 +24,22 @@ class NoteEvent:
     string: int  # 1-N (1 = highest pitched string in the tab)
     fret: int    # 0=open
     measure: int = 0  # measure index (0-based)
-    techniques: tuple["TechniqueSpec", ...] = ()  # expected techniques from the tab (bend, vibrato, slide, hammer_on, pull_off, palm_mute, harmonic, dead_note). Empty = normal note.
+    techniques: tuple["TechniqueSpec", ...] = ()  # expected techniques from the tab
+    # Derived enrichment fields — populated by Timeline._enrich_arrangement.
+    # Marked compare=False so original and enriched events compare equal by
+    # authored/core fields only.
+    phrase_id: int = field(default=-1, compare=False)
+    """Stable phrase identifier. Auto-derived from four-measure blocks when
+    the source format does not provide authored phrases."""
+    difficulty_level: int = field(default=0, compare=False)
+    """Arrangement layer 1-5. Zero means derive a coherent fallback layer."""
+    chord_id: str | None = field(default=None, compare=False)
+    """Identity shared by simultaneous notes. Mono scoring uses this as one
+    musical event rather than pretending every physical string is observable."""
+    pick_required: bool = field(default=True, compare=False)
+    """False for tied hammer-ons, pull-offs and legato slide destinations."""
+    sustain_checkpoints: tuple[float, ...] = field(default=(), compare=False)
+    """Absolute song times at which sustain quality should be sampled."""
 
     def __post_init__(self):
         if self.timestamp_ms < 0:
@@ -67,7 +82,8 @@ class Timeline:
 
     def __init__(self, notes: list[NoteEvent], metadata: SongMetadata | None = None,
                  measures: list[MeasureInfo] | None = None):
-        self._notes = sorted(notes, key=lambda n: (n.timestamp_ms, n.string))
+        self._notes = self._enrich_arrangement(notes)
+        self._notes.sort(key=lambda n: (n.timestamp_ms, n.string))
         self._timestamps = [n.timestamp_ms for n in self._notes]
         self.metadata = metadata or SongMetadata()
         self._measures = measures or []
@@ -75,6 +91,73 @@ class Timeline:
         # Active-window cursor for get_active_notes_at_time optimization
         self._active_cursor = 0
         self._last_query_time = -1.0
+
+
+    @staticmethod
+    def _enrich_arrangement(notes: list[NoteEvent]) -> list[NoteEvent]:
+        """Fill phrase, chord, difficulty and sustain metadata deterministically.
+
+        Guitar Pro files do not always carry Rocksmith-style phrase and dynamic
+        difficulty metadata. The fallback keeps layers musically coherent:
+        bass/root anchors appear first, rhythmic guide notes next, complete
+        voicings after that, and expressive articulations in upper layers.
+        """
+        if not notes:
+            return []
+        groups: dict[float, list[NoteEvent]] = {}
+        for note in notes:
+            groups.setdefault(round(note.timestamp_ms, 3), []).append(note)
+
+        phrase_onset_index: dict[int, int] = {}
+        enriched: list[NoteEvent] = []
+        for onset, group in sorted(groups.items()):
+            phrase_id = min(n.measure for n in group) // 4
+            onset_index = phrase_onset_index.get(phrase_id, 0)
+            phrase_onset_index[phrase_id] = onset_index + 1
+            chord_id = f"{onset:.3f}" if len(group) > 1 else None
+            ordered = sorted(group, key=lambda n: (n.midi_note, n.string))
+            seen_pc: set[int] = set()
+            for position, note in enumerate(ordered):
+                level = note.difficulty_level
+                if level <= 0:
+                    if len(group) > 1:
+                        pc = note.midi_note % 12
+                        if position == 0:
+                            level = 1  # bass/root guide
+                        elif pc in seen_pc:
+                            level = 4  # doubled voicing tone
+                        elif position == 1:
+                            level = 2
+                        else:
+                            level = 3
+                        seen_pc.add(pc)
+                    else:
+                        level = 1 if onset_index % 4 == 0 else (2 if onset_index % 2 == 0 else 3)
+                    if note.techniques:
+                        level = max(level, 4)
+                        if any(t.kind in ("bend", "vibrato", "harmonic") for t in note.techniques):
+                            level = 5
+
+                tied = any(
+                    t.kind in ("hammer_on", "pull_off", "slide")
+                    and getattr(t, "tied_to_previous", False)
+                    for t in note.techniques
+                )
+                checkpoints = note.sustain_checkpoints
+                if not checkpoints and note.duration_ms >= 300.0:
+                    checkpoints = tuple(
+                        note.timestamp_ms + note.duration_ms * fraction
+                        for fraction in (0.25, 0.5, 0.75)
+                    )
+                enriched.append(replace(
+                    note,
+                    phrase_id=note.phrase_id if note.phrase_id >= 0 else phrase_id,
+                    difficulty_level=max(1, min(5, level)),
+                    chord_id=note.chord_id or chord_id,
+                    pick_required=note.pick_required and not tied,
+                    sustain_checkpoints=checkpoints,
+                ))
+        return enriched
 
     def __len__(self) -> int:
         return len(self._notes)

@@ -175,18 +175,18 @@ class TestLoadGPFile:
 
     def test_tie(self):
         tl = load_gp_file(FIXTURES / "Tie.gp5")
-        assert len(tl) == 11
+        assert len(tl) == 20  # includes tie notes (was 11 before tie support)
         assert tl.metadata.tempo == 120
 
     def test_demo_v5_track0(self):
         tl = load_gp_file(FIXTURES / "Demo_v5.gp5", track_index=0)
-        assert len(tl) == 729
+        assert len(tl) == 761  # includes tie notes
         assert tl.metadata.tempo == 165
         assert tl.metadata.track_name == "Rhythm Guitar"
 
     def test_canon_track0(self):
         tl = load_gp_file(FIXTURES / "canon.gp5", track_index=0)
-        assert len(tl) == 1489
+        assert len(tl) == 1503  # includes tie notes
         assert tl.metadata.tempo == 90
         assert tl.metadata.track_name == "Guitar Player"
 
