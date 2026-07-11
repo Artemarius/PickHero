@@ -9,7 +9,6 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 pygame.init()
 pygame.display.set_mode((1, 1))
-pygame.display.set_mode((1, 1))
 
 from pickhero.ui.overlays import CompletionState, _FontCache
 class TestCompletionState:

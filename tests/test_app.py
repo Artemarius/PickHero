@@ -21,9 +21,18 @@ class TestErrorBanner:
 
     @pytest.fixture(autouse=True)
     def init_pygame(self):
-        pygame.init()
+        if not pygame.get_init():
+            pygame.init()
+        if pygame.display.get_surface() is None:
+            pygame.display.set_mode((1, 1))
         yield
-        pygame.quit()
+    @pytest.fixture(autouse=True)
+    def init_pygame(self):
+        if not pygame.get_init():
+            pygame.init()
+        if pygame.display.get_surface() is None:
+            pygame.display.set_mode((1, 1))
+        yield
 
     def test_show_error_sets_message_and_expiry(self):
         app = App(Config())
@@ -64,9 +73,11 @@ class TestSongLoadTransition:
 
     @pytest.fixture(autouse=True)
     def init_pygame(self):
-        pygame.init()
+        if not pygame.get_init():
+            pygame.init()
+        if pygame.display.get_surface() is None:
+            pygame.display.set_mode((1, 1))
         yield
-        pygame.quit()
 
     def test_load_song_sets_state_to_playing(self):
         guitarpro = pytest.importorskip("guitarpro")

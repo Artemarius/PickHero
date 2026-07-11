@@ -215,4 +215,3 @@ class TestStartDownload:
         assert menu._state == "status"
 
 
-pygame.quit()

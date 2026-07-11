@@ -233,4 +233,3 @@ class TestEnsureVisible:
         assert menu._scroll_offset == 0
 
 
-pygame.quit()

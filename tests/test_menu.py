@@ -310,4 +310,3 @@ class TestResolveDeviceName:
         assert isinstance(name, str)
 
 
-pygame.quit()
