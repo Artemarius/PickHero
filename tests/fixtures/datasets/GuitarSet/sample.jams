@@ -1,0 +1,26 @@
+{
+  "file_metadata": {
+    "title": "sample",
+    "artist": "",
+    "release": "",
+    "duration": 0.30000000000000004,
+    "identifiers": {},
+    "jams_version": "0.3.1"
+  },
+  "annotations": [
+    {
+      "namespace": "note_midi",
+      "data": [
+        {
+          "time": 0.0,
+          "duration": 0.2,
+          "value": 60.0,
+          "confidence": null
+        }
+      ],
+      "annotation_metadata": {},
+      "sandbox": {}
+    }
+  ],
+  "sandbox": {}
+}

@@ -2,17 +2,18 @@
 
 ## Project Overview
 
-Desktop guitar practice app. Scrolling Guitar Pro tabs with real-time pitch detection and visual hit/miss feedback. Python, PyGame, aubio, pyguitarpro. Must run on low-end hardware (no ML, no GPU).
+Desktop guitar practice app. Scrolling Guitar Pro tabs (GP3/GP4/GP5/GP6/GP7/GP8) with real-time pitch detection and visual hit/miss feedback. Python, PyGame, aubio, pyguitarpro. See Accuracy Profiles below for hardware-quality scaling.
 
 ## Language & Stack
 
 - **Python 3.10+**, Windows primary target
 - **aubio** for pitch detection (YIN algorithm) and onset detection
 - **sounddevice** for audio capture from USB audio devices
-- **pyguitarpro** for reading GP3/GP4/GP5 tab files
+- **pyguitarpro** for reading GP3/GP4/GP5 tab files; native XML/BCFZ parser for GP6/GP7/GP8
 - **pygame** for UI rendering (scrolling display, game loop)
 - **pygame.mixer** for backing track / metronome playback
-- No ML frameworks. No TensorFlow, no CREPE, no PyTorch. Detection is signal-processing only.
+- ML is optional and never required for the base app. The app runs
+  identically without any ML dependency.
 
 ## Architecture
 
@@ -54,11 +55,13 @@ onset_detector.set_threshold(0.3)  # adjust based on testing
 - 44100 Hz sample rate (standard for USB audio devices)
 - Noise gate: ignore pitches below configurable confidence threshold
 
-## pyguitarpro Data Extraction
+## Guitar Pro File Loading
 
-GP file → iterate tracks → find guitar track(s) → iterate measures → beats → notes:
+GP3/GP4/GP5 files are read with pyguitarpro: iterate tracks → find guitar/bass track(s) → iterate measures → beats → notes.
+GP6 (.gpx) files are BCFZ/BCFS containers that hold a `score.gpif` XML file; GP7/GP8 files are ZIP containers with the same XML. The native parser extracts that XML and builds the timeline.
+
 ```python
-# Each note gives: note.value (fret), note.string (1-6), beat.start, beat.duration
+# Each note gives: note.value (fret), note.string (1-N), beat.start, beat.duration
 # Convert to: (timestamp_ms, midi_note, string, fret, duration_ms)
 ```
 
@@ -88,6 +91,7 @@ pickhero/
 │   ├── __init__.py
 │   ├── input.py
 │   ├── detector.py
+│   ├── console.py       # audio testing console (pitch/chord/synth/list subcommands)
 │   ├── midi_playback.py
 │   └── note_utils.py
 ├── tabs/
@@ -110,8 +114,8 @@ pickhero/
 ## Testing
 
 - `tests/test_detector.py` — feed known sine waves to aubio, verify correct note detection
-- `tests/test_loader.py` — load a reference GP5 file, verify extracted notes match expected
-- `tests/test_timeline.py` — verify timeline tick advancement, note activation windows
+- `tests/test_loader.py` — load reference GP5/GP6/GP7 files and verify extracted notes
+- `tests/test_chord_detector.py`, `tests/test_console.py`, `tests/test_app.py`, `tests/test_integration.py` — detector, UI, console, and end-to-end smoke tests
 - `tests/test_downloader.py` — Songsterr search/download with mocked urllib responses
 - Use `pytest`. Keep tests independent of audio hardware (mock sounddevice).
 
@@ -121,16 +125,29 @@ pickhero/
 pip install -r requirements.txt
 python -m pickhero
 
+# Audio testing console (no GUI)
+python -m pickhero console                    # live pitch detection
+python -m pickhero console list               # list audio input devices
+python -m pickhero console chord E2 A2 D3     # FFT chord verification
+python -m pickhero console synth E2 A2 D3    # synthetic signal test
+
 # Package for distribution
 pip install pyinstaller
 pyinstaller pickhero.spec --noconfirm
 # Or use build.bat on Windows
-```
+
+Two profiles, selectable at runtime. The audio callback must only copy audio
+and run the lightweight aubio detectors; heavy analysis runs in worker threads
+or on the main thread.
+
+- **Portable**: aubio yinfast, 2048/512, 44.1 kHz, forgiving matching (ARCADE mode).
+- **HighAccuracy**: multi-resolution YIN + spectral checks, strict chords
+  (JUDGE mode), 48 kHz, hop 128-256, parallel 2048+4096 windows. For capable CPUs.
+
+Do not add ML as a hard dependency. Do not run FFT/ML in the PortAudio callback.
 
 ## What NOT To Do
 
-- Don't add ML-based pitch detection. aubio YIN is sufficient and runs everywhere.
 - Don't create a web UI or Electron wrapper. This is a desktop app.
 - Don't add online features, accounts, or cloud sync. Offline-first, local files only.
 - Don't over-abstract. Simple classes, no deep inheritance hierarchies. This is a ~3K LOC app, not a framework.
-- Don't add polyphonic pitch detection. aubio YIN is monophonic. Chord scoring uses a majority-match model instead.

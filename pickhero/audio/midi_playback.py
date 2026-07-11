@@ -7,7 +7,11 @@ existing playback clock. No audio files or temp files needed.
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pygame.midi
 
 
 # MIDI status bytes
@@ -76,20 +80,42 @@ class MidiPlayer:
 
     def __init__(self, backing_track: BackingTrack):
         self._track = backing_track
-        self._output = None
+        self._output: pygame.midi.Output | None = None
         self._active_notes: set[tuple[int, int]] = set()  # (channel, note)
         self._muted = False
         self._opened = False
 
     def open(self) -> bool:
-        """Initialize pygame.midi and open the default output device.
+        """Initialize pygame.midi and open the best available output device.
+
+        Skips the kernel Midi Through port (which produces no sound) and
+        prefers real synthesizers like FluidSynth or PipeWire MIDI bridges.
 
         Returns True on success, False if MIDI is unavailable.
         """
         try:
             import pygame.midi
             pygame.midi.init()
-            device_id = pygame.midi.get_default_output_id()
+
+            # Scan devices for the best output: skip Midi Through (port 0/14),
+            # prefer real synthesizers like FluidSynth or PipeWire MIDI bridges.
+            device_id = -1
+            for i in range(pygame.midi.get_count()):
+                info = pygame.midi.get_device_info(i)
+                is_output = info[3]
+                if not is_output:
+                    continue
+                name = info[1].decode()
+                if name == "Midi Through Port-0":
+                    continue  # produces no audio
+                # Found a usable output device
+                device_id = i
+                break
+
+            # Fallback: try default if nothing better found
+            if device_id == -1:
+                device_id = pygame.midi.get_default_output_id()
+
             if device_id == -1:
                 print("No MIDI output device found")
                 return False
@@ -97,6 +123,9 @@ class MidiPlayer:
             self._opened = True
             return True
         except Exception as e:
+            # pygame.midi raises MidiException for device errors, but the import
+            # itself may fail before pygame.midi exists, so we can't reference
+            # MidiException here. Don't catch KeyboardInterrupt/SystemExit.
             print(f"MIDI init failed: {e}")
             return False
 

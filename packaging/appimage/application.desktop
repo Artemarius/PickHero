@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PickHero
+Comment=Open-source guitar practice app with real-time pitch detection
+Exec=pickhero
+Icon=application
+Terminal=false
+Categories=AudioVideo;Audio;Music;Education;
+Keywords=guitar;practice;tab;pitch;tuner;

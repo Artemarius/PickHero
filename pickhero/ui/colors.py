@@ -58,6 +58,11 @@ class Theme:
     tuner_close: tuple[int, int, int]
     tuner_off: tuple[int, int, int]
 
+    # Timing Judge
+    timing_early: tuple[int, int, int]
+    timing_late: tuple[int, int, int]
+    timing_on_time: tuple[int, int, int]
+
 
 DARK_THEME = Theme(
     bg=(20, 20, 30),
@@ -88,6 +93,9 @@ DARK_THEME = Theme(
     tuner_in_tune=(50, 220, 80),
     tuner_close=(220, 200, 40),
     tuner_off=(220, 100, 40),
+    timing_early=(100, 180, 255),
+    timing_late=(255, 100, 100),
+    timing_on_time=(50, 220, 80),
 )
 
 LIGHT_THEME = Theme(
@@ -119,6 +127,9 @@ LIGHT_THEME = Theme(
     tuner_in_tune=(30, 180, 60),
     tuner_close=(200, 170, 20),
     tuner_off=(200, 80, 30),
+    timing_early=(40, 120, 200),
+    timing_late=(200, 60, 60),
+    timing_on_time=(40, 180, 60),
 )
 
 _THEMES = {"dark": DARK_THEME, "light": LIGHT_THEME}
@@ -152,7 +163,7 @@ def cycle_theme() -> str:
     return "dark"
 
 
-# String colors (Rocksmith palette, keyed 1-6: 1=high E, 6=low E)
+# String colors (Rocksmith palette, keyed 1-8: 1=highest string, 8=lowest).
 # These don't change with theme — they're gameplay identifiers.
 STRING_COLORS: dict[int, tuple[int, int, int]] = {
     1: (200, 50, 50),    # red
@@ -161,7 +172,14 @@ STRING_COLORS: dict[int, tuple[int, int, int]] = {
     4: (220, 140, 30),   # orange
     5: (50, 180, 70),    # green
     6: (140, 60, 200),   # purple
+    7: (40, 180, 180),   # cyan
+    8: (220, 60, 140),   # pink
 }
+
+
+def string_color(string_num: int) -> tuple[int, int, int]:
+    """Return the color for a string, falling back to gray for unknown strings."""
+    return STRING_COLORS.get(string_num, (180, 180, 180))
 
 
 def dimmed(color: tuple[int, int, int], factor: float = 0.4) -> tuple[int, int, int]:

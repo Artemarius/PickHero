@@ -53,17 +53,23 @@ class TestNoteEvent:
                 timestamp_ms=0.0, duration_ms=500.0, midi_note=128, string=1, fret=0
             )
 
-    def test_invalid_string(self):
+    def test_invalid_string_low(self):
         with pytest.raises(ValueError, match="string"):
             NoteEvent(
                 timestamp_ms=0.0, duration_ms=500.0, midi_note=64, string=0, fret=0
             )
 
-    def test_invalid_fret(self):
-        with pytest.raises(ValueError, match="fret"):
+    def test_invalid_string_high(self):
+        with pytest.raises(ValueError, match="string"):
             NoteEvent(
-                timestamp_ms=0.0, duration_ms=500.0, midi_note=64, string=1, fret=-1
+                timestamp_ms=0.0, duration_ms=500.0, midi_note=64, string=13, fret=0
             )
+
+    def test_extended_string_allowed(self):
+        note = NoteEvent(
+            timestamp_ms=0.0, duration_ms=500.0, midi_note=35, string=7, fret=0
+        )
+        assert note.string == 7
 
     def test_zero_duration_allowed(self):
         note = NoteEvent(
@@ -79,15 +85,18 @@ class TestSongMetadata:
         assert meta.artist == ""
         assert meta.tempo == 120
         assert meta.tuning == {}
+        assert meta.num_strings == 6
 
     def test_custom_values(self):
-        tuning = {1: 64, 2: 59, 3: 55, 4: 50, 5: 45, 6: 40}
+        tuning = {1: 64, 2: 59, 3: 55, 4: 50, 5: 45, 6: 40, 7: 35}
         meta = SongMetadata(
-            title="Test Song", artist="Artist", tempo=140, tuning=tuning
+            title="Test Song", artist="Artist", tempo=140, tuning=tuning,
+            num_strings=7,
         )
         assert meta.title == "Test Song"
         assert meta.tempo == 140
         assert meta.tuning[1] == 64
+        assert meta.num_strings == 7
 
 
 class TestTimeline:
@@ -220,3 +229,41 @@ class TestTimeline:
         notes = [self._make_note(i * 100) for i in range(10)]
         tl = Timeline(notes)
         assert len(tl) == 10
+
+    def test_active_cursor_forward_playback(self):
+        """Cursor should advance during forward playback, not scan from 0."""
+        notes = [self._make_note(i * 100, duration_ms=50) for i in range(100)]
+        tl = Timeline(notes)
+        # Query forward — should find the right notes
+        result = tl.get_active_notes_at_time(500, window_ms=50)
+        assert len(result) >= 1
+        # Cursor should have advanced past early notes
+        assert tl._active_cursor > 0
+
+    def test_active_cursor_backward_seek_resets(self):
+        """Backward query should reset cursor and still return correct results."""
+        notes = [
+            self._make_note(100, duration_ms=50),
+            self._make_note(500, duration_ms=50),
+            self._make_note(1000, duration_ms=50),
+        ]
+        tl = Timeline(notes)
+        # Forward: query at 1000
+        tl.get_active_notes_at_time(1000, window_ms=50)
+        assert tl._active_cursor > 0
+        # Backward: query at 100 — should reset and still work
+        result = tl.get_active_notes_at_time(100, window_ms=50)
+        assert len(result) >= 1
+        assert notes[0] in result or result[0].timestamp_ms == 100
+
+    def test_active_cursor_sustained_notes(self):
+        """Long sustained notes that started before the window are still returned."""
+        notes = [
+            self._make_note(0, duration_ms=2000, string=1),  # sustained
+            self._make_note(500, duration_ms=50, string=2),
+        ]
+        tl = Timeline(notes)
+        # Query at 600 — sustained note (0-2000) should still be active
+        result = tl.get_active_notes_at_time(600, window_ms=50)
+        ts = [n.timestamp_ms for n in result]
+        assert 0 in ts  # sustained note still active

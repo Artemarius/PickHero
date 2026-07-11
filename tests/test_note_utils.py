@@ -129,9 +129,18 @@ class TestFretToMidi:
         assert fret_to_midi(1, 12) == 76
 
     def test_invalid_string(self):
-        assert fret_to_midi(7, 0) == -1
+        assert fret_to_midi(13, 0) == -1
         assert fret_to_midi(0, 0) == -1
 
+    def test_seventh_string_drop_a(self):
+        # Drop-A 7-string: low A1 = MIDI 33
+        assert fret_to_midi(7, 0, {7: 33}) == 33
+        assert fret_to_midi(7, 2, {7: 33}) == 35
+
+    def test_custom_tuning_fallback_to_standard(self):
+        # Only override string 6; others fall back to STANDARD_TUNING.
+        assert fret_to_midi(6, 0, {6: 38}) == 38
+        assert fret_to_midi(1, 0, {6: 38}) == 64
 
 class TestMidiToFretOptions:
     def test_open_low_e(self):
@@ -171,11 +180,13 @@ class TestSemitoneDistance:
 
 class TestGuitarRange:
     def test_in_range(self):
+        assert is_in_guitar_range(23) is True   # low B0 (5-string bass)
         assert is_in_guitar_range(40) is True   # low E
         assert is_in_guitar_range(64) is True   # high E open
         assert is_in_guitar_range(88) is True   # high E 24th fret
+        assert is_in_guitar_range(96) is True   # generous headroom
 
     def test_out_of_range(self):
-        assert is_in_guitar_range(39) is False
-        assert is_in_guitar_range(89) is False
+        assert is_in_guitar_range(22) is False
+        assert is_in_guitar_range(97) is False
         assert is_in_guitar_range(0) is False

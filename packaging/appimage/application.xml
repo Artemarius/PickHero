@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.pickhero.PickHero</id>
+  <name>PickHero</name>
+  <summary>Offline guitar practice with real-time pitch detection</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <url type="homepage">https://github.com/Artemarius/PickHero</url>
+  <launchable type="desktop-id">application.desktop</launchable>
+  <content_rating type="oars-1.1" />
+</component>

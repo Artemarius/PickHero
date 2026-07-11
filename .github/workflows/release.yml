@@ -9,26 +9,21 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
           pip install pyinstaller
-
       - name: Build exe
         run: pyinstaller pickhero.spec --noconfirm
-
       - name: Verify build output
         run: |
           if (!(Test-Path "dist\PickHero.exe")) {
@@ -38,9 +33,50 @@ jobs:
           $size = (Get-Item "dist\PickHero.exe").Length / 1MB
           Write-Host "PickHero.exe size: $([math]::Round($size, 1)) MB"
         shell: pwsh
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PickHero-windows
+          path: dist/PickHero.exe
 
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install python-appimage
+        run: pip install python-appimage
+      - name: Build AppImage
+        run: bash packaging/appimage/build-appimage.sh
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PickHero-linux
+          path: PickHero-x86_64.AppImage
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: PickHero-windows
+          path: dist
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: PickHero-linux
+          path: dist
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/PickHero.exe
+          files: |
+            dist/PickHero.exe
+            dist/PickHero-x86_64.AppImage
           generate_release_notes: true

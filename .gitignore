@@ -54,3 +54,10 @@ tmp/
 
 # User config
 pickhero_config.json
+
+# Local detector evaluation artifacts and recorded corpus audio
+evaluation-results/
+research/evaluation/clips/
+research/evaluation/local-corpus.jsonl
+research/evaluation/public-corpus.jsonl
+research/evaluation/corpus.jsonl

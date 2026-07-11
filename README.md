@@ -4,7 +4,7 @@ Free, open-source desktop guitar practice app with real-time pitch detection and
 
 ## Why?
 
-Yousician is great but expensive for continuous use, and there's no good free alternative that combines Guitar Pro tab playback with live pitch detection. PickHero fills that gap: load any Guitar Pro tab file (GP3/GP4/GP5/GP7/GP8), plug in your guitar via a cheap USB cable, and practice with real-time visual feedback — all without an internet connection or subscription.
+Yousician is great but expensive for continuous use, and there's no good free alternative that combines Guitar Pro tab playback with live pitch detection. PickHero fills that gap: load any Guitar Pro tab file (GP3/GP4/GP5/GP6/GP7/GP8), plug in your guitar via a cheap USB cable, and practice with real-time visual feedback — all without an internet connection or subscription.
 
 Designed to run on modest hardware (tested on an HP ProBook 650 G5 laptop). No ML models, no GPU required.
 
@@ -38,7 +38,7 @@ A regular microphone also works for acoustic guitar or as a quick test, though a
 
 ## Tab Sources
 
-PickHero reads Guitar Pro files (`.gp3`, `.gp4`, `.gp5`, `.gp7`, `.gp8`). You can get tabs from:
+PickHero reads Guitar Pro files (`.gp3`, `.gp4`, `.gp5`, `.gpx`, `.gp7`, `.gp8`). You can get tabs from:
 
 - **Songsterr** — 1M+ songs, GP5 download via built-in downloader
 - **GProTab.net** — 70K+ free Guitar Pro files
@@ -52,7 +52,7 @@ PickHero reads Guitar Pro files (`.gp3`, `.gp4`, `.gp5`, `.gp7`, `.gp8`). You ca
 | Audio capture | `sounddevice` | Works with any USB audio device, low latency |
 | Pitch detection | `aubio` (YIN) | Real-time, pure C, tiny footprint |
 | Onset detection | `aubio` | Detects note strikes for timing |
-| Tab parsing | `pyguitarpro` | Reads GP3/GP4/GP5 structured data |
+| Tab parsing | `pyguitarpro` + native XML/BCFZ | Reads GP3/GP4/GP5 via pyguitarpro; GP6/GP7/GP8 via native parser |
 | UI | `pygame` | Game-loop oriented, fast rendering |
 | Audio playback | `pygame.midi` | Real-time MIDI backing tracks via system synth |
 | Packaging | `PyInstaller` | Single .exe for Windows |
@@ -139,7 +139,15 @@ PickHero/
 - In Windows: `Settings > System > Sound > Input` — select "USB Audio" and check the volume slider isn't at zero. You should see the input meter move when you strum.
 
 **Testing your setup:**
-Run `python -m pickhero --console` to see detected notes printed live in the terminal. This helps isolate whether the issue is hardware (no signal) or software (signal present but not matching).
+Run `python -m pickhero console` to see detected notes printed live in the terminal. This helps isolate whether the issue is hardware (no signal) or software (signal present but not matching).
+
+The console has four modes:
+- `python -m pickhero console` — live pitch detection (default)
+- `python -m pickhero console list` — list available audio input devices
+- `python -m pickhero console chord E2 A2 D3` — FFT-based chord verification for the given notes
+- `python -m pickhero console synth E2 A2 D3` — run detection on a synthetic signal (no audio device needed)
+
+Notes can be given as names (`E2`, `C#4`, `Db4`) or MIDI numbers (`40`, `61`). Common options: `-d INDEX` (device), `-r SR` (sample rate), `-g DB` (noise gate), `--duration MS` (synth signal length). Run `python -m pickhero console --help` for details.
 
 **Audio detection not working in-game:**
 - Audio detection is enabled by default. If you turned it off, press **A** during playback to re-enable it. The bottom status bar should show `A: audio ON`.
@@ -154,6 +162,18 @@ Run `python -m pickhero --console` to see detected notes printed live in the ter
 - Cheap USB cables can add 10-20ms of latency — this is usually fine but noticeable on fast passages
 - Slow the song down with **PgDn** while practicing
 - Press **H** during playback to see a full help overlay with controls and color legend
+
+## Detector quality and corpus evaluation
+
+Recognition quality is measured against versioned real-guitar corpora rather
+than synthetic tones alone. See [`docs/evaluation.md`](docs/evaluation.md) for
+the capture manifest, held-out evaluation, threshold calibration, failure
+reports, and release-gate workflow.
+
+The live path uses a deadline-safe callback, worker-thread DSP, multi-resolution
+fundamental hypotheses, octave-risk suppression, and fused expected-note
+evidence. See [`docs/audio-pipeline.md`](docs/audio-pipeline.md) for the exact
+real-time and latency-calibration contracts.
 
 ## References
 

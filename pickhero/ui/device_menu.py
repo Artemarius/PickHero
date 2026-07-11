@@ -9,7 +9,7 @@ from __future__ import annotations
 import pygame
 
 from pickhero.audio.input import list_audio_devices
-from pickhero.config import Config
+from pickhero.config import Config, LATENCY_PRESETS
 from pickhero.ui.colors import get_theme
 
 # Max items visible before scrolling
@@ -80,6 +80,10 @@ class DeviceMenuScreen:
             self._ensure_visible()
         elif event.key == pygame.K_r:
             self._refresh_devices()
+        elif event.key == pygame.K_l:
+            self._cycle_latency()
+        elif event.key == pygame.K_c:
+            self._cycle_channel()
         elif event.key == pygame.K_RETURN:
             self._apply_selection()
             return "selected"
@@ -90,9 +94,58 @@ class DeviceMenuScreen:
         """Persist the selected device to config."""
         if self._selected == 0:
             self._config.audio.device_index = None
+            self._config.audio.device_name = ""
+            self._config.audio.input_channel = min(
+                self._config.audio.input_channel, self._selected_channel_count() - 1
+            )
         else:
             dev = self._devices[self._selected - 1]
-            self._config.audio.device_index = dev["index"]
+            idx = dev["index"]
+            name = dev["name"]
+            self._config.audio.device_index = idx
+            self._config.audio.device_name = name
+            self._config.audio.input_channel = min(
+                self._config.audio.input_channel, max(0, int(dev.get("channels", 1)) - 1)
+            )
+            # Match sample rate to device default
+            import sounddevice as sd
+            info = sd.query_devices(idx)
+            if info["default_samplerate"]:
+                self._config.audio.sample_rate = int(info["default_samplerate"])
+        self._config.save()
+
+    def _selected_channel_count(self) -> int:
+        if self._selected > 0 and self._selected - 1 < len(self._devices):
+            return max(1, int(self._devices[self._selected - 1].get("channels", 1)))
+        try:
+            import sounddevice as sd
+            info = sd.query_devices(None, "input")
+            return max(1, int(info["max_input_channels"]))
+        except Exception:
+            return 1
+
+    def _cycle_channel(self) -> None:
+        """Cycle the physical interface input used for mono detection."""
+        count = self._selected_channel_count()
+        self._config.audio.input_channel = (
+            max(0, int(self._config.audio.input_channel)) + 1
+        ) % count
+        self._config.save()
+
+    def _cycle_latency(self) -> None:
+        """Cycle through latency presets and apply immediately."""
+        modes = list(LATENCY_PRESETS.keys())
+        current = self._config.audio.latency_mode
+        try:
+            idx = modes.index(current)
+        except ValueError:
+            idx = 0
+        next_idx = (idx + 1) % len(modes)
+        new_mode = modes[next_idx]
+        self._config.audio.latency_mode = new_mode
+        buf, hop, _ = LATENCY_PRESETS[new_mode]
+        self._config.audio.buf_size = buf
+        self._config.audio.hop_size = hop
         self._config.save()
 
     def render(self, surface: pygame.Surface) -> None:
@@ -114,7 +167,24 @@ class DeviceMenuScreen:
         )
         surface.blit(sub_surf, (w // 2 - sub_surf.get_width() // 2, 68))
 
-        list_top = 110
+        # Latency preset display
+        mode = self._config.audio.latency_mode
+        _, _, desc = LATENCY_PRESETS[mode]
+        lat_surf = hint_font.render(
+            f"Latency: {mode.upper()} — {desc}  [L to change]",
+            True, t.hud_accent,
+        )
+        surface.blit(lat_surf, (w // 2 - lat_surf.get_width() // 2, 92))
+
+        channel_count = self._selected_channel_count()
+        channel = min(max(0, int(self._config.audio.input_channel)), channel_count - 1)
+        channel_surf = hint_font.render(
+            f"Input channel: {channel + 1}/{channel_count}  [C to change]",
+            True, t.hud_accent,
+        )
+        surface.blit(channel_surf, (w // 2 - channel_surf.get_width() // 2, 112))
+
+        list_top = 150
         item_h = 30
         list_left = 60
         list_width = w - 120
@@ -125,7 +195,11 @@ class DeviceMenuScreen:
         items: list[tuple[str, bool]] = []
         items.append(("System Default", current_device_index is None))
         for dev in self._devices:
-            label = f"[{dev['index']}] {dev['name']}  ({dev['sample_rate']:.0f} Hz)"
+            label = (
+                f"[{dev['index']}] {dev['name']}  "
+                f"({dev['sample_rate']:.0f} Hz, {int(dev.get('channels', 1))} in, "
+                f"{dev.get('hostapi', '?')})"
+            )
             is_active = dev["index"] == current_device_index
             items.append((label, is_active))
 
@@ -164,7 +238,7 @@ class DeviceMenuScreen:
             surface.blit(arrow, (w // 2 - arrow.get_width() // 2, y_bottom))
 
         # Hints
-        hint = "UP/DOWN: navigate  |  ENTER: select  |  R: refresh  |  ESC: back"
+        hint = "UP/DOWN: navigate  |  ENTER: select  |  C: channel  |  L: latency  |  R: refresh  |  ESC: back"
         hint_surf = hint_font.render(hint, True, t.hud_text)
         surface.blit(hint_surf, (w // 2 - hint_surf.get_width() // 2, h - 36))
 

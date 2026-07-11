@@ -131,3 +131,67 @@ class TestPitchDetector:
         # Should still work
         note = self._detect_note_from_sine(detector, 440.0)
         assert note == 69
+
+class TestOnsetSample:
+    """Verify onset_sample field is populated correctly."""
+
+    @pytest.fixture
+    def detector(self):
+        return PitchDetector(
+            buf_size=2048,
+            hop_size=512,
+            sample_rate=44100,
+            confidence_threshold=0.3,
+            onset_threshold=0.3,
+            noise_gate_db=-80.0,
+        )
+
+    def test_onset_sample_is_none_for_non_onset(self, detector):
+        """Non-onset detections should have onset_sample=None."""
+        signal = generate_sine(440.0, duration_s=0.2, amplitude=0.5)
+        hop = detector.hop_size
+        non_onset_results = []
+        for i in range(0, len(signal) - hop + 1, hop):
+            result = detector.process(signal[i:i + hop])
+            if result is not None and not result.is_onset:
+                non_onset_results.append(result)
+        for r in non_onset_results:
+            assert r.onset_sample is None
+
+    def test_onset_sample_is_int_when_onset(self, detector):
+        """When an onset fires, onset_sample should be a non-negative int."""
+        sr = 44100
+        hop = detector.hop_size
+        total = hop * 20
+        t = np.arange(total, dtype=np.float32) / sr
+        sig = np.zeros(total, dtype=np.float32)
+        start = hop * 4
+        sig[start:] = 0.5 * np.sin(2 * np.pi * 440 * t[:total - start]) * np.exp(-3.0 * t[:total - start])
+        onset_results = []
+        for i in range(0, total - hop + 1, hop):
+            result = detector.process(sig[i:i + hop])
+            if result is not None and result.is_onset:
+                onset_results.append(result)
+        assert len(onset_results) >= 1, "Expected at least one onset detection"
+        for r in onset_results:
+            assert isinstance(r.onset_sample, int)
+            assert r.onset_sample >= 0
+
+    def test_onset_sample_increases_monotonically(self, detector):
+        """Successive onsets should have non-decreasing sample positions."""
+        sr = 44100
+        hop = detector.hop_size
+        burst_len = int(sr * 0.1)
+        silence_len = int(sr * 0.1)
+        burst1 = (0.5 * np.sin(2 * np.pi * 440 * np.arange(burst_len) / sr)).astype(np.float32)
+        silence = np.zeros(silence_len, dtype=np.float32)
+        burst2 = (0.5 * np.sin(2 * np.pi * 330 * np.arange(burst_len) / sr)).astype(np.float32)
+        signal = np.concatenate([burst1, silence, burst2])
+        onset_samples = []
+        for i in range(0, len(signal) - hop + 1, hop):
+            result = detector.process(signal[i:i + hop])
+            if result is not None and result.is_onset:
+                onset_samples.append(result.onset_sample)
+        for j in range(1, len(onset_samples)):
+            assert onset_samples[j] >= onset_samples[j - 1], \
+                f"onset_sample decreased: {onset_samples[j]} < {onset_samples[j - 1]}"
