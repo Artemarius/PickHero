@@ -13,6 +13,8 @@ from typing import Callable
 import pygame
 
 from pickhero.audio.midi_playback import BackingTrack, MidiPlayer
+from pickhero.audio.verifier_composite import CompositeVerifier
+from pickhero.adaptive import AdaptiveDifficultyController
 from pickhero.config import Config
 from pickhero.matcher import NoteMatcher
 from pickhero.audio.match_mode import MatchMode, _coerce_match_mode
@@ -204,17 +206,38 @@ class PlayingScreen:
         self._last_technique: str | None = None
         self._recent_verdicts: list = []
 
+        # Phrase-level dynamic difficulty. Persisted mastery is loaded per song
+        # and the same predicate is used for rendering and scoring.
+        persisted_mastery: dict[str, dict] = {}
+        if self._progress_tracker is not None and self._song_key:
+            record = self._progress_tracker.get_best(self._song_key)
+            if record is not None:
+                persisted_mastery = record.phrase_mastery
+        self._adaptive = AdaptiveDifficultyController(
+            self._timeline,
+            enabled=self._config.dynamic_difficulty_enabled,
+            initial_level=self._config.dynamic_difficulty_start_level,
+            target_accuracy=self._config.dynamic_difficulty_target_accuracy / 100.0,
+            persisted=persisted_mastery,
+        )
+
     def _note_passes_filter(self, note: NoteEvent) -> bool:
         """Check if a note passes the difficulty filter."""
         if note.fret > self._max_fret:
             return False
         if not self._active_strings[note.string - 1]:
             return False
+        if not self._adaptive.accepts(note):
+            return False
         return True
 
     def _is_filter_active(self) -> bool:
         """Check if any difficulty filter is active."""
-        return self._max_fret < 24 or not all(self._active_strings)
+        return (
+            self._max_fret < 24
+            or not all(self._active_strings)
+            or self._adaptive.enabled
+        )
 
     def toggle_play(self) -> None:
         """Toggle play/pause. Restarts with count-in if at beginning or past end."""
@@ -268,22 +291,23 @@ class PlayingScreen:
                 self._midi_player.pause()
 
     def seek(self, ms: float) -> None:
-        """Seek to an absolute position in ms, clamped to [0, duration]."""
+        """Seek to an absolute position in ms, clamped to [0, duration].
+
+        Playback mapping changes via clock.set_segment; the input stream
+        and detector clock remain uninterrupted.
+        """
         self._playback_ms = max(0.0, min(ms, self._timeline.duration_ms))
         if self._matcher:
             self._matcher.reset()
         self._feedback.reset()
         if self._midi_player is not None:
             self._midi_player.seek(self._playback_ms)
-        # Restart audio with new offset if active
-        if self._audio_enabled and self._playing:
-            self._stop_audio()
-            self._start_audio()
-            if self._audio_capture is not None:
-                stream_ms = self._audio_capture.stream_time_ms()
-                self._audio_capture.clock.set_segment(
-                    self._playback_ms, stream_ms, self._tempo_factor
-                )
+        # Remap the clock without restarting the input stream.
+        if self._audio_capture is not None and self._audio_enabled and self._playing:
+            stream_ms = self._audio_capture.stream_time_ms()
+            self._audio_capture.clock.set_segment(
+                self._playback_ms, stream_ms, self._tempo_factor
+            )
 
     def is_playing(self) -> bool:
         return self._playing
@@ -376,10 +400,17 @@ class PlayingScreen:
                         self._midi_player.pause()
                     if self._audio_capture is not None:
                         stream_ms = self._audio_capture.stream_time_ms()
-                        self._audio_capture.clock.set_segment(
-                            self._playback_ms, stream_ms, 0.0  # tempo=0: stream advances, song frozen
+                        self._audio_capture.clock.refresh_frozen_anchor(
+                            self._playback_ms, stream_ms
                         )
-                # else: already frozen — don't add another segment, don't modify playback_ms
+                else:
+                    # Keep one frozen segment anchored to the newest captured
+                    # samples; this makes repeated attempts judgeable forever.
+                    if self._audio_capture is not None:
+                        self._audio_capture.clock.refresh_frozen_anchor(
+                            self._playback_ms,
+                            self._audio_capture.stream_time_ms(),
+                        )
             elif self._wait_mode_frozen:
                 self._wait_mode_frozen = False
                 if self._midi_player is not None and not self._backing_muted:
@@ -411,34 +442,42 @@ class PlayingScreen:
                 and self._audio_enabled
                 and self._audio_capture is not None
                 and self._matcher is not None):
-            # Feed tab context to the stabilizer for octave resolution.
-            # The tab prior helps the stabilizer resolve octave confusion
-            # during the attack transient (e.g., E2 vs E3).
+            clock = self._audio_capture.clock
+            capture_stream_ms = self._audio_capture.stream_time_ms()
+            # Positive input latency means the newest captured sample belongs
+            # to an earlier chart position. Never ask the verifier for audio
+            # beyond this captured scoring horizon.
+            scoring_playback_ms = min(
+                self._playback_ms,
+                clock.stream_to_song_ms(capture_stream_ms),
+            )
+
             window = self._config.timing_window_ms * 2
             nearby = self._timeline.get_notes_in_range(
-                self._playback_ms - window,
-                self._playback_ms + window,
+                scoring_playback_ms - window,
+                scoring_playback_ms + window,
             )
             expected_midi = [n.midi_note for n in nearby]
-            self._audio_capture.set_tab_context(expected_midi, self._playback_ms)
+            self._audio_capture.set_tab_context(expected_midi, scoring_playback_ms)
             detected = self._audio_capture.get_notes()
             for d in detected:
-                d.timestamp_ms = self._audio_capture.clock.stream_to_song_ms(d.timestamp_ms)
-            # Extract a raw audio window for expected-event verification.
-            # We deliberately delay judgment by one timing window so the full
-            # tolerable audio range is already captured. The window covers from
-            # two timing windows before the judgment point up to the current
-            # playback position, ensuring we never request future samples.
+                d.timestamp_ms = clock.stream_to_song_ms(d.timestamp_ms)
             timing_window_ms = self._config.timing_window_ms
-            judge_ms = self._playback_ms - timing_window_ms
+            judge_ms = scoring_playback_ms - timing_window_ms
             window_start_song_ms = judge_ms - timing_window_ms - 50.0
-            window_end_song_ms = self._playback_ms
-            clock = self._audio_capture.clock
+            window_end_song_ms = scoring_playback_ms
             window_start_stream_ms = clock.song_to_stream_ms(window_start_song_ms)
             window_end_stream_ms = clock.song_to_stream_ms(window_end_song_ms)
             audio_window = self._audio_capture.get_window_between(
                 window_start_stream_ms, window_end_stream_ms
             )
+
+            def audio_for_song_range(start_song_ms: float, end_song_ms: float):
+                return self._audio_capture.get_window_between(
+                    clock.song_to_stream_ms(start_song_ms),
+                    clock.song_to_stream_ms(end_song_ms),
+                )
+
             # Single scoring authority: unified event state machine.
             # Replaces the three legacy paths (verify_hit_zone, process_detected_notes,
             # verify_chord_at) that produced inconsistent judgments per event.
@@ -450,13 +489,11 @@ class PlayingScreen:
                 for d in detected:
                     d.timestamp_ms = pinned_ts
             results = list(self._matcher.advance_state_machine(
-                playback_ms=self._playback_ms,
+                playback_ms=scoring_playback_ms,
                 audio_window=audio_window,
                 detected_notes=detected,
-                chord_detector=self._audio_capture.chord_detector if (
-                    self._audio_capture is not None
-                    and self._audio_capture.chord_detector is not None
-                ) else None,
+                window_start_ms=window_start_song_ms,
+                audio_window_provider=audio_for_song_range,
             ))
             has_onset = any(d.note.is_onset for d in detected) if detected else False
             self._feedback.add_results(results, self._playback_ms)
@@ -503,25 +540,43 @@ class PlayingScreen:
                 and self._playback_ms >= self._loop_end_ms):
             if self._midi_player is not None:
                 self._midi_player.pause()
+            stats: dict = {}
+            phrase_stats: dict[int, dict[str, float | int]] = {}
+            if self._matcher:
+                # Snapshot the completed iteration before reset or _start_audio
+                # replaces the matcher.
+                stats = self._matcher.get_statistics()
+                phrase_stats = self._matcher.get_phrase_statistics()
             self._playback_ms = self._loop_start_ms
             self._last_tick = time.perf_counter()
             if self._matcher:
-                stats = self._matcher.get_statistics()
                 self._matcher.reset()
             self._feedback.reset()
             if self._midi_player is not None:
                 self._midi_player.seek(self._loop_start_ms)
-            if self._audio_enabled and self._playing:
-                self._stop_audio()
-                self._start_audio()
-                if self._audio_capture is not None:
-                    stream_ms = self._audio_capture.stream_time_ms()
-                    self._audio_capture.clock.set_segment(
-                        self._loop_start_ms, stream_ms, self._tempo_factor
+            # Remap the clock without restarting the input stream.
+            if self._audio_capture is not None and self._audio_enabled and self._playing:
+                stream_ms = self._audio_capture.stream_time_ms()
+                self._audio_capture.clock.set_segment(
+                    self._loop_start_ms, stream_ms, self._tempo_factor
+                )
+
+            # Phrase mastery updates on every completed loop, not only while
+            # guided-practice tempo automation is enabled. This makes repeated
+            # Riff Repeater-style practice drive arrangement density directly.
+            if phrase_stats:
+                for phrase_id, phrase in phrase_stats.items():
+                    self._adaptive.update_phrase(
+                        phrase_id, float(phrase.get("accuracy", 0.0))
+                    )
+                if self._progress_tracker is not None and self._song_key:
+                    self._progress_tracker.update_phrase_mastery(
+                        self._song_key, self._adaptive.export()
                     )
 
-            # Guided practice auto-progression
-            if self._guided_practice and self._matcher is not None:
+            # Guided practice controls tempo independently from arrangement
+            # density, as in Rocksmith's phrase mastery model.
+            if self._guided_practice and stats:
                 section_acc = stats.get("accuracy_percent", 0.0)
                 self._guided_loop_count += 1
                 if section_acc >= self._guided_target_accuracy:
@@ -553,6 +608,14 @@ class PlayingScreen:
                     # Audio-scored completion
                     stats = self._matcher.get_statistics()
                     if stats["total"] > 0:
+                        phrase_stats = self._matcher.get_phrase_statistics()
+                        for phrase_id, phrase in phrase_stats.items():
+                            self._adaptive.update_phrase(
+                                phrase_id, float(phrase.get("accuracy", 0.0))
+                            )
+                        self._progress_tracker.update_phrase_mastery(
+                            self._song_key, self._adaptive.export()
+                        )
                         weakest = self._matcher.get_weakest_sections()
                         self._is_new_best, self._recommendations = (
                             self._progress_tracker.record_detailed_result(
@@ -1006,6 +1069,7 @@ class PlayingScreen:
                         xrun_text = f"XRuns: {xruns}"
                         xrun_surf = _font_cache.render(hint_font, xrun_text, True, t.feedback_miss)
                         surface.blit(xrun_surf, (w - xrun_surf.get_width() - 12, stats_bottom_y + 54))
+                    self._draw_input_health(surface, hint_font, w, stats_bottom_y + 72)
         elif self._audio_capture is not None:
             # Audio off but capture exists — still show meter and tuner
             self._draw_signal_meter(surface, hint_font, w, stats_bottom_y)
@@ -1016,6 +1080,7 @@ class PlayingScreen:
                 xrun_text = f"XRuns: {xruns}"
                 xrun_surf = _font_cache.render(hint_font, xrun_text, True, t.feedback_miss)
                 surface.blit(xrun_surf, (w - xrun_surf.get_width() - 12, stats_bottom_y + 36))
+            self._draw_input_health(surface, hint_font, w, stats_bottom_y + 54)
 
         # Bottom-center: play state + controls
         if self._playback_ms < 0:
@@ -1072,6 +1137,34 @@ class PlayingScreen:
             mode_text = f"Mode: {self._match_mode.value}"
             mode_surf = _font_cache.render(hint_font, mode_text, True, t.hud_accent)
             surface.blit(mode_surf, (12, info_y))
+
+
+    def _draw_input_health(
+        self,
+        surface: pygame.Surface,
+        font: pygame.font.Font,
+        width: int,
+        y: int,
+    ) -> None:
+        if self._audio_capture is None:
+            return
+        health = self._audio_capture.get_input_health()
+        status = health.get("status")
+        if status == "clipping":
+            clipped = float(health.get("clipped_fraction", 0.0)) * 100.0
+            text = f"INPUT CLIPPING ({clipped:.1f}%) — lower gain"
+        elif status == "dc_offset":
+            dc = float(health.get("dc_offset", 0.0))
+            text = f"INPUT DC OFFSET ({dc:+.3f})"
+        elif status == "overrun":
+            dropped = int(health.get("dropped_samples", 0))
+            backlog = int(health.get("worker_backlog", 0))
+            text = f"AUDIO WORKER OVERRUN ({dropped} samples, queue {backlog})"
+        else:
+            return
+        t = get_theme()
+        warning = _font_cache.render(font, text, True, t.feedback_miss)
+        surface.blit(warning, (width - warning.get_width() - 12, y))
 
     def _draw_signal_meter(self, surface: pygame.Surface, font: pygame.font.Font,
                            screen_w: int, y: int) -> None:
@@ -1351,6 +1444,12 @@ class PlayingScreen:
                 for i, on in enumerate(self._active_strings)
             )
             parts.append(f"Strings: {strs}")
+        if self._adaptive.enabled:
+            levels = [state.level for state in self._adaptive.phrases.values()]
+            if levels:
+                low, high = min(levels), max(levels)
+                level_text = str(low) if low == high else f"{low}-{high}"
+                parts.append(f"Dynamic difficulty: {level_text}/5")
         return "  |  ".join(parts) if parts else None
 
     def _reset_matcher_for_filter(self) -> None:
@@ -1371,6 +1470,12 @@ class PlayingScreen:
                 for i, on in enumerate(self._active_strings)
             )
             parts.append(f"Strings: {strs}")
+        if self._adaptive.enabled:
+            levels = [state.level for state in self._adaptive.phrases.values()]
+            if levels:
+                low, high = min(levels), max(levels)
+                level_text = str(low) if low == high else f"{low}-{high}"
+                parts.append(f"Dynamic difficulty: {level_text}/5")
         return "  |  ".join(parts) if parts else None
 
     # -- Theme --
@@ -1619,8 +1724,9 @@ class PlayingScreen:
             if self._audio_capture is None:
                 self._audio_capture = AudioCapture(self._config)
             self._audio_capture.start()
+            stream_ms = self._audio_capture.stream_time_ms()
             self._audio_capture.clock.set_segment(
-                self._playback_ms, 0.0, self._tempo_factor
+                self._playback_ms, stream_ms, self._tempo_factor
             )
             # Patch 6b/d: arm raw-take recording for offline polyphonic analysis
             # when the preset requests it.
@@ -1634,11 +1740,12 @@ class PlayingScreen:
             self._matcher = NoteMatcher(
                 self._timeline,
                 timing_window_ms=self._config.timing_window_ms,
-                audio_offset_ms=self._config.audio_latency_offset_ms,
+                audio_offset_ms=self._config.get_audio_latency_offset(),
                 chord_threshold_ms=self._config.chord_threshold_ms,
-                note_filter=self._note_passes_filter if self._is_filter_active() else None,
+                note_filter=self._note_passes_filter,
                 mode=self._match_mode,
                 verifier=verifier,
+                adaptive_scoring=self._config.adaptive_scoring_enabled,
             )
             if self._timing_judge and self._timing_overlay is None:
                 self._timing_overlay = TimingOverlay()

@@ -42,8 +42,8 @@ class TestCallbackPurity:
     """Task 1.2: _audio_callback must do NO DSP."""
 
     def test_callback_does_not_call_detector_process(self):
-        """Patching detector.process to raise should NOT cause _audio_callback
-        to raise — the callback must not call it at all.
+        """Patching detector.process / drain_events to raise should NOT cause
+        _audio_callback to raise — the callback must not call either.
         """
         config = Config()
         config.audio.confidence_threshold = 0.3
@@ -55,8 +55,12 @@ class TestCallbackPurity:
         assert capture._engine is None  # portable mode
 
         original_process = capture.detector.process
+        original_drain = capture.detector.drain_events
         capture.detector.process = lambda x: (_ for _ in ()).throw(
             RuntimeError("detector.process must not be called from callback")
+        )
+        capture.detector.drain_events = lambda: (_ for _ in ()).throw(
+            RuntimeError("detector.drain_events must not be called from callback")
         )
 
         sr = 44100
@@ -72,8 +76,9 @@ class TestCallbackPurity:
                 indata, len(chunk), _MockTimeInfo(i / sr), 0
             )
 
-        # Callback finished without raising — detector.process was not called.
+        # Callback finished without raising — detector.process/drain_events were not called.
         capture.detector.process = original_process
+        capture.detector.drain_events = original_drain
 
     def test_callback_submits_to_worker_queue(self):
         """Calling _audio_callback with audio must push chunks into

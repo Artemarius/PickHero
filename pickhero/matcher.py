@@ -45,6 +45,7 @@ class MatchResult:
     match_type: MatchType
     matched_events: list[NoteEvent] = field(default_factory=list)
     semitone_distance: int | None = None
+    affects_streak: bool = True
 
 
 class NoteMatcher:
@@ -750,6 +751,27 @@ class NoteMatcher:
         detected_midis = {d.note.midi_note for d in detected_notes if d.note.midi_note is not None}
         has_onset = any(d.note.is_onset for d in detected_notes)
 
+        # Spectral verifier evidence: when the audio window contains the
+        # expected note's pitch, add it to detected_midis so the state
+        # machine can transition even if YIN detected a different pitch.
+        for note in candidates:
+            if self._is_filtered(note):
+                continue
+            if note.midi_note in detected_midis:
+                continue
+            if self._get_event_state((note.timestamp_ms, note.string)) in (
+                EventState.HIT, EventState.PARTIAL, EventState.MISS
+            ):
+                continue
+            try:
+                verification = self._verifier.verify_single_note(
+                    audio_window, note.midi_note, self._mode
+                )
+                if verification.is_pitch_present and verification.confidence >= 0.3:
+                    detected_midis.add(note.midi_note)
+            except Exception:
+                pass
+
         # Identify chord groups (≥2 notes at same timestamp) for FFT evidence.
         chord_groups: dict[float, list[NoteEvent]] = {}
         all_candidates: list[NoteEvent] = []
@@ -837,15 +859,22 @@ class NoteMatcher:
                         actual_duration = n.duration_ms
                         break
                 if actual_duration > 0 and playback_ms > ts + actual_duration + timing_window:
-                    # PITCHED note duration expired but _transition didn't catch it
-                    # (e.g., candidate window shifted past the note).
-                    self._event_states[key] = EventState.PARTIAL
-                    self._record_match(
-                        NoteEvent(timestamp_ms=ts, string=string, midi_note=0,
-                                  duration_ms=0, measure=0, fret=0, techniques=()),
-                        MatchType.CLOSE,
+                    # PITCHED note duration expired — pitch was confirmed,
+                    # so this is a HIT, not a CLOSE.
+                    self._event_states[key] = EventState.HIT
+                    # Find the actual note for proper match recording
+                    actual_note = next(
+                        (n for n in notes_at_ts
+                         if n.string == string and abs(n.timestamp_ms - ts) < 1),
+                        None,
                     )
-                    results.append(MatchResult(match_type=MatchType.CLOSE, matched_events=[]))
+                    if actual_note is not None:
+                        self._consumed_event_ids.add(f"{ts}:{string}")
+                        self._record_match(actual_note, MatchType.HIT)
+                        results.append(MatchResult(
+                            match_type=MatchType.HIT,
+                            matched_events=[actual_note],
+                        ))
         return results
 
     def _transition(
@@ -868,6 +897,9 @@ class NoteMatcher:
         if current == EventState.PENDING:
             # Onset + pitch match → PITCHED directly
             if has_onset and pitch_matches:
+                return EventState.PITCHED
+            # Tie notes (pick_required=False): pitch alone → PITCHED, no onset needed
+            if not note.pick_required and pitch_matches:
                 return EventState.PITCHED
             # Onset seen but pitch not yet confirmed → ATTACKING
             if has_onset:
