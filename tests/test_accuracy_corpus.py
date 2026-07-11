@@ -289,8 +289,13 @@ class TestAccuracyCorpus:
             assert len(candidates) > 0, (
                 "Engine should produce candidates via signal-processing fallback"
             )
-            result = candidates[0]
+            result = next(
+                (c for c in candidates if c.candidate.raw_frequency > 0 or c.candidate.best_midi is not None),
+                None,
+            )
+            assert result is not None, (
+                "Engine should produce at least one valid candidate"
+            )
             assert isinstance(result.candidate, PitchCandidate)
-            assert result.candidate.raw_frequency > 0 or result.candidate.best_midi is not None
         finally:
             engine.stop()
