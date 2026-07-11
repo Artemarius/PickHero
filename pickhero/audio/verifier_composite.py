@@ -11,6 +11,7 @@ import numpy as np
 
 from pickhero.audio.evidence import (
     ChordVerification,
+    ExpectedNote,
     NoteVerification,
     TechniqueVerification,
 )
@@ -44,17 +45,91 @@ class CompositeVerifier(ExpectedEventVerifier):
         expected_onset_offset_ms: float | None = None,
         onset_tolerance_ms: float | None = None,
     ) -> NoteVerification:
-        """Verify a single note using only the spectral verifier.
+        """Fuse cents-aware spectral and multi-resolution evidence.
 
-        CQT is intentionally not used as a fallback because it lacks the
-        cents, anti-alias, fundamental, and onset checks that the spectral
-        verifier applies. Allowing it to run as a fallback re-accepts notes
-        that spectral correctly rejected as aliases.
+        The fixed spectral verifier is precise around a known fundamental; the
+        log-frequency front end is better at low notes and octave ambiguity.
+        Neither backend can unilaterally manufacture a Judge hit: disagreement
+        requires strong, low-alias evidence from the recovering backend.
         """
-        return self._spectral.verify_single_note(
+        spectral = self._spectral.verify_single_note(
             audio_window, expected_midi, mode,
             expected_onset_offset_ms=expected_onset_offset_ms,
             onset_tolerance_ms=onset_tolerance_ms,
+        )
+        log_result = self._cqt.verify_single_note(
+            audio_window, expected_midi, mode,
+            expected_onset_offset_ms=expected_onset_offset_ms,
+            onset_tolerance_ms=onset_tolerance_ms,
+        )
+
+        spectral_conf = spectral.confidence
+        log_conf = log_result.confidence
+        if spectral.is_pitch_present and log_result.is_pitch_present:
+            present = True
+            confidence = min(1.0, spectral_conf * 0.58 + log_conf * 0.42 + 0.08)
+        elif spectral.is_pitch_present:
+            present = (
+                mode == MatchMode.ARCADE
+                or spectral_conf >= 0.58
+                or spectral.alias_risk <= 0.34
+            )
+            confidence = spectral_conf * 0.88
+        elif log_result.is_pitch_present:
+            recovery_threshold = {
+                MatchMode.ARCADE: 0.50,
+                MatchMode.PRACTICE: 0.64,
+                MatchMode.JUDGE: 0.76,
+            }.get(mode, 0.64)
+            present = log_conf >= recovery_threshold and log_result.alias_risk <= 0.46
+            confidence = log_conf * (0.90 if present else 0.62)
+        else:
+            present = False
+            confidence = max(spectral_conf, log_conf) * 0.55
+
+        pitch_evidence = spectral.pitch_evidence or log_result.pitch_evidence
+        if pitch_evidence is not None:
+            from pickhero.audio.evidence import PitchEvidence
+            sources = []
+            if spectral.pitch_evidence is not None:
+                sources.append(spectral.pitch_evidence.source)
+            if log_result.pitch_evidence is not None:
+                sources.append(log_result.pitch_evidence.source)
+            cents = (
+                spectral.pitch_evidence.cents_error
+                if spectral.pitch_evidence is not None
+                and spectral.pitch_evidence.cents_error is not None
+                else log_result.pitch_evidence.cents_error
+                if log_result.pitch_evidence is not None
+                else None
+            )
+            pitch_evidence = PitchEvidence(
+                midi_note=expected_midi,
+                cents_error=cents,
+                confidence=max(0.0, min(1.0, confidence)),
+                source="+".join(dict.fromkeys(sources)) or "composite",
+            )
+
+        onset_ms = spectral.onset_ms if spectral.onset_ms is not None else log_result.onset_ms
+        timing_error = (
+            spectral.timing_error_ms
+            if spectral.timing_error_ms is not None
+            else log_result.timing_error_ms
+        )
+        if spectral.pitch_evidence is not None and log_result.pitch_evidence is not None:
+            alias_risk = min(spectral.alias_risk, log_result.alias_risk)
+        elif spectral.pitch_evidence is not None:
+            alias_risk = spectral.alias_risk
+        else:
+            alias_risk = log_result.alias_risk
+        return NoteVerification(
+            is_pitch_present=present,
+            is_onset_present=spectral.is_onset_present or log_result.is_onset_present,
+            pitch_evidence=pitch_evidence,
+            onset_ms=onset_ms,
+            harmonic_score=max(spectral.harmonic_score, log_result.harmonic_score),
+            timing_error_ms=timing_error,
+            alias_risk=alias_risk,
         )
 
     def verify_chord(
